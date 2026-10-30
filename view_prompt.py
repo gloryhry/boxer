@@ -40,8 +40,10 @@ from utils.viewer_3d import (
     build_seq_ctx,
     launch_viewer,
     load_common,
+    load_view_file,
     scale_factor,
 )
+from utils.xnav_prompt import XNavPromptMixin, screen_to_image_coords
 
 # Saturated colors visible on both light and dark backgrounds
 _BOX_COLORS = [
@@ -71,13 +73,41 @@ def main():
     parser.add_argument("--ckpt", type=str, default=os.path.join(CKPT_PATH, DEFAULT_BOXERNET_CKPT), help="BoxerNet checkpoint")
     parser.add_argument("--force_precision", type=str, default=None, choices=["float32", "bfloat16"])
     parser.add_argument("--force_cpu", action="store_true")
+    parser.add_argument(
+        "--xnav_cameras", default="all", help="x-nav camera ids: all or 0,1"
+    )
+    parser.add_argument(
+        "--xnav_camera_mode", choices=["native", "virtual_pinhole"],
+        default="native",
+    )
     # fmt: on
     args = parser.parse_args()
 
-    input_path, dataset_type, seq_name, log_dir, view_path, load_view_data = (
-        load_common(args)
-    )
-    seq_ctx = build_seq_ctx(input_path, dataset_type)
+    from loaders.xnav_loader import is_xnav_map
+
+    xnav_loader = None
+    if is_xnav_map(args.input):
+        from loaders.xnav_prompt_loader import XNavPromptLoader
+
+        xnav_loader = XNavPromptLoader(
+            args.input,
+            cameras=args.xnav_cameras,
+            camera_mode=args.xnav_camera_mode,
+            start_frame=args.start_n,
+            skip_frames=args.skip_n,
+            max_frames=args.max_n,
+        )
+        validation = xnav_loader.validate()
+        print(f"==> x-nav prompt input validated: {validation}", flush=True)
+        dataset_type = "xnav"
+        seq_name = xnav_loader.map.manifest["map_id"]
+        log_dir = str(xnav_loader.map.output_path(args.output_dir) / "prompt")
+        view_path, load_view_data = load_view_file(log_dir, args.load_view)
+    else:
+        input_path, dataset_type, seq_name, log_dir, view_path, load_view_data = (
+            load_common(args)
+        )
+        seq_ctx = build_seq_ctx(input_path, dataset_type)
 
     # Load BoxerNet
     if torch.backends.mps.is_available() and not args.force_cpu:
@@ -87,6 +117,9 @@ def main():
     else:
         device = "cpu"
     boxernet = BoxerNet.load_from_checkpoint(args.ckpt, device=device)
+    if xnav_loader is not None:
+        xnav_loader.image_size = boxernet.hw
+        seq_ctx = xnav_loader.sequence_context()
     if args.force_precision is not None:
         precision_dtype = (
             torch.bfloat16 if args.force_precision == "bfloat16" else torch.float32
@@ -135,15 +168,23 @@ def main():
     else:
         empty_timed_obbs = {int(ts): empty_obb for ts in seq_ctx["rgb_timestamps"]}
 
-    default_w, default_h = 2250 * scale_factor, 1100 * scale_factor
+    default_w, default_h = (
+        (1800, 1000)
+        if xnav_loader is not None
+        else (2250 * scale_factor, 1100 * scale_factor)
+    )
     init_w = args.window_w if args.window_w > 0 else default_w
     init_h = args.window_h if args.window_h > 0 else default_h
 
-    class PromptViewer(SequenceOBBViewer):
+    class PromptViewer(XNavPromptMixin, SequenceOBBViewer):
         title = "BoxerNet Prompt Viewer"
         window_size = (init_w, init_h)
 
         def __init__(self, **kw):
+            self._xnav_loader = xnav_loader
+            if xnav_loader is not None:
+                self._data_source = "xnav"
+                self._loader = xnav_loader
             self._prompted_obbs: list[ObbTW] = []
             self._prompted_labels: list[str] = []
             self._prompted_colors: list[tuple[float, float, float]] = []
@@ -155,6 +196,8 @@ def main():
             self._owl_2d_colors = []  # (N,) pre-assigned colors
             self._owl_3d_confs = []  # (N,) float, set after lift
             self._owl_cached_datum = None
+            self._owl_context_key = None
+            self._owl_request_text = ""
             self._owl_dt_owl = 0.0
             self._owl_dt_bxr = 0.0
             self._drawing = False
@@ -218,7 +261,13 @@ def main():
                 timed_obbs=empty_timed_obbs,
                 seq_ctx=seq_ctx,
                 init_color_mode=args.init_color_mode,
-                init_image_panel_width=args.init_image_panel_width,
+                init_image_panel_width=(
+                    args.init_image_panel_width
+                    if args.init_image_panel_width is not None
+                    else 0.32
+                    if xnav_loader is not None
+                    else None
+                ),
                 load_view_data=load_view_data,
                 view_save_path=view_path,
                 seq_name=seq_name,
@@ -227,8 +276,12 @@ def main():
             )
 
             # Scale up all ImGui elements
-            imgui.get_style().font_scale_main *= 1.4
-            self.ui_panel_width = 550
+            if xnav_loader is not None:
+                imgui.get_style().font_scale_main = 1.1 * self.wnd.pixel_ratio
+                self.ui_panel_width = 420
+            else:
+                imgui.get_style().font_scale_main *= 1.4
+                self.ui_panel_width = 550
 
             # Load SDP after GL context is ready
             self._load_sdp_point_cloud()
@@ -241,7 +294,11 @@ def main():
         def _load_sdp_point_cloud(self):
             """Load semi-dense points into a GPU point cloud VBO."""
             # Try sdp_global first (ca1m, scannet)
-            sdp_global = seq_ctx.get("sdp_global", None)
+            sdp_global = (
+                xnav_loader.background_points()
+                if xnav_loader is not None
+                else seq_ctx.get("sdp_global", None)
+            )
             if sdp_global is not None and len(sdp_global) > 0:
                 positions = (
                     sdp_global.astype(np.float32)
@@ -258,7 +315,10 @@ def main():
                     [(self._sdp_point_vbo, "3f 3f", "in_position", "in_color")],
                 )
                 self._sdp_point_count = P
-                print(f"Loaded {P} global semidense points as point cloud")
+                kind = (
+                    "map background" if xnav_loader is not None else "global semidense"
+                )
+                print(f"Loaded {P} {kind} points as point cloud")
                 return
 
             uid_to_p3 = seq_ctx.get("uid_to_p3", None)
@@ -432,35 +492,34 @@ def main():
 
         def _screen_to_image_coords(self, sx, sy):
             """Convert screen coords to image pixel coords (in VRS resolution)."""
-            rect = getattr(self, "_img_screen_rect", None)
-            if rect is None:
+            if not self._xnav_can_prompt():
                 return None
-            ix, iy, iw, ih = rect
-            if sx < ix or sx > ix + iw or sy < iy or sy > iy + ih:
-                return None
-            u_norm = (sx - ix) / iw
-            v_norm = (sy - iy) / ih
-            img_u = u_norm * self._rgb_vrs_w
-            img_v = v_norm * self._rgb_vrs_h
-
-            return img_u, img_v
+            return screen_to_image_coords(
+                sx,
+                sy,
+                getattr(self, "_img_screen_rect", None),
+                self._rgb_vrs_w,
+                self._rgb_vrs_h,
+            )
 
         def on_mouse_press_event(self, x, y, button):
             self.imgui.mouse_press_event(x, y, button)
-            # Let imgui handle interactive widgets (sliders, buttons, text)
-            # Use is_any_item_hovered to avoid blocking draws on the RGB panel background
-            if imgui.get_io().want_capture_mouse and imgui.is_any_item_hovered():
-                return
-            # Check image area (drawing 2D BBs)
+            # The image is itself an ImGui item. Its exact rectangle takes
+            # priority over widget capture, otherwise hovering it blocks draws.
             if button == 1:
                 coords = self._screen_to_image_coords(x, y)
                 if coords is not None:
+                    if xnav_loader is not None:
+                        self._reset_pending_prompt(clear_image_rect=False)
+                        self._pause_for_xnav_prompt()
                     self._drawing = True
                     self._draw_start = coords
                     self._draw_end = coords
                     self._draw_start_screen = (x, y)
                     self._draw_end_screen = (x, y)
                     return
+            if imgui.get_io().want_capture_mouse and imgui.is_any_item_hovered():
+                return
             # 3D viewport — camera controls
             super().on_mouse_press_event(x, y, button)
 
@@ -481,6 +540,7 @@ def main():
 
         def on_mouse_release_event(self, x, y, button):
             if self._drawing and button == 1:
+                self.imgui.mouse_release_event(x, y, button)
                 self._drawing = False
                 coords = self._screen_to_image_coords(x, y)
                 if coords is not None:
@@ -514,6 +574,9 @@ def main():
         def _get_sdp_for_timestamp(self, ts_ns):
             """Get semi-dense world points for the given timestamp."""
             loader = self._sdp_loader
+            if xnav_loader is not None:
+                datum = xnav_loader.load_at_time(ts_ns)
+                return datum["sdp_w"] if datum is not None else torch.zeros(0, 3)
             # Aria path: per-timestamp SDP via SLAM observations
             if (
                 loader is not None
@@ -562,6 +625,13 @@ def main():
             """Run BoxerNet on the drawn 2D BB and add result to prompted_obbs."""
             if self.total_frames == 0:
                 return
+            if xnav_loader is not None:
+                self._pause_for_xnav_prompt()
+                if not self._xnav_box_mask([[xmin, xmax, ymin, ymax]])[0]:
+                    self._flash_text = "Box needs valid image pixels"
+                    self._flash_time = 1.5
+                    self._flash_color = (1.0, 0.2, 0.2)
+                    return
 
             ts_ns = self.sorted_timestamps[self.current_frame_idx]
             cam, T_wr = self._get_cam_and_pose(ts_ns)
@@ -666,6 +736,11 @@ def main():
             self._owl_stage = 0  # reset so early returns don't re-trigger
             if self.total_frames == 0:
                 return
+            if not self._xnav_can_prompt():
+                return
+            self._pause_for_xnav_prompt()
+            self._owl_request_text = self._owl_text
+            self._owl_context_key = self._xnav_context_key()
 
             ts_ns = self.sorted_timestamps[self.current_frame_idx]
             cam, T_wr = self._get_cam_and_pose(ts_ns)
@@ -688,6 +763,9 @@ def main():
             boxes, scores2d, label_ints, _ = owl.forward(
                 img_torch_255, resize_to_HW=(906, 906)
             )
+            if xnav_loader is not None:
+                keep = torch.from_numpy(self._xnav_box_mask(boxes))
+                boxes, scores2d = boxes[keep], scores2d[keep]
             self._owl_dt_owl = (time.perf_counter() - t0) * 1000
 
             n_dets = len(boxes)
@@ -762,6 +840,9 @@ def main():
 
         def _run_owl_lift(self):
             """Stage 2: lift cached OWL 2D BBs to 3D via BoxerNet."""
+            if not self._xnav_pending_is_current():
+                self._reset_pending_prompt()
+                return
             datum = self._owl_cached_datum
             if datum is None:
                 self._owl_stage = 0
@@ -786,7 +867,7 @@ def main():
                     if conf >= self.conf_threshold:
                         n_accepted += 1
                         self._prompted_obbs.append(obb)
-                        self._prompted_labels.append(self._owl_text)
+                        self._prompted_labels.append(self._owl_request_text)
                         self._prompted_colors.append(self._owl_2d_colors[i])
 
                 self._prompt_dirty = True
@@ -810,6 +891,8 @@ def main():
 
         def _load_raw_image(self, ts_ns):
             """Load the raw (unscaled, unrotated) RGB image for a timestamp."""
+            if xnav_loader is not None:
+                return xnav_loader.rgb_at_time(ts_ns)
             if (
                 getattr(self, "_data_source", None) == "aria"
                 and self._loader is not None
@@ -1356,6 +1439,35 @@ def main():
 
         def _render_main_controls(self):
             """Render prompt + visualization controls (playback is in bottom bar)."""
+            if xnav_loader is not None:
+                self._section_header("x-nav map")
+                key = xnav_loader.keyframe_ids[self.current_frame_idx]
+                imgui.text(f"Keyframe {key}")
+                ids = xnav_loader.camera_ids
+                changed, selection = imgui.combo(
+                    "Camera",
+                    ids.index(xnav_loader.camera_id),
+                    [str(cid) for cid in ids],
+                )
+                if changed:
+                    self._select_xnav_view(ids[selection])
+                views = xnav_loader.available_views()
+                if xnav_loader.camera_mode == "native":
+                    imgui.text("View: native (front hemisphere)")
+                else:
+                    changed, selection = imgui.combo(
+                        "View", views.index(xnav_loader.view_id), views,
+                    )
+                    if changed:
+                        self._select_xnav_view(xnav_loader.camera_id, views[selection])
+                if self._xnav_can_prompt():
+                    datum = xnav_loader.load(self.current_frame_idx)
+                    imgui.text(f"Image time: {datum['time_ns0']} ns")
+                    imgui.text(f"Input points: {len(datum['sdp_w'])} (keyframe view)")
+                else:
+                    imgui.text_wrapped(
+                        "No image for this keyframe and camera. Select another camera or keyframe."
+                    )
             # Prompt controls (in sidebar)
             self._section_header("Prompt")
             imgui.text_colored("Option A: Drag a 2DBB", 0.0, 1.0, 0.0)
@@ -1364,6 +1476,7 @@ def main():
             imgui.spacing()
             imgui.text_colored("Option B: Detect Text (OWL)", 0.2, 0.8, 1.0)
             imgui.spacing()
+            imgui.begin_disabled(not self._xnav_can_prompt())
             imgui.push_item_width(300)
             enter_pressed, self._owl_text = imgui.input_text(
                 "##owl_prompt",
@@ -1377,10 +1490,14 @@ def main():
             imgui.pop_item_width()
             imgui.same_line()
             if (imgui.button("Detect") or enter_pressed) and self._owl_stage == 0:
+                self._pause_for_xnav_prompt()
                 self._owl_stage = -1  # pending: renders overlay, then runs OWL
+            imgui.end_disabled()
             imgui.spacing()
 
             if imgui.button("Clear All"):
+                if xnav_loader is not None:
+                    self._reset_pending_prompt()
                 self._prompted_obbs.clear()
                 self._prompted_labels.clear()
                 self._prompted_colors.clear()
@@ -1449,7 +1566,8 @@ def main():
             # SDP controls
             self._section_header("Points")
             if self._sdp_point_count > 0:
-                imgui.text(f"{self._sdp_point_count} semi-dense points")
+                kind = "map background" if xnav_loader is not None else "semi-dense"
+                imgui.text(f"{self._sdp_point_count} {kind} points")
                 _changed, self.show_sdp = imgui.checkbox("Show Points", self.show_sdp)
                 imgui.push_item_width(200)
                 _changed, self.sdp_point_size = imgui.slider_float(
@@ -1526,7 +1644,10 @@ def main():
                 cam_h = cam.size[..., 1].item()
                 if abs(cam_w - self._rgb_vrs_w) > 1 or abs(cam_h - self._rgb_vrs_h) > 1:
                     proj_cam = cam.scale_to_size((self._rgb_vrs_w, self._rgb_vrs_h))
-            fov = 140.0 if self._vrs_is_nebula else 120.0
+            fov = (
+                None if proj_cam.is_xnav
+                else (140.0 if self._vrs_is_nebula else 120.0)
+            )
             pts_2d, valid = proj_cam.project(pts_cam.unsqueeze(0), fov_deg=fov)
             pts_2d = pts_2d.squeeze(0).cpu().numpy()
             valid = valid.squeeze(0).cpu().numpy()
@@ -1703,7 +1824,11 @@ def main():
 
         def _step_to_frame(self, target_idx: int) -> None:
             """Override to update prompted OBB projections on frame change."""
+            if xnav_loader is not None and target_idx != self.current_frame_idx:
+                self._reset_pending_prompt()
             super()._step_to_frame(target_idx)
+            if xnav_loader is not None:
+                self._clear_missing_xnav_image()
             # Reload per-frame SDP for omni3d (each image has its own depth)
             # Also clear 3D BBs since each image has its own coordinate frame
             if dataset_type == "omni3d":

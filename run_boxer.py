@@ -91,10 +91,25 @@ def main():
     # fmt: off
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=str, default=DEFAULT_SEQ, help="path to the sequence folder")
+    parser.add_argument(
+        "--xnav_cameras", default="all", help="x-nav camera ids: all or 0,1"
+    )
+    parser.add_argument(
+        "--validate_input", action="store_true",
+        help="validate an x-nav map without loading models or writing output",
+    )
+    parser.add_argument(
+        "--track_min_hits", type=int, default=None,
+        help="keyframes to confirm a track (x-nav: 3, legacy: 8)",
+    )
     parser.add_argument("--skip_n", type=int, default=1, help="skip n frames")
     parser.add_argument("--start_n", type=int, default=1, help="start from n-th frame")
     parser.add_argument("--max_n", type=int, default=99999, help="run for max n frames")
     parser.add_argument("--pinhole", action="store_true", help="rectify to pinhole")
+    parser.add_argument(
+        "--xnav_camera_mode", choices=["native", "virtual_pinhole"],
+        default="native", help="x-nav image geometry (default: native)",
+    )
     parser.add_argument("--camera", type=str, default="rgb", choices=["rgb", "slaml", "slamr"], help="camera to use (default: rgb)")
     parser.add_argument("--detector", type=str, default="owl", choices=["owl"], help="2D detector to use (default: owl)")
     parser.add_argument("--thresh2d", type=float, default=0.25, help="detection confidence for 2d detector")
@@ -103,6 +118,14 @@ def main():
     parser.add_argument("--detector_hw", type=int, default=960, help="resize images before going into 2D detector")
     parser.add_argument("--write_name", default="boxer", type=str, help="name prefix for outputs")
     parser.add_argument("--skip_viz", action="store_true", help="disable headless visualization (on by default)")
+    parser.add_argument(
+        "--live_viz", action="store_true",
+        help="open a 3D window that follows inference results (x-nav maps only)",
+    )
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="write x-nav performance.json (CUDA synchronization only when profiling)",
+    )
     parser.add_argument("--cache2d", action="store_true", help="load 2D BBs from CSV instead of running detector")
     parser.add_argument("--cache3d", action="store_true", help="load 3D BBs from CSV instead of running BoxerNet")
     parser.add_argument("--no_sdp", action="store_true", help="turn off SDP input")
@@ -118,11 +141,27 @@ def main():
 
     if args.fuse and args.track:
         parser.error("--fuse and --track are mutually exclusive")
+    if args.track_min_hits is not None and args.track_min_hits < 1:
+        parser.error("--track_min_hits must be positive")
     if args.cache3d:
         args.cache2d = True
     args.viz_headless = not args.skip_viz
     print(args)
     # fmt: on
+
+    from loaders.xnav_loader import is_xnav_map
+
+    if is_xnav_map(args.input):
+        from utils.xnav_pipeline import run_xnav
+
+        run_xnav(args)
+        return
+    if args.validate_input:
+        parser.error("--validate_input requires an x-nav map directory")
+    if args.profile:
+        parser.error("--profile requires an x-nav map directory")
+    if args.live_viz:
+        parser.error("--live_viz requires an x-nav map directory")
 
     DEBUG = os.environ.get("DEBUG", "0") == "1"
     _t_start = time.perf_counter()
@@ -349,7 +388,7 @@ def main():
 
         tracker = BoundingBox3DTracker(
             iou_threshold=0.25,
-            min_hits=8,
+            min_hits=args.track_min_hits if args.track_min_hits is not None else 8,
             conf_threshold=args.thresh3d,
             samp_per_dim=8,
             max_missed=90,

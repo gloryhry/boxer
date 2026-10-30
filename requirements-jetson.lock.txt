@@ -1,0 +1,26 @@
+# Jetson Orin NX / Ubuntu 22.04 / Python 3.10 / JetPack 6.2.1 / CUDA 12.6.
+# Captured 2026-10-30. Rebuild with scripts/setup_jetson.sh.
+# cuDSS is installed separately from the NVIDIA Jetson archive, not from PyPI.
+dill==0.4.1
+filelock==4.1.0
+fsspec==2026.9.0
+glcontext==3.1.0
+imageio-ffmpeg==0.7.0
+imgui-bundle==1.93.0
+jinja2==3.1.6
+markupsafe==3.0.4
+moderngl==5.13.0
+moderngl-window==3.1.1
+mpmath==1.3.0
+networkx==3.4.2
+numpy==1.26.4
+opencv-python==4.11.0.86
+packaging==26.3
+pillow==12.3.0
+pyglet==2.1.19
+pyglm==2.8.3
+pyyaml==6.0.3
+sympy==1.14.0
+torch @ https://pypi.jetson-ai-lab.io/jp6/cu126/+f/37d/7e156cfb4a646/torch-2.10.0-cp310-cp310-linux_aarch64.whl#sha256=37d7e156cfb4a646c4d7347597727db1529d184108f703324dfff1842cec094e
+tqdm==4.70.1
+typing-extensions==4.16.0

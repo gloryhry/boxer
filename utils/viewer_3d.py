@@ -2987,6 +2987,7 @@ class SequenceOBBViewer(OBBViewer):
                     "ca1m": "CALoader",
                     "scannet": "ScanNetLoader",
                     "omni3d": "OmniLoader",
+                    "xnav": "XNavPromptLoader",
                 }.get(self._data_source, "AriaLoader")
                 print("Data source: " + source_name)
                 self._loader = seq_ctx_data.get("loader", None)
@@ -3062,6 +3063,16 @@ class SequenceOBBViewer(OBBViewer):
 
     def _load_rgb_for_timestamp(self, ts_ns: int) -> Optional[np.ndarray]:
         """Load nearest RGB frame for the given timestamp."""
+        if getattr(self, "_data_source", None) == "xnav":
+            # The loader caches by keyframe/camera/view, not timestamp alone.
+            img = self._loader.rgb_at_time(ts_ns)
+            if img is None:
+                return None
+            self._rgb_vrs_h, self._rgb_vrs_w = img.shape[:2]
+            self._rgb_img_scale = 1200.0 / self._rgb_vrs_h
+            return cv2.resize(
+                img, (int(self._rgb_vrs_w * self._rgb_img_scale), 1200)
+            )
 
         def _to_scannet_fid(val: Any) -> str:
             try:
@@ -3398,19 +3409,47 @@ class SequenceOBBViewer(OBBViewer):
             ],
             dtype=torch.float32,
         )
+        valid = torch.ones(4, dtype=torch.bool)
+        if cam.is_xnav:
+            # A pinhole rectangle cannot describe a distorted valid region.
+            source = getattr(self, "_xnav_loader", None)
+            datum = source.load(self.current_frame_idx) if source is not None else None
+            mask = datum["valid_mask"] if datum is not None else None
+            if mask is None:
+                yy, xx = np.mgrid[0 : h_img - 1 : 65j, 0 : w_img - 1 : 65j]
+                grid = torch.from_numpy(np.stack((xx, yy), -1)).float()
+                mask = cam.cpu().unproject(grid.reshape(1, -1, 2))[1]
+                mask = mask.reshape(65, 65).numpy()
+            contours, _ = cv2.findContours(
+                mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+            )
+            if not contours:
+                return
+            contour = max(contours, key=cv2.contourArea).reshape(-1, 2)
+            indices = np.linspace(0, len(contour) - 1, 32, dtype=int)
+            pixels = contour[indices].astype(np.float32)
+            pixels *= [
+                (w_img - 1) / (mask.shape[1] - 1),
+                (h_img - 1) / (mask.shape[0] - 1),
+            ]
+            rays, valid = cam.cpu().unproject(torch.from_numpy(pixels)[None])
+            pts_cam, valid = rays[0] * d, valid[0]
         R_wc = T_wc.R.reshape(3, 3).cpu().float()
         t_wc = origin
         pts_world = (R_wc @ pts_cam.T).T + t_wc
 
         segments = []
         color = torch.tensor([0.0, 0.8, 0.8], dtype=torch.float32)
-        for i in range(4):
-            segments.append(torch.cat([origin, pts_world[i], color, torch.ones(1)]))
-        for i in range(4):
-            j = (i + 1) % 4
-            segments.append(
-                torch.cat([pts_world[i], pts_world[j], color, torch.ones(1)])
-            )
+        for i in range(len(pts_world)):
+            if valid[i]:
+                segments.append(torch.cat([origin, pts_world[i], color, torch.ones(1)]))
+            j = (i + 1) % len(pts_world)
+            if valid[i] and valid[j]:
+                segments.append(
+                    torch.cat([pts_world[i], pts_world[j], color, torch.ones(1)])
+                )
+        if not segments:
+            return
         frustum_data = torch.stack(segments).numpy().astype("f4")
         self.frustum_instance_count = len(frustum_data)
         self.frustum_instance_vbo = self.ctx.buffer(frustum_data.tobytes())
@@ -3433,6 +3472,8 @@ class SequenceOBBViewer(OBBViewer):
         self, ts_ns: int
     ) -> tuple[Optional[CameraTW], Optional[PoseTW]]:
         """Get nearest camera calibration and world pose for timestamp."""
+        if getattr(self, "_data_source", None) == "xnav":
+            return self._loader.camera_and_pose(ts_ns)
         if self.traj is None or self.calibs is None:
             return None, None
         if len(self.pose_ts) == 0 or len(self.calib_ts) == 0:
@@ -3479,7 +3520,7 @@ class SequenceOBBViewer(OBBViewer):
         if len(obbs) == 0:
             return [], []
 
-        N_SUB = 10
+        N_SUB = 31 if cam.is_xnav else 10
         corners = obbs.bb3corners_world
         edge_idx = torch.tensor(BB3D_LINE_ORDERS, dtype=torch.long)
         p0 = corners[:, edge_idx[:, 0], :]
@@ -3501,7 +3542,10 @@ class SequenceOBBViewer(OBBViewer):
                 proj_cam = cam.scale_to_size((self._rgb_vrs_w, self._rgb_vrs_h))
         pts_2d, valid = proj_cam.project(
             pts_cam.unsqueeze(0),
-            fov_deg=140.0 if self._vrs_is_nebula else 120.0,
+            fov_deg=(
+                None if proj_cam.is_xnav
+                else (140.0 if self._vrs_is_nebula else 120.0)
+            ),
         )
         pts_2d = pts_2d.squeeze(0).cpu().numpy()
         valid = valid.squeeze(0).cpu().numpy()
@@ -5488,7 +5532,10 @@ class TrackerViewer(SequenceOBBViewer):
                         proj_cam = cam.scale_to_size((self._rgb_vrs_w, self._rgb_vrs_h))
                 pts_2d, valid = proj_cam.project(
                     pts_cam.unsqueeze(0),
-                    fov_deg=140.0 if self._vrs_is_nebula else 120.0,
+                    fov_deg=(
+                        None if proj_cam.is_xnav
+                        else (140.0 if self._vrs_is_nebula else 120.0)
+                    ),
                 )
                 pts_2d = pts_2d.squeeze(0).cpu().numpy()  # (V*12*S, 2)
                 valid = valid.squeeze(0).cpu().numpy()  # (V*12*S,)

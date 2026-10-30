@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional
 
+import numpy as np
 import torch
 
 from utils.fuse_3d_boxes import (
@@ -79,6 +80,16 @@ class TrackedInstance:
     missed_count: int = 0  # Frames where visible but unmatched
     last_visible: bool = True  # Whether track was visible in last aging check
     cached_text: str = "?"  # Cached text label (updated on match)
+
+
+@dataclass
+class ViewObservation:
+    """One calibrated view of a keyframe, with currently visible world points."""
+
+    cam: CameraTW
+    T_world_rig: PoseTW
+    observed_points: Optional[torch.Tensor] = None
+    valid_mask: Optional[torch.Tensor] = None
 
 
 class BoundingBox3DTracker:
@@ -139,6 +150,9 @@ class BoundingBox3DTracker:
         self._embedding_cache: dict[str, torch.Tensor] = {}
         self._embed_model = None
         self._embed_thread = None
+        self.id_aliases: dict[int, int] = {}
+        self._support_frames: dict[int, set[int]] = {}
+        self._mask_integrals = {}
 
         # Try to load precomputed text embeddings from OWL cache (fast, no model load).
         if self.merge_iou_threshold > 0 and self.merge_semantic_threshold > 0:
@@ -179,6 +193,7 @@ class BoundingBox3DTracker:
         cam: Optional[CameraTW] = None,
         T_world_rig: Optional[PoseTW] = None,
         observed_points: Optional[torch.Tensor] = None,
+        observations: Optional[List[ViewObservation]] = None,
     ) -> List[TrackedInstance]:
         """
         Process one frame of detections and update tracks.
@@ -189,10 +204,15 @@ class BoundingBox3DTracker:
             cam: Optional camera for visibility-aware aging
             T_world_rig: Optional rig pose for visibility-aware aging
             observed_points: Optional (K, 3) semidense points for occlusion-aware aging
+            observations: Multi-view keyframe. None preserves the legacy path;
+                [] means no image observation and never ages tracks.
 
         Returns:
             List of active tracked instances
         """
+        if observations is not None:
+            return self._update_multiview(detections, frame_idx, observations)
+
         # Filter detections by confidence threshold
         if len(detections) > 0 and self.conf_threshold > 0:
             conf_mask = (detections.prob >= self.conf_threshold).reshape(-1)
@@ -337,6 +357,221 @@ class BoundingBox3DTracker:
             )
 
         return self._get_active_tracks()
+
+    def semantic_similarity(self, a: str, b: str) -> float:
+        """Semantic compatibility shared by multi-view fusion and matching."""
+        a, b = a.lower(), b.lower()
+        if a == b:
+            return 1.0
+        override = _SEM_OVERRIDES.get((a, b))
+        if override is not None:
+            return override
+        ea, eb = self._embedding_cache.get(a), self._embedding_cache.get(b)
+        if ea is None or eb is None:
+            return 0.0
+        return float(torch.dot(ea.reshape(-1).float(), eb.reshape(-1).float()))
+
+    def _mask_visible_boxes(self, bounds, visible, mask):
+        """Vectorized equivalent of the original clipped rectangle .any()."""
+        mask = mask.bool().cpu()
+        key = (mask.data_ptr(), tuple(mask.shape), tuple(mask.stride()))
+        pixels = mask.numpy()
+        cached = self._mask_integrals.get(key)
+        # Tensor wrappers around the same NumPy view are recreated each frame.
+        # Compare contents as well, so mutable external masks cannot go stale.
+        if cached is None or not np.array_equal(cached[0], pixels):
+            snapshot = pixels.copy()
+            integral = np.pad(
+                snapshot.astype(np.int64).cumsum(0).cumsum(1), ((1, 0), (1, 0))
+            )
+            if len(self._mask_integrals) >= 16:
+                self._mask_integrals.pop(next(iter(self._mask_integrals)))
+            self._mask_integrals[key] = snapshot, integral
+        else:
+            integral = cached[1]
+        indices = visible.nonzero(as_tuple=True)[0]
+        if not len(indices):
+            return visible
+        rectangles = bounds.reshape(-1, 4).cpu().numpy()[indices.numpy()]
+        if not np.isfinite(rectangles).all():
+            # Retain Python int()'s exception for non-finite visible bounds.
+            for value in rectangles.flat:
+                int(value)
+        # astype truncates towards zero just like Python int(), including -0.x.
+        rectangles = rectangles.astype(np.int64)
+        xa = np.maximum(0, rectangles[:, 0])
+        xb = np.minimum(pixels.shape[1], rectangles[:, 1] + 1)
+        ya = np.maximum(0, rectangles[:, 2])
+        yb = np.minimum(pixels.shape[0], rectangles[:, 3] + 1)
+        nonempty = (xb > xa) & (yb > ya)
+        xa, xb, ya, yb = (a[nonempty] for a in (xa, xb, ya, yb))
+        hits = np.zeros(len(indices), dtype=bool)
+        hits[nonempty] = (
+            integral[yb, xb] - integral[ya, xb] - integral[yb, xa] + integral[ya, xa]
+        ) > 0
+        visible[indices] = torch.from_numpy(hits)
+        return visible
+
+    def _multiview_visibility(self, observations):
+        count = len(self.tracks)
+        projected = torch.zeros(count, dtype=torch.bool)
+        supported = torch.zeros(count, dtype=torch.bool)
+        if not count:
+            return projected, supported
+        obbs = torch.stack([t.obb for t in self.tracks])
+        for view in observations:
+            bb2, ok = obbs.get_pseudo_bb2(
+                view.cam.unsqueeze(0),
+                view.T_world_rig.unsqueeze(0),
+                num_samples_per_edge=32 if view.cam.is_xnav else 4,
+                valid_ratio=0.16667,
+            )
+            visible = ok.reshape(-1).cpu()
+            if view.valid_mask is not None:
+                visible = self._mask_visible_boxes(bb2, visible, view.valid_mask)
+            projected |= visible
+            if view.observed_points is None:
+                supported |= visible
+            elif len(view.observed_points):
+                points = view.observed_points.float().cpu()
+                indices = visible.nonzero(as_tuple=True)[0]
+                for chunk in indices.split(256):
+                    if not len(chunk):
+                        continue
+                    inside = obbs[chunk].batch_points_inside_bb3(
+                        points[None].expand(len(chunk), -1, -1)
+                    )
+                    supported[chunk] |= inside.sum(-1).cpu() >= self.min_obs_points
+        return projected, supported
+
+    def _update_multiview(self, detections, frame_idx, observations):
+        """One association/aging pass per keyframe, using fresh view visibility.
+
+        Projection gates matching; point support gates missed-count aging. A
+        sparse cloud therefore cannot prevent reacquisition of an existing ID.
+        """
+        if not observations:
+            if len(detections):
+                raise ValueError("Detections require at least one view observation")
+            return self._get_active_tracks()
+        detections = detections[(detections.prob >= self.conf_threshold).reshape(-1)]
+        projected, supported = self._multiview_visibility(observations)
+        for i, track in enumerate(self.tracks):
+            track.last_visible = bool(supported[i])
+        candidates = [i for i, visible in enumerate(projected) if visible]
+        matched_tracks, matched_detections = set(), set()
+        self.last_iou_matrix_size = (len(candidates), len(detections))
+        if candidates and len(detections):
+            from utils.fuse_3d_boxes import linear_sum_assignment
+
+            boxes = torch.stack([self.tracks[i].obb for i in candidates])
+            device = (
+                "cuda" if torch.cuda.is_available() and not self.force_cpu else "cpu"
+            )
+            overlap = iou_mc7(
+                boxes.to(device), detections.to(device), samp_per_dim=self.samp_per_dim
+            ).cpu()
+            cost = 1 - overlap.numpy()
+            labels = detections.text_string()
+            for r, i in enumerate(candidates):
+                for c, label in enumerate(labels):
+                    if (
+                        overlap[r, c] < self.iou_threshold
+                        or self.semantic_similarity(self.tracks[i].cached_text, label)
+                        < self.merge_semantic_threshold
+                    ):
+                        cost[r, c] = 1e6
+            rows, cols = linear_sum_assignment(cost)
+            for r, c in zip(rows, cols):
+                if cost[r, c] >= 1:
+                    continue
+                i = candidates[r]
+                track = self.tracks[i]
+                frames = self._support_frames.setdefault(
+                    track.track_id, {track.last_seen_frame}
+                )
+                if frame_idx not in frames:
+                    self._update_track(track, detections[c], frame_idx)
+                    frames.add(frame_idx)
+                    track.support_count = len(frames)
+                matched_tracks.add(i)
+                matched_detections.add(c)
+        for i, track in enumerate(self.tracks):
+            if i in matched_tracks:
+                continue
+            if track.state == TrackState.ACTIVE:
+                track.state = TrackState.INACTIVE
+            if supported[i]:
+                track.missed_count += 1
+        for j in range(len(detections)):
+            if j not in matched_detections:
+                self._create_track(detections[j], frame_idx)
+                track = self.tracks[-1]
+                self._support_frames[track.track_id] = {frame_idx}
+                if self.min_hits <= 1:
+                    track.state = TrackState.ACTIVE
+        # Sparse map keyframes need not observe an object consecutively. Only
+        # visible, supported misses retire tentative map tracks; the legacy
+        # stream tracker keeps its original two-frame tentative timeout.
+        self.tracks = [
+            t
+            for t in self.tracks
+            if not (
+                t.missed_count >= max(3, self.min_hits)
+                if t.state == TrackState.TENTATIVE
+                else self._should_remove(t, frame_idx)
+            )
+        ]
+        if self.merge_iou_threshold > 0 and (
+            self.merge_interval <= 1 or frame_idx % self.merge_interval == 0
+        ):
+            self._merge_multiview_tracks()
+        return self._get_active_tracks()
+
+    def _merge_multiview_tracks(self):
+        """Keep the earliest ID; overlapping support frames count only once."""
+        if len(self.tracks) < 2:
+            return
+        ordered = sorted(self.tracks, key=lambda t: t.track_id)
+        boxes = torch.stack([t.obb for t in ordered])
+        device = "cuda" if torch.cuda.is_available() and not self.force_cpu else "cpu"
+        overlap = iou_mc7(
+            boxes.to(device), boxes.to(device), samp_per_dim=self.samp_per_dim
+        ).cpu()
+        visible = np.array([track.last_visible for track in ordered], dtype=bool)
+        # Preserve the original comparison (including its handling of NaN).
+        eligible = ~(overlap.numpy() < self.merge_iou_threshold)
+        eligible &= visible[:, None] | visible[None, :]
+        rows, columns = np.nonzero(np.triu(eligible, k=1))
+        absorbed = set()
+        # np.nonzero traverses rows then columns, retaining greedy merge order.
+        for i, j in zip(rows, columns):
+            first, second = ordered[i], ordered[j]
+            if first.track_id in absorbed or second.track_id in absorbed:
+                continue
+            # Do not precompute semantics: a prior merge can change cached_text.
+            if (
+                self.semantic_similarity(first.cached_text, second.cached_text)
+                < self.merge_semantic_threshold
+            ):
+                continue
+            frames = (
+                self._support_frames[first.track_id]
+                | self._support_frames[second.track_id]
+            )
+            self._merge_track_pair(first, second)
+            self._support_frames[first.track_id] = frames
+            first.support_count = len(frames)
+            if first.support_count >= self.min_hits:
+                first.state = (
+                    TrackState.ACTIVE if first.last_visible else TrackState.INACTIVE
+                )
+            self.id_aliases[second.track_id] = first.track_id
+            for old, target in list(self.id_aliases.items()):
+                if target == second.track_id:
+                    self.id_aliases[old] = first.track_id
+            absorbed.add(second.track_id)
+        self.tracks = [t for t in self.tracks if t.track_id not in absorbed]
 
     def _create_track(self, detection: ObbTW, frame_idx: int) -> None:
         """Create a new track from a detection."""
@@ -1000,3 +1235,6 @@ class BoundingBox3DTracker:
         """Reset tracker state."""
         self.tracks = []
         self._next_id = 0
+        self.id_aliases.clear()
+        self._support_frames.clear()
+        self._mask_integrals.clear()

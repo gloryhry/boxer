@@ -166,13 +166,14 @@ class _DrawListWrapper:
         self._dl.add_line(_imgui.ImVec2(x1, y1), _imgui.ImVec2(x2, y2), col, thickness)
 
     def add_rect(self, x1, y1, x2, y2, col, rounding=0.0, flags=0, thickness=1.0):
+        # Dear ImGui 1.92.8 swapped flags and thickness; names work with either order.
         self._dl.add_rect(
             _imgui.ImVec2(x1, y1),
             _imgui.ImVec2(x2, y2),
             col,
-            rounding,
-            flags,
-            thickness,
+            rounding=rounding,
+            thickness=thickness,
+            flags=flags,
         )
 
     def add_rect_filled(self, x1, y1, x2, y2, col, rounding=0.0, flags=0):

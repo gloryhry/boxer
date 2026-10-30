@@ -15,6 +15,9 @@ Boxer lifts 2D object detections into static, global, fused 3D oriented bounding
 
 We tested on MacOS (with mps acceleration) and Fedora (with CUDA acceleration).
 
+For the deployed Jetson Orin NX environment and x-nav map commands, see
+[Jetson deployment](docs/JETSON_ORIN_NX.md).
+
 ```bash
 # Install uv (https://docs.astral.sh/uv/)
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -151,6 +154,26 @@ python view_prompt.py --input scene0707_00
 ![ScanNet Prompt](docs/images/scannet_screenshot.jpg)
 
 ## run_boxer.py Usage Details
+
+### x-nav map packages
+
+V6 x-nav map snapshots with keyframe images can be used directly. All six x-nav
+camera models and calibration schemas V1/V2 are supported. Native projection
+is the default and uses the front hemisphere, with one static-tracker update per keyframe.
+Use `--xnav_camera_mode virtual_pinhole` for the original virtual-view pipeline.
+Outputs are isolated under `output/<map_id>/<snapshot_id>/<camera_mode>/`.
+
+```bash
+python run_boxer.py --input /path/to/xnav/map --validate_input
+python run_boxer.py --input /path/to/xnav/map --track
+python run_boxer.py --input /path/to/xnav/map --track --live_viz
+python view_tracker.py --input /path/to/xnav/map --autoplay
+python view_tracker.py --input /path/to/xnav/map --live
+python view_prompt.py --input /path/to/xnav/map
+```
+
+See [x-nav usage and input/output conventions](docs/XNAV_MAP.md) for details.
+
 
 The pipeline supports optional **online 3D tracking** (`--track`) for temporal consistency and **offline 3D fusion** (`--fuse`) for merging detections across frames after all detections have been made.
 

@@ -11,6 +11,7 @@ import torch
 
 from .pose import IdentityPose, PoseTW, get_T_rot_z
 from .tensor_wrapper import TensorWrapper, autocast, autoinit, smart_cat
+from .xnav_camera import MODEL_NAMES, NATIVE_CAMERA_SIZE, geometry, pack_camera
 
 
 # Sample some random pixels in a circle around the camera center.
@@ -67,7 +68,10 @@ class DefaultCameraTWData(TensorWrapper):
 
     @property
     def shape(self):
-        return (torch.Size([34]), torch.Size([26]), torch.Size([22]))
+        return (
+            torch.Size([34]), torch.Size([26]), torch.Size([22]),
+            torch.Size([NATIVE_CAMERA_SIZE]),
+        )
 
 
 class DefaultCameraTWParam(TensorWrapper):
@@ -205,8 +209,29 @@ class CameraTW(TensorWrapper):
         self, data: Union[torch.Tensor, DefaultCameraTWData] = DEFAULT_CAM_DATA
     ):
         assert isinstance(data, torch.Tensor)
-        assert data.shape[-1] in [22, 26, 34]
+        assert data.shape[-1] in [22, 26, 34, NATIVE_CAMERA_SIZE]
         super().__init__(data)
+
+    @classmethod
+    def from_xnav(cls, entry):
+        """Preserve an exported x-nav model exactly, with identity rig extrinsics.
+
+        The loader supplies the map-to-physical-camera pose separately. Native
+        observations use only the model's invertible front hemisphere.
+        """
+        source, extra = pack_camera(entry)
+        p = source.p
+        base = cls.from_surreal(
+            source.width,
+            source.height,
+            "Pinhole",
+            [p["fx"], p["fy"], p["cx"], p["cy"]],
+        )
+        return cls(torch.cat((base._data, extra)))
+
+    @property
+    def is_xnav(self):
+        return self._data.shape[-1] == NATIVE_CAMERA_SIZE
 
     @classmethod
     @autoinit
@@ -422,6 +447,9 @@ class CameraTW(TensorWrapper):
 
     def type_string(self):
         """Return a string describing the camera type."""
+        if self.is_xnav:
+            ids = self._data[..., 22].unique()
+            return MODEL_NAMES[int(ids.item()) - 1] if ids.numel() == 1 else "XNavMixed"
         if self.is_fisheye624:
             return "Fisheye624"
         elif self.is_kb4:
@@ -462,6 +490,11 @@ class CameraTW(TensorWrapper):
             ],
             dim=-1,
         )
+        if self.is_xnav:
+            data[..., 23:25] *= s
+            data[..., 36:40] = (data[..., 36:40] + 0.5) * s.repeat(2) - 0.5
+            data[..., 40:42] *= s
+            data[..., 42:44] = (data[..., 42:44] + 0.5) * s - 0.5
         return self.__class__(data)
 
     def scale_to_size(self, size_wh: Union[int, Tuple[int]]):
@@ -515,6 +548,9 @@ class CameraTW(TensorWrapper):
             ],
             dim=-1,
         )
+        if self.is_xnav:
+            data[..., 36:40] -= torch.cat((left_top, left_top), dim=-1)
+            data[..., 42:44] -= left_top
         return self.__class__(data)
 
     @autocast
@@ -529,6 +565,8 @@ class CameraTW(TensorWrapper):
     @autocast
     def in_radius(self, p2d: torch.Tensor):
         """Check if 2D points are within the valid fisheye radius region."""
+        if self.is_xnav:
+            return self.unproject(p2d)[1]
         assert p2d.shape[-1] == 2, f"p2d shape needs to be 2d {p2d.shape}"
         dists = torch.linalg.norm(
             (p2d - self.c.unsqueeze(-2)) / self.valid_radius.unsqueeze(-2),
@@ -557,6 +595,9 @@ class CameraTW(TensorWrapper):
     @autocast
     def in_fov(self, p3d: torch.Tensor, fov_deg: float):
         """Check if 3D points are within the valid FOV of the fisheye camera."""
+        if self.is_xnav:
+            cosine = p3d[..., 2] / torch.linalg.vector_norm(p3d, dim=-1)
+            return torch.isfinite(cosine) & (cosine > np.cos(np.deg2rad(fov_deg / 2)))
         assert p3d.shape[-1] == 3, f"p3d shape needs to be 3d {p3d.shape}"
         # unproject the principal point to get the principal axis
         cam_center = self.c
@@ -576,11 +617,17 @@ class CameraTW(TensorWrapper):
     def project(
         self,
         p3d: torch.Tensor,
-        fov_deg: float = 140.0,
+        fov_deg: Optional[float] = None,
         suppress_warning: bool = False,
         skip_fov: bool = False,
     ) -> Tuple[torch.Tensor]:
         """Transform 3D points into 2D pixel coordinates."""
+
+        if self.is_xnav:
+            p2d, valid = geometry(self._data, p3d)
+            if fov_deg is not None and not skip_fov:
+                valid &= self.in_fov(p3d, fov_deg)
+            return p2d, valid
 
         # Try to auto-determine the camera model.
         if self.is_fisheye624:  # Fisheye624.
@@ -610,7 +657,7 @@ class CameraTW(TensorWrapper):
         valid = in_image & in_radius & in_front
 
         if not skip_fov:
-            valid = valid & self.in_fov(p3d, fov_deg)
+            valid = valid & self.in_fov(p3d, 140.0 if fov_deg is None else fov_deg)
 
         # pyre-fixme[7]: Expected `Tuple[Tensor]` but got `Tuple[Any, Any]`.
         #  Expected has length 1, but actual has length 2.
@@ -619,6 +666,9 @@ class CameraTW(TensorWrapper):
     @autocast
     def unproject(self, p2d: torch.Tensor) -> Tuple[torch.Tensor]:
         """Transform 2D points into 3D rays."""
+
+        if self.is_xnav:
+            return geometry(self._data, p2d, inverse=True)
 
         # Try to auto-determine the camera model.
         if self.is_fisheye624:  # Fisheye624.
@@ -656,6 +706,10 @@ class CameraTW(TensorWrapper):
         return self.rotate_90(clock_wise=False)
 
     def rotate_90(self, clock_wise: bool):
+        if self.is_xnav:
+            raise NotImplementedError(
+                "Native x-nav images keep their physical camera orientation"
+            )
         dist_params = self.dist.clone()
         if self.is_fisheye624:
             # swap thin prism and tangential distortion parameters

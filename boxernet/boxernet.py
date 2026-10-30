@@ -4,6 +4,7 @@
 
 # pyre-unsafe
 
+import contextlib
 import os
 
 import numpy as np
@@ -23,6 +24,12 @@ from utils.tw.pose import PoseTW, rotation_from_euler
 # ---------------------------------------------------------------------------
 # Attention modules
 # ---------------------------------------------------------------------------
+
+
+def geometry_context(cam):
+    if cam is not None and cam.is_xnav and cam.device.type in ("cpu", "cuda"):
+        return torch.autocast(device_type=cam.device.type, enabled=False)
+    return contextlib.nullcontext()
 
 
 class FeedForward(nn.Module):
@@ -157,62 +164,66 @@ class AleHead(torch.nn.Module):
         logvar = self.logvar_head(h)
         logvar = torch.clamp(logvar, -10, +3)
 
-        params_v = mu
+        cam = batch.get("cam0")
+        with geometry_context(cam):
+            if cam is not None and cam.is_xnav:
+                mu, logvar = mu.float(), logvar.float()
+            params_v = mu
 
-        B, M = params_v.shape[0], params_v.shape[1]
-        device = params_v.device
-        pr = params_v
-        yaw_max = np.pi / 2
+            B, M = params_v.shape[0], params_v.shape[1]
+            device = params_v.device
+            pr = params_v
+            yaw_max = np.pi / 2
 
-        # Directly predict X,Y,Z in voxel coords.
-        center_v = pr[..., :3]
+            # Directly predict X,Y,Z in voxel coords.
+            center_v = pr[..., :3]
 
-        # Build size
-        pr[..., 3:6] = (
-            torch.sigmoid(pr[..., 3:6]) * (self.bbox_max - self.bbox_min)
-            + self.bbox_min
-        )
-        hh, ww, dd = pr[:, :, 3], pr[:, :, 4], pr[:, :, 5]
-        if self.min_dim > 0:
-            hh = hh.clamp(min=self.min_dim)
-            ww = ww.clamp(min=self.min_dim)
-            dd = dd.clamp(min=self.min_dim)
-        bb3 = torch.zeros((B, M, 6)).to(device)
-        bb3[:, :, 0] = -(hh / 2)
-        bb3[:, :, 1] = hh / 2
-        bb3[:, :, 2] = -(ww / 2)
-        bb3[:, :, 3] = ww / 2
-        bb3[:, :, 4] = -(dd / 2)
-        bb3[:, :, 5] = dd / 2
+            # Build size
+            pr[..., 3:6] = (
+                torch.sigmoid(pr[..., 3:6]) * (self.bbox_max - self.bbox_min)
+                + self.bbox_min
+            )
+            hh, ww, dd = pr[:, :, 3], pr[:, :, 4], pr[:, :, 5]
+            if self.min_dim > 0:
+                hh = hh.clamp(min=self.min_dim)
+                ww = ww.clamp(min=self.min_dim)
+                dd = dd.clamp(min=self.min_dim)
+            bb3 = torch.zeros((B, M, 6)).to(device)
+            bb3[:, :, 0] = -(hh / 2)
+            bb3[:, :, 1] = hh / 2
+            bb3[:, :, 2] = -(ww / 2)
+            bb3[:, :, 3] = ww / 2
+            bb3[:, :, 4] = -(dd / 2)
+            bb3[:, :, 5] = dd / 2
 
-        # Build T_world_object
-        pr[..., 6] = yaw_max * torch.tanh(pr[..., 6])
-        yaw = pr[:, :, 6]
-        zeros = torch.zeros_like(yaw).to(device)
-        e_angles = torch.stack([zeros, zeros, yaw], dim=-1)
-        R = rotation_from_euler(e_angles.reshape(-1, 3))
-        R = R.reshape(B, M, 3, 3)
-        T_vo = PoseTW.from_Rt(R, center_v)
+            # Build T_world_object
+            pr[..., 6] = yaw_max * torch.tanh(pr[..., 6])
+            yaw = pr[:, :, 6]
+            zeros = torch.zeros_like(yaw).to(device)
+            e_angles = torch.stack([zeros, zeros, yaw], dim=-1)
+            R = rotation_from_euler(e_angles.reshape(-1, 3))
+            R = R.reshape(B, M, 3, 3)
+            T_vo = PoseTW.from_Rt(R, center_v)
 
-        # Build final ObbTW.
-        sigma2 = torch.exp(logvar)
-        prob = 1.0 / (1.0 + sigma2)
+            # Build final ObbTW.
+            sigma2 = torch.exp(logvar)
+            prob = 1.0 / (1.0 + sigma2)
 
-        inst_id = torch.arange(M).reshape(1, M, -1).repeat(B, 1, 1).to(device)
-        sem_id = 32 + torch.zeros((B, M, 1)).to(device)
-        obb_pr_v = ObbTW.from_lmc(
-            bb3_object=bb3,
-            T_world_object=T_vo,
-            prob=prob,
-            inst_id=inst_id,
-            sem_id=sem_id,
-        )
-        T_wv = batch["T_world_voxel0"].unsqueeze(1)
-        obb_pr_w = obb_pr_v.transform(T_wv)
-        output["obbs_pr_w"] = obb_pr_w
-        output["obbs_pr_params"] = params_v
-        output["obbs_pr_logvar"] = logvar
-        return batch, output
+            inst_id = torch.arange(M).reshape(1, M, -1).repeat(B, 1, 1).to(device)
+            sem_id = 32 + torch.zeros((B, M, 1)).to(device)
+            obb_pr_v = ObbTW.from_lmc(
+                bb3_object=bb3,
+                T_world_object=T_vo,
+                prob=prob,
+                inst_id=inst_id,
+                sem_id=sem_id,
+            )
+            T_wv = batch["T_world_voxel0"].unsqueeze(1)
+            obb_pr_w = obb_pr_v.transform(T_wv)
+            output["obbs_pr_w"] = obb_pr_w
+            output["obbs_pr_params"] = params_v
+            output["obbs_pr_logvar"] = logvar
+            return batch, output
 
 
 def image_to_patches(x, patch_size=14):
@@ -648,15 +659,16 @@ class BoxerNet(nn.Module):
         torch_img = batch["img0"]
         cam = batch["cam0"]
         T_wr = batch["T_world_rig0"]
-        T_wc = T_wr @ cam.T_camera_rig.inverse()
-        if "T_world_voxel0" not in batch:
-            T_wv = gravity_align_T_world_cam(T_wc, z_grav=True)
-            rpy = T_wv.to_euler()  # T_wv should only have yaw value
-            assert torch.allclose(
-                torch.zeros(1, device=rpy.device), rpy[:, :2], atol=1e-4
-            )
-            batch["T_world_voxel0"] = T_wv
-        T_wv = batch["T_world_voxel0"]
+        with geometry_context(cam):
+            T_wc = T_wr @ cam.T_camera_rig.inverse()
+            if "T_world_voxel0" not in batch:
+                T_wv = gravity_align_T_world_cam(T_wc, z_grav=True)
+                rpy = T_wv.to_euler()  # T_wv should only have yaw value
+                assert torch.allclose(
+                    torch.zeros(1, device=rpy.device), rpy[:, :2], atol=1e-4
+                )
+                batch["T_world_voxel0"] = T_wv
+            T_wv = batch["T_world_voxel0"]
         B, _, H, W = torch_img.shape
 
         with torch.no_grad():
@@ -668,24 +680,27 @@ class BoxerNet(nn.Module):
 
             # Render semi-dense points as patches.
             sdp_w = batch["sdp_w_padded"]
-            sdp_median = sdp_to_patches(sdp_w, cam, T_wr, H, W, self.dino.patch_size)
+            with geometry_context(cam):
+                sdp_median = sdp_to_patches(
+                    sdp_w, cam, T_wr, H, W, self.dino.patch_size
+                )
             out["sdp_patch0"] = sdp_median.clone()
             sdp_input = sdp_median.reshape(B, -1, fH * fW).permute(0, 2, 1)
             x = torch.cat([dino_feat, sdp_input], dim=-1)
 
             # Get ray directions in voxel frame.
             if self.with_ray:
-                T_vc = T_wv.inverse() @ T_wc
-                # print a loud warning if T_vc.t is not close to zero (loose tolerance).
-                # This is because we define the gravity aligned coordinate frame to have
-                # a (0,0,0) translation relative to the camera center.
-                if not torch.allclose(T_vc.t, torch.zeros_like(T_vc.t), atol=1e-2):
-                    print(
-                        f"WARNING: T_vc.t is not close to zero: {T_vc.t}. This is not expected."
+                with geometry_context(cam):
+                    T_vc = T_wv.inverse() @ T_wc
+                    # The gravity-aligned origin should be the camera center.
+                    if not torch.allclose(T_vc.t, torch.zeros_like(T_vc.t), atol=1e-2):
+                        print(
+                            f"WARNING: T_vc.t is not close to zero: {T_vc.t}. "
+                            "This is not expected."
+                        )
+                    ray_enc = generate_plucker_encoding(
+                        B, fH, fW, self.dino.patch_size, cam, T_vc
                     )
-                ray_enc = generate_plucker_encoding(
-                    B, fH, fW, self.dino.patch_size, cam, T_vc
-                )
                 out["ray_enc0"] = ray_enc.clone()
                 x = torch.cat([x, ray_enc], dim=-1)
 

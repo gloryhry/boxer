@@ -286,6 +286,7 @@ class BoundingBox3DFuser:
         enable_nms: bool = False,
         nms_iou_threshold: float = 0.6,
         conf_threshold: float = 0.55,
+        force_cpu: bool = False,
     ) -> None:
         """
         Initialize 3D box fusion system.
@@ -307,6 +308,7 @@ class BoundingBox3DFuser:
         self.enable_nms = enable_nms
         self.nms_iou_threshold = nms_iou_threshold
         self.conf_threshold = conf_threshold
+        self.force_cpu = force_cpu
 
     def fuse(
         self, detections: ObbTW, semantic_embeddings: Optional[torch.Tensor] = None
@@ -353,9 +355,9 @@ class BoundingBox3DFuser:
         print("\n[1/4] Computing 3D IoU matrix...")
         step1_start = time.time()
 
-        if torch.backends.mps.is_available():
+        if not self.force_cpu and torch.backends.mps.is_available():
             detections = detections.to("mps")
-        elif torch.cuda.is_available():
+        elif not self.force_cpu and torch.cuda.is_available():
             detections = detections.to("cuda")
 
         # Auto-detect whether to use sparse IoU based on memory requirements

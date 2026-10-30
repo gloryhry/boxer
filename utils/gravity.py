@@ -52,7 +52,9 @@ def gravity_align_T_world_cam(
         R_cg_cgz = torch.tensor(
             [[[0, -1, 0], [0, 0, 1], [-1, 0, 0]]], dtype=torch.float32
         ).to(device)
-        R_world_cgz = R_world_cg @ R_cg_cgz.inverse()
+        # This fixed rotation is orthogonal; its transpose is the exact inverse.
+        # Avoid loading a general CUDA linear solver for the axis permutation.
+        R_world_cgz = R_world_cg @ R_cg_cgz.transpose(-1, -2)
         T_world_cgz = PoseTW.from_Rt(R_world_cgz, T_world_cam.t)
         return T_world_cgz
     else:

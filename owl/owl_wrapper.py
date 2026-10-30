@@ -277,8 +277,6 @@ class OwlWrapper(nn.Module):
             else:
                 # Old format: raw tensor
                 self.text_embeddings = cached
-            if self.use_bfloat16:
-                self.text_embeddings = self.text_embeddings.to(dtype=torch.bfloat16)
             _dbg(f"load cached text embeddings ({len(text_prompts)} prompts)")
         else:
             self.text_embeddings = self._encode_text(text_prompts)
@@ -288,6 +286,12 @@ class OwlWrapper(nn.Module):
             )
             self.text_embeddings = self.text_embeddings.to(device)
             _dbg(f"encode_text ({len(text_prompts)} prompts) + save cache")
+        # A cache written on CUDA may contain bfloat16 features. Match the
+        # current vision model even when reusing that cache on CPU/float32.
+        self.text_embeddings = self.text_embeddings.to(
+            device=device,
+            dtype=torch.bfloat16 if self.use_bfloat16 else torch.float32,
+        )
         self.query_mask = torch.ones(len(text_prompts), dtype=torch.bool, device=device)
 
         print(

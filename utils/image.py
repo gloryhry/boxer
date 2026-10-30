@@ -267,6 +267,9 @@ def draw_bb3s(
     if obbs.shape[0] == 0:
         return viz
 
+    if cam.is_xnav:
+        render_obb_corner_steps = 32
+
     # Get pose of camera.
     T_world_cam = T_world_rig.float() @ cam.T_camera_rig.inverse()
 

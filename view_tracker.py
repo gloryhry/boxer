@@ -33,13 +33,35 @@ def main():
     parser.add_argument("--init_follow_look_ahead", type=float, default=None, help="Follow-view look-ahead distance (meters)")
     parser.add_argument("--init_show_obs", action="store_true", help="Initially show observed points")
     parser.add_argument("--autoplay", action="store_true", help="Automatically start playback")
+    parser.add_argument(
+        "--live", action="store_true",
+        help="follow newly committed inference frames (x-nav maps only)",
+    )
     parser.add_argument("--autorecord", action="store_true")
     parser.add_argument("--record_fps", type=float, default=0.0, help="Recording FPS (0 = auto)")
     parser.add_argument("--teaser", action="store_true")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose tracker logging")
     parser.add_argument("--bb2d_csv", type=str, default="", help="2D BB CSV filename (relative to log_dir)")
+    parser.add_argument(
+        "--xnav_show_tentative", action="store_true",
+        help="initially display unconfirmed x-nav object candidates",
+    )
     # fmt: on
+    parser.add_argument(
+        "--xnav_camera_mode", choices=["native", "virtual_pinhole"],
+        default="native",
+    )
     args = parser.parse_args()
+
+    from loaders.xnav_loader import is_xnav_map
+
+    if is_xnav_map(args.input):
+        from utils.xnav_viewer import launch_xnav_viewer
+
+        launch_xnav_viewer(args)
+        return
+    if args.live:
+        parser.error("--live requires an x-nav map directory")
 
     input_path, dataset_type, seq_name, log_dir, view_path, load_view_data = (
         load_common(args)

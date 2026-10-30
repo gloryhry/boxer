@@ -24,12 +24,16 @@ htmlcov/
 # Environment
 .env
 *.egg
+.venv
+.runtime/
 
 # Checkpoints
 ckpts/
+/ckpts
 
 # Sample data
 sample_data/
+/sample_data
 
 # Visualization output
 output/
