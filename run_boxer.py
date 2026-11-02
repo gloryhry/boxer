@@ -110,6 +110,14 @@ def main():
         "--xnav_camera_mode", choices=["native", "virtual_pinhole"],
         default="native", help="x-nav image geometry (default: native)",
     )
+    parser.add_argument(
+        "--xnav_execution", choices=["auto", "serial"], default="auto",
+        help="x-nav CUDA pipeline or original serial execution (default: auto)",
+    )
+    parser.add_argument(
+        "--xnav_detector_batch_size", type=int, choices=[1, 2], default=1,
+        help="OWLv2 observations per call; BoxerNet remains batch=1",
+    )
     parser.add_argument("--camera", type=str, default="rgb", choices=["rgb", "slaml", "slamr"], help="camera to use (default: rgb)")
     parser.add_argument("--detector", type=str, default="owl", choices=["owl"], help="2D detector to use (default: owl)")
     parser.add_argument("--thresh2d", type=float, default=0.25, help="detection confidence for 2d detector")
@@ -124,7 +132,7 @@ def main():
     )
     parser.add_argument(
         "--profile", action="store_true",
-        help="write x-nav performance.json (CUDA synchronization only when profiling)",
+        help="write x-nav host/CUDA-event timings, queue waits and committed throughput",
     )
     parser.add_argument("--cache2d", action="store_true", help="load 2D BBs from CSV instead of running detector")
     parser.add_argument("--cache3d", action="store_true", help="load 3D BBs from CSV instead of running BoxerNet")

@@ -13,6 +13,8 @@ import re
 import uuid
 from pathlib import Path
 
+from utils.exception_compat import add_exception_note
+
 
 def _encode(value):
     return json.dumps(
@@ -220,7 +222,7 @@ class ResultStore:
             try:
                 self.close()
             except Exception as close_error:
-                error.add_note(f"Could not close result journal: {close_error}")
+                add_exception_note(error, f"Could not close result journal: {close_error}")
             raise
 
     def _descriptor(self, **updates):

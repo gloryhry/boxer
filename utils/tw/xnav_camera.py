@@ -8,8 +8,23 @@ The prefix intrinsics and rectangle always describe the current image.
 
 import contextlib
 import math
+import threading
 
 import torch
+
+_dispatch = threading.local()
+
+
+@contextlib.contextmanager
+def fixed_camera_model(model):
+    """Use a validated CPU camera tag while projecting its immutable CUDA copy."""
+    previous = getattr(_dispatch, "model", None)
+    _dispatch.model = model
+    try:
+        yield
+    finally:
+        _dispatch.model = previous
+
 
 MODEL_NAMES = (
     "Pinhole",
@@ -254,10 +269,16 @@ def geometry(data, points, inverse=False):
         valid = torch.zeros(
             (len(cameras), count), device=points.device, dtype=torch.bool
         )
-        for model in cameras[:, 22].unique().tolist():
+        fixed = getattr(_dispatch, "model", None)
+        models = [fixed] if fixed is not None else cameras[:, 22].unique().tolist()
+        for model in models:
             if model not in range(1, 7):
                 raise ValueError(f"Invalid native x-nav camera tag {model}")
-            ids = torch.where(cameras[:, 22] == model)[0]
+            ids = (
+                slice(None)
+                if fixed is not None
+                else torch.where(cameras[:, 22] == model)[0]
+            )
             selected = cameras[ids]
             result, ok = (_unproject if inverse else _project)(
                 inputs[ids], selected, int(model)

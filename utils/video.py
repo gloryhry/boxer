@@ -103,5 +103,5 @@ def make_mp4(
         f"{mp4_path}"
     )
     print(cmd)
-    subprocess.run(cmd, shell=True)
+    subprocess.run(cmd, shell=True, check=True)
     return mp4_path

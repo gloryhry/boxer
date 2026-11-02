@@ -152,6 +152,8 @@ Z≤0 区域置黑并禁用提示；不再额外裁至 140°，因此可保留�
 | `--xnav_camera_mode native` | 默认；原始畸变图像，六种模型精确适配，仅使用前半球 |
 | `--xnav_camera_mode virtual_pinhole` | 原有六方向候选针孔视图，100° 视场 |
 | `--xnav_cameras all` | 全部相机；也可指定 `0` 或 `0,1` |
+| `--xnav_execution auto` | CUDA 使用有界流水线；CPU/MPS 串行执行。指定 `serial` 可回退对照 |
+| `--xnav_detector_batch_size 1` | OWLv2 每批 1 或 2 个有序观测；BoxerNet 始终逐相机运行 |
 | `--start_n 1 --skip_n 1 --max_n 68` | 从第一个关键帧开始，按关键帧计数，而非虚拟视图 |
 | `--labels lvisplus` | 默认开放词汇类别表；可用带引号的逗号分隔文本提示 |
 | `--thresh2d 0.25 --thresh3d 0.5` | 分别筛选 2D、3D 模型置信度；保存的框分数为二者均值 |
@@ -173,8 +175,18 @@ x-nav 自动进行关键帧内融合；全局融合使用 `--track`。`--fuse` �
 
 ### 性能观测
 
-默认命令已经使用增量保存、批量记录转换与等价的跟踪优化。类别、分辨率、相机、
-深度输入、检测阈值、投影采样及关联顺序保持原设置。
+CUDA 默认命令使用图像/点云预取、单模型推理线程和独立 CPU 输出进程。
+主线程按关键帧顺序融合与跟踪；模型和跟踪使用独立 CUDA stream。
+从开始推理到可靠提交确认占用两个全局额度，最多两帧在途；不会跳帧。
+输出进程逐帧生成 CSV/预览，执行原有 fsync 和原子发布后才确认提交。
+类别、分辨率、相机、深度输入、检测阈值、投影采样及关联顺序保持原设置。
+
+OWLv2 可对同一关键帧的相邻两个观测批处理，沿用原 CPU resize/归一化和逐图 NMS。
+默认 batch=1；Orin NX 的完整地图验证中，batch=2 的置信度误差超过 0.002，
+因此没有进入默认路径。BoxerNet 固定 batch=1。批量推理遇到 CUDA OOM 时，仅当前组按单图重试，
+本次运行后续使用单图；`execution` 元数据记录实际批量及回退次数。
+CPU/MPS 和 `--xnav_execution serial` 使用原串行模型调用。
+`--cache2d`、`--cache3d` 保持各自的模型跳过规则，执行模式不参与缓存参数匹配。
 
 ```bash
 bash scripts/run_local_cuda.sh --input /path/to/map --track --profile
@@ -185,11 +197,44 @@ bash scripts/run_local_cuda.sh --input /path/to/map --track --profile
 `steady_stages` 和 `steady_frames` 排除开头两个预热帧；`segments` 将预热后的帧
 分为前、中、后三段，分别报告 p50/p95。初始化、最终完整 JSON 导出和视频编码
 放在 `other_stages`，总 `wall_seconds` 包含这些阶段。
-只有 `--profile` 开启时才同步 GPU 进行阶段计时；它会带来测量开销。
+`steady_cuda_stages` 使用 CUDA events 记录各 stream 的阶段区间，在执行线程停止后
+统一解析；阶段边界不再全局同步。区间可能包含主机发起算子之间的空闲，不能视为
+纯 kernel 活跃时间。关闭 profiling 时不创建计时事件或增加同步。
+stream 与事件语义参见 [PyTorch CUDA 说明](https://docs.pytorch.org/docs/2.10/notes/cuda.html)。
+流水线各阶段可以重叠，不能把阶段耗时相加当作整段耗时；`wall_ms` 是单帧延迟，
+`steady_throughput_fps` 按可靠提交间隔计算吞吐。`queue.*` 分别记录额度、
+数据、推理结果与输出队列等待；`commit_lag` 记录确认时的在途帧数。
+`commit_latency_ms` 和 `steady_commit_latency` 单独报告计算完成到可靠提交的延迟。
+`execution` 独立保存执行模式、批量和最大在途量，不改变 schema 或缓存约定。
 
 每帧仍保存完整轨迹快照，历史文件大小会随帧数与轨迹数增长；每帧写入只处理本帧
 内容，结束时再流式汇总一次。全局合并沿用原有间隔和顺序，语义判断使用每次合并后
-更新的标签。可见性沿用 native 的 32 点曲边投影，点支持仅计算可见框，每批最多 256 框。
+更新的标签。可见性沿用 native 的每边 32 点曲边投影、有效域与严格框内判断，
+未增加距离截断。少于 256 条轨迹时使用 CPU 几何，避免小规模 CUDA 调度开销；
+更大规模使用 float32 GPU 投影/掩码和每批最多 256 框的点支持，缓存静态相机
+模型与掩码积分图。框面附近可能改变支持阈值的浮点判断由原 CPU 路径复核。
+全局合并只计算至少一条轨迹可见的候选对，保留较早 ID 优先及合并后重查标签的顺序。
+
+2026-10-30 在本机 RTX 5060 Laptop GPU、PyTorch 2.10.0+cu128、4 个 CPU 运算线程下，
+对 `img2` 的 469 个关键帧、938 张图像进行顺序对照；保持 native、1220 类、960 输入、
+bfloat16、跟踪、CSV、预览和视频设置：
+
+| 完整流程 | 耗时 |
+| --- | ---: |
+| 修改前冻结源码 | 2804.65 秒 |
+| 优化后，开启 `--profile` | 426.31 秒 |
+
+总时间包含初始化、最终完整 JSON 导出及视频编码，减少约 84.8%。
+469 帧记录及非耗时元数据严格一致，4 个 CSV 和 469 张预览图逐字节一致；
+视频均为 1920×960、5 FPS、469 帧。逐帧持久化 p95 为 34.6 ms。
+本机存在其他任务，测试期间还执行了回归及中间结果读取，绝对时间会随负载变化。
+
+2026-11-02 在 Jetson Orin NX 上按同机顺序各运行两次完整 `img2`，包含 CSV、
+预览和视频且关闭 profiling：串行中位数 1272.55 秒，默认流水线中位数 906.05 秒，
+减少 28.80%；相同关键帧计算窗口内 GPU <10% 采样比例从 62.25% 降至 33.82%。
+两次优化结果分别通过全部 469 帧差分，离散字段、最终别名及置信度完全一致。
+OWLv2 和 BoxerNet 默认均为 batch=1；batch=2 未通过置信度误差门槛。
+详细采样、内存与验收证据见 [Jetson 部署文档](JETSON_ORIN_NX.md)。
 
 ## 输出与回放
 
@@ -210,6 +255,8 @@ bash scripts/run_local_cuda.sh --input /path/to/map --track --profile
 完整逐帧快照追加到本次运行独立的 JSONL。先同步帧记录，再原子发布已提交的帧数和
 字节边界；回放与缓存只读取已提交范围，忽略未提交尾部。
 完成后流式导出可独立读取的紧凑 schema_version 2 `results.json`，并清理本次侧文件。
+流水线在所有请求的 CSV、预览与视频输出成功后才发布完成状态；收尾失败时保留
+可读取的已提交前缀，并把异常传回主进程。
 失败或 Ctrl+C 时保留侧文件与 `failed` / `interrupted` 状态，已提交帧仍可回放和用于
 覆盖范围内的缓存复用；这不恢复跟踪器内部状态，不属于断点续推。
 项目读取器兼容 schema 1、2、3。外部程序在推理完成后仍可直接读取完整 JSON；
@@ -234,6 +281,12 @@ bash scripts/run_local_cuda.sh view_tracker.py \
 窗口使用独立进程，增量读取已提交的帧；日志保存在结果目录的 `live_viewer.log`。
 `--skip_viz` 只关闭图片和视频导出，可与 `--live_viz` 同时使用。
 
+2026-10-30 在本机 CUDA 上实际运行 `img2` 前 90 个关键帧、180 张图像，验证了
+推理期间的自动更新和完成后保留窗口。另通过真实 OpenGL 窗口检查首帧前等待、
+暂停后保留历史帧及 ID、恢复跟随和相机切换。
+日志与截图保存在 `output/live_viz_validation/`，回归日志为
+`output/live_viz_regression.log`。
+
 左键拖动平移，右键拖动旋转，滚轮缩放。候选框尚未满足确认条件，
 默认隐藏，可用界面的 `Include tentative candidates` 或
 `--xnav_show_tentative` 显示。没有确认物体时，最终跟踪 CSV 只有表头是合法结果。
@@ -242,3 +295,44 @@ bash scripts/run_local_cuda.sh view_tracker.py \
 `--xnav_camera_mode virtual_pinhole` 且新模式目录不存在时，才回退读取旧目录；
 原生模式不会加载旧针孔结果。旧缓存可在虚拟针孔模式复用，重建结果写入新目录。
 新模式目录已存在但缺少结果时直接报错，避免读取不对应的历史文件。
+
+## 验证与已知限制
+
+六种相机的固定参考向量由 `tests/reference_xnav_cameras.cpp` 调用实际 x-nav
+C++ 实现生成，保存在 `tests/fixtures/`，同时记录源文件 SHA256。
+普通测试无需安装 x-nav、ROS 或 C++ 编译器；先按 `tests/README.md` 安装 pytest：
+
+```bash
+.venv/bin/python -m pytest tests/test_xnav.py tests/test_xnav_native.py tests/test_xnav_prompt.py tests/test_track_3d_boxes.py \
+  tests/test_fusion.py tests/test_file_io.py tests/test_imgui_compat.py -q
+```
+
+验证覆盖投影、有效域、视场覆盖、坐标变换、时间精度、PCD 读取、V1 转换、
+空观测、去重计数、再关联、较早 ID 保留、缓存隔离及跳帧回放。
+
+2026-10-29 的参考地图实际处理了 68 个关键帧、136 张源图像和 680 个虚拟视图。
+CUDA/bfloat16 推理得到 264 个 2D 检测及 24 个融合后的 3D 检测。
+最大跨关键帧支持数为 2，默认要求 3，因此最终已确认物体为 0。
+可显示候选框检查结果；降低确认次数会放宽证据要求，不代表精度得到验证。
+该地图为室外场景，而 Boxer 主要面向室内物体；当前结果存在错误类别预测，
+没有人工标注或准确率评测。完整验收记录见 `output/xnav_validation.json`。
+
+2026-10-30 补充验证了交互式提示入口：在没有批处理结果的独立输出目录中直接加载地图，
+完成文本检测、真实鼠标拖框事件、相机/虚拟视图/关键帧切换、深度点及深度块叠加，
+并检查 3D 视口实际绘制的包围框像素。样例 `flag` 预测置信度约为 0.519：
+默认 0.6 阈值下拒绝，在界面调至 0.5 后接受；程序默认值保持 0.6。
+原有 Aria `nym10_gen1` 的 `light` 提示也通过 CUDA/OpenGL 窗口验证。
+验收记录：`output/xnav_prompt_validation.json`；截图：`output/xnav_prompt_smoke.png`。
+
+2026-10-30 双模式验收：完整地图的原生模式为 136 个观测，虚拟针孔为 680 个观测。
+原生模式使用 CUDA/bfloat16 完成全包推理，得到 209 个 2D 检测及 21 个关键帧融合
+3D 检测；最大支持数仍为 2，默认三关键帧确认条件下已确认物体为 0。
+虚拟针孔模式成功复用旧版 3D 缓存，分别生成独立的结果目录。
+两种模式的文本提示、鼠标拖框、切换、深度叠加及回放跳帧保持 ID 均通过窗口验收；
+原有 Aria `light` 提示入口也通过回归。原生 `flag` 单文本提示的 3D 置信度约 0.54，
+默认 0.6 下拒绝，界面调至 0.5 后接受，默认阈值保持不变。
+这些数量仅用于验收数据流，不是准确率指标。
+
+最新记录：`output/xnav_dual_mode_acceptance.json`、`output/xnav_dual_validation.json`；
+回归日志：`output/xnav_dual_regression.log`、`output/xnav_native_cuda_geometry.log`；
+原生提示窗口截图：`output/xnav_native_prompt_smoke.png`。

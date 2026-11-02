@@ -136,6 +136,9 @@ class BoundingBox3DTracker:
         self.samp_per_dim = samp_per_dim
         self.max_missed = max_missed
         self.force_cpu = force_cpu
+        self.xnav_accelerated = False
+        self.xnav_geometry_cuda = True
+        self._xnav_geometry = None
         self.merge_iou_threshold = merge_iou_threshold
         self.merge_semantic_threshold = merge_semantic_threshold
         self.merge_iou_2d_threshold = merge_iou_2d_threshold
@@ -372,77 +375,34 @@ class BoundingBox3DTracker:
         return float(torch.dot(ea.reshape(-1).float(), eb.reshape(-1).float()))
 
     def _mask_visible_boxes(self, bounds, visible, mask):
-        """Vectorized equivalent of the original clipped rectangle .any()."""
-        mask = mask.bool().cpu()
-        key = (mask.data_ptr(), tuple(mask.shape), tuple(mask.stride()))
-        pixels = mask.numpy()
-        cached = self._mask_integrals.get(key)
-        # Tensor wrappers around the same NumPy view are recreated each frame.
-        # Compare contents as well, so mutable external masks cannot go stale.
-        if cached is None or not np.array_equal(cached[0], pixels):
-            snapshot = pixels.copy()
-            integral = np.pad(
-                snapshot.astype(np.int64).cumsum(0).cumsum(1), ((1, 0), (1, 0))
-            )
-            if len(self._mask_integrals) >= 16:
-                self._mask_integrals.pop(next(iter(self._mask_integrals)))
-            self._mask_integrals[key] = snapshot, integral
-        else:
-            integral = cached[1]
-        indices = visible.nonzero(as_tuple=True)[0]
-        if not len(indices):
-            return visible
-        rectangles = bounds.reshape(-1, 4).cpu().numpy()[indices.numpy()]
-        if not np.isfinite(rectangles).all():
-            # Retain Python int()'s exception for non-finite visible bounds.
-            for value in rectangles.flat:
-                int(value)
-        # astype truncates towards zero just like Python int(), including -0.x.
-        rectangles = rectangles.astype(np.int64)
-        xa = np.maximum(0, rectangles[:, 0])
-        xb = np.minimum(pixels.shape[1], rectangles[:, 1] + 1)
-        ya = np.maximum(0, rectangles[:, 2])
-        yb = np.minimum(pixels.shape[0], rectangles[:, 3] + 1)
-        nonempty = (xb > xa) & (yb > ya)
-        xa, xb, ya, yb = (a[nonempty] for a in (xa, xb, ya, yb))
-        hits = np.zeros(len(indices), dtype=bool)
-        hits[nonempty] = (
-            integral[yb, xb] - integral[ya, xb] - integral[yb, xa] + integral[ya, xa]
-        ) > 0
-        visible[indices] = torch.from_numpy(hits)
-        return visible
+        from utils.xnav_geometry import mask_visible_boxes_cpu
+
+        return mask_visible_boxes_cpu(bounds, visible, mask, self._mask_integrals)
 
     def _multiview_visibility(self, observations):
+        from utils.xnav_geometry import XNavGeometry, visibility_cpu
+
         count = len(self.tracks)
-        projected = torch.zeros(count, dtype=torch.bool)
-        supported = torch.zeros(count, dtype=torch.bool)
         if not count:
-            return projected, supported
-        obbs = torch.stack([t.obb for t in self.tracks])
-        for view in observations:
-            bb2, ok = obbs.get_pseudo_bb2(
-                view.cam.unsqueeze(0),
-                view.T_world_rig.unsqueeze(0),
-                num_samples_per_edge=32 if view.cam.is_xnav else 4,
-                valid_ratio=0.16667,
+            return torch.zeros(0, dtype=torch.bool), torch.zeros(0, dtype=torch.bool)
+        obbs = torch.stack([track.obb for track in self.tracks])
+        # Below one point-support chunk, CPU geometry is cheaper and overlaps
+        # the next model call without launching many small CUDA kernels.
+        if (
+            self.xnav_accelerated
+            and count >= 256
+            and self.xnav_geometry_cuda
+            and not self.force_cpu
+            and torch.cuda.is_available()
+        ):
+            if self._xnav_geometry is None:
+                self._xnav_geometry = XNavGeometry()
+            return self._xnav_geometry.visibility(
+                obbs, observations, self.min_obs_points
             )
-            visible = ok.reshape(-1).cpu()
-            if view.valid_mask is not None:
-                visible = self._mask_visible_boxes(bb2, visible, view.valid_mask)
-            projected |= visible
-            if view.observed_points is None:
-                supported |= visible
-            elif len(view.observed_points):
-                points = view.observed_points.float().cpu()
-                indices = visible.nonzero(as_tuple=True)[0]
-                for chunk in indices.split(256):
-                    if not len(chunk):
-                        continue
-                    inside = obbs[chunk].batch_points_inside_bb3(
-                        points[None].expand(len(chunk), -1, -1)
-                    )
-                    supported[chunk] |= inside.sum(-1).cpu() >= self.min_obs_points
-        return projected, supported
+        return visibility_cpu(
+            obbs, observations, self.min_obs_points, self._mask_integrals
+        )
 
     def _update_multiview(self, detections, frame_idx, observations):
         """One association/aging pass per keyframe, using fresh view visibility.
@@ -535,14 +495,17 @@ class BoundingBox3DTracker:
         ordered = sorted(self.tracks, key=lambda t: t.track_id)
         boxes = torch.stack([t.obb for t in ordered])
         device = "cuda" if torch.cuda.is_available() and not self.force_cpu else "cpu"
-        overlap = iou_mc7(
-            boxes.to(device), boxes.to(device), samp_per_dim=self.samp_per_dim
-        ).cpu()
         visible = np.array([track.last_visible for track in ordered], dtype=bool)
-        # Preserve the original comparison (including its handling of NaN).
-        eligible = ~(overlap.numpy() < self.merge_iou_threshold)
-        eligible &= visible[:, None] | visible[None, :]
-        rows, columns = np.nonzero(np.triu(eligible, k=1))
+        if self.xnav_accelerated:
+            rows, columns = self._visible_merge_pairs(boxes.to(device), visible)
+        else:
+            overlap = iou_mc7(
+                boxes.to(device), boxes.to(device), samp_per_dim=self.samp_per_dim
+            ).cpu()
+            # Preserve the original comparison, including NaN handling.
+            eligible = ~(overlap.numpy() < self.merge_iou_threshold)
+            eligible &= visible[:, None] | visible[None, :]
+            rows, columns = np.nonzero(np.triu(eligible, k=1))
         absorbed = set()
         # np.nonzero traverses rows then columns, retaining greedy merge order.
         for i, j in zip(rows, columns):
@@ -572,6 +535,40 @@ class BoundingBox3DTracker:
                     self.id_aliases[old] = first.track_id
             absorbed.add(second.track_id)
         self.tracks = [t for t in self.tracks if t.track_id not in absorbed]
+
+    def _visible_merge_pairs(self, boxes, visible):
+        """Evaluate only eligible orientations, retaining the original i<j order."""
+        visible_ids = np.flatnonzero(visible)
+        if not len(visible_ids):
+            return np.empty(0, dtype=int), np.empty(0, dtype=int)
+        count = len(boxes)
+        pairs = []
+        # Visible rows may pair with any later column. Invisible rows only need
+        # visible columns. Both calls keep the original (lower ID, higher ID)
+        # IoU orientation rather than relying on approximate symmetry.
+        for row_ids, column_ids in (
+            (visible_ids, np.arange(count)),
+            (np.flatnonzero(~visible), visible_ids),
+        ):
+            for offset in range(0, len(row_ids), 256):
+                subset = row_ids[offset : offset + 256]
+                overlap = (
+                    iou_mc7(
+                        boxes[subset], boxes[column_ids], samp_per_dim=self.samp_per_dim
+                    )
+                    .cpu()
+                    .numpy()
+                )
+                eligible = ~(overlap < self.merge_iou_threshold)
+                eligible &= subset[:, None] < column_ids[None, :]
+                rows, columns = np.nonzero(eligible)
+                if len(rows):
+                    pairs.append(np.stack((subset[rows], column_ids[columns]), axis=1))
+        if not pairs:
+            return np.empty(0, dtype=int), np.empty(0, dtype=int)
+        pairs = np.concatenate(pairs)
+        pairs = pairs[np.lexsort((pairs[:, 1], pairs[:, 0]))]
+        return pairs[:, 0], pairs[:, 1]
 
     def _create_track(self, detection: ObbTW, frame_idx: int) -> None:
         """Create a new track from a detection."""
@@ -1238,3 +1235,4 @@ class BoundingBox3DTracker:
         self.id_aliases.clear()
         self._support_frames.clear()
         self._mask_integrals.clear()
+        self._xnav_geometry = None

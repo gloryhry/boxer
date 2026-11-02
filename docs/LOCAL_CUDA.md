@@ -88,6 +88,37 @@ TMPDIR="$runtime_dir/tmp" uv --no-cache pip install \
 `nvidia-smi` 和 PyTorch 也会报 CUDA 不可用。本机终端应能直接访问显卡。
 本次 GPU 验证使用了能访问宿主机 NVIDIA 设备的进程。
 
+## 验证记录
+
+2026-10-28 在本机实际验证：
+
+| 检查 | 结果 |
+| --- | --- |
+| Python 依赖一致性 | `uv pip check` 通过，155 个包 |
+| CUDA 实际运算 | bfloat16 矩阵乘法、注意力、卷积全部通过 |
+| 显卡架构 | compute capability 12.0 |
+| OpenGL 3.3 独立上下文 | NVIDIA GeForce RTX 5060 Laptop GPU，创建成功 |
+| 项目入口和数据/图形依赖 | 四个入口脚本及 Aria、OpenCV、查看器依赖导入成功 |
+| 官方样例 | `--input nym10_gen1 --max_n 90 --track`，退出码 0 |
+| 模型设备和精度 | CUDA，OWLv2 使用 bfloat16，BoxerNet 权重 320/320 全部加载 |
+| 帧数 | 90/90，2D 和 3D CSV 均覆盖 90 个时间戳 |
+| 检测结果 | 2038 条 2D 检测、1848 条 3D 检测、60 条最终跟踪结果 |
+| 结果数值 | 数值全部有限、置信度在 [0, 1]、3D 尺寸为正 |
+| 视频 | H.264，2880×960，10 FPS，90 帧，9 秒 |
+
+日志确认 `Using device cuda` 和 `Loaded OWLv2 on cuda ... precision=bfloat16`；
+运行期间 `nvidia-smi` 也观察到本项目 Python 进程占用显卡。
+帧处理循环约 19 秒，包含检测、3D 提升、跟踪和逐帧可视化；不包含首次模型加载、
+内核编译和最后的视频编码时间。
+
+完整日志：`output/local_cuda_demo.log`。
+CSV 数值检查结果：`output/local_cuda_validation.json`。
+查看器进一步完成 NVIDIA 桌面窗口验证：自动执行 `light` 提示，得到 1 个 2D 检测，
+成功提升并接受 1 个 3D 框，实际绘制 6.0 和 3.0 像素线宽的矩形，连续渲染 8 帧后
+正常关闭（退出码 0）。日志：`output/local_cuda_gui.log`；
+结果：`output/gui_prompt_validation.json`；窗口图像：`output/gui_prompt_smoke.jpg`。
+日志中的自动调优提示和 NumPy 弃用警告没有阻止此次样例完成。
+
 ## `add_rect` 界面兼容修复
 
 本机安装的 `imgui-bundle==1.93.0` 使用新版 Dear ImGui 绘图接口。Dear ImGui 从
@@ -98,6 +129,14 @@ TMPDIR="$runtime_dir/tmp" uv --no-cache pip install \
 
 已在 `utils/imgui_compat.py` 中改用 `rounding=...`、`thickness=...`、`flags=...`
 关键字传参，保留上层调用接口。依赖版本保持不变。
+新增三个直接调用真实 imgui-bundle 绑定的回归测试，覆盖默认线宽、查看器使用的
+浮点线宽，以及圆角标志和线宽对应的实际顶点/索引几何。修复前复现相同异常，
+修复后全部通过：
+
+```bash
+.venv/bin/python -m unittest discover -s tests -p test_imgui_compat.py -v
+```
+
 接口变更说明：[Dear ImGui Draw List](https://github.com/ocornut/imgui/wiki/Draw-List#rectangles)。
 
 参考：[Boxer 官方安装与示例](https://github.com/facebookresearch/boxer)、

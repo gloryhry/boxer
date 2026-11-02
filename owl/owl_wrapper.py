@@ -332,36 +332,86 @@ class OwlWrapper(nn.Module):
                 self.vision_detector(dummy, self.text_embeddings, self.query_mask)
 
     @torch.no_grad()
-    def forward(self, image_torch, resize_to_HW=(906, 906)):
-        _debug = os.environ.get("DEBUG", "0") == "1"
-        assert len(image_torch.shape) == 4, "input image should be 4D tensor"
-        assert image_torch.shape[0] == 1, "only batch size 1 is supported"
+    def prepare_image(self, image_torch):
+        """Preserve the scalar preprocessing order; safe to prefetch on CPU."""
         if (
             image_torch.max() < 1.01
             or image_torch.max() > 255.0
-            or image_torch.min() < 0.0
+            or image_torch.min() < 0
         ):
             print("warning: input image should be in [0, 255] as a float")
+        image = image_torch.clone()
+        mode = "bilinear" if self.device == "mps" else "bicubic"
+        pixels = F.interpolate(
+            image, size=self.native_size, mode=mode, align_corners=False
+        )
+        pixels = pixels / 255.0
+        return (pixels - self.image_mean.to(pixels.device)) / self.image_std.to(
+            pixels.device
+        )
 
+    @torch.no_grad()
+    def forward_batch(self, images, *, prepared=None):
+        """Return scalar-format detections for one or two ordered images."""
+        if images.ndim != 4 or not 1 <= images.shape[0] <= 2:
+            raise ValueError("OWLv2 batches must contain one or two images")
+        if images.shape[0] == 1:
+            return [self.forward(images, prepared=prepared)]
+        if prepared is None:
+            prepared = torch.cat(
+                [self.prepare_image(images[i : i + 1]) for i in range(len(images))]
+            )
+        pixels = prepared.to(self.device)
+        if self.use_bfloat16:
+            pixels = pixels.to(torch.bfloat16)
+        logits, predicted = self.vision_detector(
+            pixels, self.text_embeddings, self.query_mask
+        )
+        scores, labels = logits.float().max(-1)
+        scores = scores.sigmoid()
+        cx, cy, w, h = predicted.float().unbind(-1)
+        height, width = images.shape[-2:]
+        # Convert on the device in the same operation order as forward().
+        xyxy = torch.stack(
+            [
+                (cx - w / 2) * width,
+                (cy - h / 2) * height,
+                (cx + w / 2) * width,
+                (cy + h / 2) * height,
+            ],
+            -1,
+        )
+        # Three batch transfers replace per-image scalar/dynamic transfers.
+        xyxy, scores, labels = xyxy.cpu(), scores.cpu(), labels.cpu()
+        outputs = []
+        for boxes, confidence, names in zip(xyxy, scores, labels):
+            keep = confidence > self.min_confidence
+            boxes, confidence, names = boxes[keep], confidence[keep], names[keep]
+            too_big = (boxes[:, 2] - boxes[:, 0] > 0.9 * width) | (
+                boxes[:, 3] - boxes[:, 1] > 0.9 * height
+            )
+            too_small = (boxes[:, 2] - boxes[:, 0] < 0.05 * width) | (
+                boxes[:, 3] - boxes[:, 1] < 0.05 * height
+            )
+            keep = ~(too_big | too_small)
+            boxes, confidence, names = boxes[keep], confidence[keep], names[keep]
+            if self.nms_iou_threshold < 1 and len(boxes):
+                keep = _per_class_nms(boxes, confidence, names, self.nms_iou_threshold)
+                boxes, confidence, names = boxes[keep], confidence[keep], names[keep]
+            outputs.append((boxes[:, [0, 2, 1, 3]], confidence, names, None))
+        return outputs
+
+    @torch.no_grad()
+    def forward(self, image_torch, resize_to_HW=(906, 906), *, prepared=None):
+        _debug = os.environ.get("DEBUG", "0") == "1"
+        assert len(image_torch.shape) == 4, "input image should be 4D tensor"
+        assert image_torch.shape[0] == 1, "only batch size 1 is supported"
         if _debug:
             torch.cuda.synchronize()
             _t0 = time.perf_counter()
 
-        input_image = image_torch.clone()
-        HH, WW = input_image.shape[2], input_image.shape[3]
-
-        # Preprocess: resize to native model resolution, normalize
-        interp_mode = "bilinear" if self.device == "mps" else "bicubic"
-        pixel_values = F.interpolate(
-            input_image,
-            size=self.native_size,
-            mode=interp_mode,
-            align_corners=False,
-        )
-        pixel_values = pixel_values / 255.0
-        mean = self.image_mean.to(pixel_values.device)
-        std = self.image_std.to(pixel_values.device)
-        pixel_values = (pixel_values - mean) / std
+        HH, WW = image_torch.shape[2:]
+        pixel_values = self.prepare_image(image_torch) if prepared is None else prepared
         pixel_values = pixel_values.to(self.device)
         if self.use_bfloat16:
             pixel_values = pixel_values.to(dtype=torch.bfloat16)
