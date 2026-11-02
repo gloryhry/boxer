@@ -165,6 +165,9 @@ def main():
         frame_ts = [ts for ts in frame_ts if range_start <= ts <= range_end]
 
         empty_timed_obbs = {int(ts): empty_obb for ts in frame_ts}
+    elif xnav_loader is not None:
+        # Timestamp-keyed dictionaries collapse groups and sort across time resets.
+        empty_timed_obbs = {i: empty_obb for i in range(len(xnav_loader))}
     else:
         empty_timed_obbs = {int(ts): empty_obb for ts in seq_ctx["rgb_timestamps"]}
 
@@ -1441,8 +1444,12 @@ def main():
             """Render prompt + visualization controls (playback is in bottom bar)."""
             if xnav_loader is not None:
                 self._section_header("x-nav map")
-                key = xnav_loader.keyframe_ids[self.current_frame_idx]
-                imgui.text(f"Keyframe {key}")
+                key = xnav_loader.frame_ids[self.current_frame_idx]
+                metadata = xnav_loader.map.frame_metadata(key)
+                if metadata["image_frame_id"] is not None:
+                    imgui.text(f"Image group {key} | LiDAR keyframe {metadata['lidar_keyframe_id']}")
+                else:
+                    imgui.text(f"LiDAR keyframe {key}")
                 ids = xnav_loader.camera_ids
                 changed, selection = imgui.combo(
                     "Camera",
@@ -1463,10 +1470,10 @@ def main():
                 if self._xnav_can_prompt():
                     datum = xnav_loader.load(self.current_frame_idx)
                     imgui.text(f"Image time: {datum['time_ns0']} ns")
-                    imgui.text(f"Input points: {len(datum['sdp_w'])} (keyframe view)")
+                    imgui.text(f"Input points: {len(datum['sdp_w'])} (anchor cloud view)")
                 else:
                     imgui.text_wrapped(
-                        "No image for this keyframe and camera. Select another camera or keyframe."
+                        "No image for this frame and camera. Select another camera or frame."
                     )
             # Prompt controls (in sidebar)
             self._section_header("Prompt")

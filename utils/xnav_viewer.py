@@ -8,7 +8,7 @@ import moderngl
 import numpy as np
 
 import utils.imgui_compat as imgui
-from loaders.xnav_loader import XNavMapLoader, read_pcd
+from loaders.xnav_loader import XNavMapLoader, processing_frame_id, read_pcd
 from utils.image import draw_bb3s, put_text, render_bb2
 from utils.tw.obb import BB3D_LINE_ORDERS
 from utils.viewer_3d import OrbitViewer, _perspective_projection, launch_viewer
@@ -130,9 +130,9 @@ def launch_xnav_viewer(args):
                 points, _ = read_pcd(cloud_path)
             else:
                 key = (
-                    replay.frames[0]["keyframe_id"]
+                    processing_frame_id(replay.frames[0])
                     if replay.frames
-                    else loader.keyframe_ids[0]
+                    else loader.frame_ids[0]
                 )
                 points, _ = loader.world_points(key)
             if len(points) > 500000:
@@ -143,7 +143,7 @@ def launch_xnav_viewer(args):
             self.scene_center = (
                 np.median(points, axis=0)
                 if len(points)
-                else loader.poses[loader.keyframe_ids[0]][:3, 3]
+                else loader.poses[loader.frame_ids[0]][:3, 3]
             )
             self.scene_radius = max(
                 5.0,
@@ -191,7 +191,7 @@ def launch_xnav_viewer(args):
                 axis=0,
             ).reshape(-1, 3)
             self._geometry("boxes", positions, colors)
-            key = replay.frame(self.index)["keyframe_id"]
+            key = processing_frame_id(replay.frame(self.index))
             if self.show_obs:
                 xyz, rgb = loader.world_points(key)
                 step = max(1, len(xyz) // 50000)
@@ -218,7 +218,7 @@ def launch_xnav_viewer(args):
                 return
             observation = observations[self.view_index]
             datum = loader.load_view(
-                frame["keyframe_id"],
+                processing_frame_id(frame),
                 observation["camera_id"],
                 observation["view_id"],
                 with_points=False,
@@ -320,14 +320,18 @@ def launch_xnav_viewer(args):
                     self._select_frame(len(replay.frames) - 1)
                 imgui.text_wrapped("Closing this window leaves inference running.")
             if not replay.frames:
-                imgui.text("Waiting for the first completed keyframe...")
+                imgui.text("Waiting for the first completed frame...")
                 imgui.end()
                 return
             frame = replay.frame(self.index)
-            frame_number = frame["keyframe_id"]
-            imgui.text(
-                f"Keyframe {frame_number} | {self.index + 1}/{len(replay.frames)}"
+            frame_number = processing_frame_id(frame)
+            metadata = loader.frame_metadata(frame_number)
+            label = (
+                f"Image group {frame_number} | LiDAR {metadata['lidar_keyframe_id']}"
+                if metadata["image_frame_id"] is not None
+                else f"LiDAR keyframe {frame_number}"
             )
+            imgui.text(f"{label} | {self.index + 1}/{len(replay.frames)}")
             imgui.text(f"Map time: {frame['time_ns']} ns")
             changed, index = imgui.slider_int(
                 "Frame", self.index, 0, len(replay.frames) - 1
@@ -363,7 +367,7 @@ def launch_xnav_viewer(args):
                 )
                 imgui.image(self.texture.glo, width, width * 2)
             else:
-                imgui.text("No image observation in this keyframe")
+                imgui.text("No image observation in this frame")
             imgui.text(f"{len(self.current_boxes)} displayed 3D objects")
             imgui.text_wrapped("IDs come from saved snapshots; seeking never retracks.")
             imgui.end()

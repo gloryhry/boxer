@@ -159,7 +159,10 @@ python view_prompt.py --input scene0707_00
 
 V6 x-nav map snapshots with keyframe images can be used directly. All six x-nav
 camera models and calibration schemas V1/V2 are supported. Native projection
-is the default and uses the front hemisphere, with one static-tracker update per keyframe.
+is the default and uses the front hemisphere. New maps with independently sampled
+image groups use each group's exported pose and update the static tracker once per
+group, using the associated LiDAR keyframe cloud for depth. Legacy six-column
+image indexes keep their original LiDAR-keyframe timeline.
 Use `--xnav_camera_mode virtual_pinhole` for the original virtual-view pipeline.
 Outputs are isolated under `output/<map_id>/<snapshot_id>/<camera_mode>/`.
 

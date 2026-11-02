@@ -79,27 +79,53 @@ bash scripts/run_local_cuda.sh view_prompt.py \
 ```text
 manifest.txt                 # format/schema_version/map_id/snapshot_id 等
 poses_base.txt               # 每行 timestamp tx ty tz qx qy qz qw
+poses_image_base.txt         # 新索引必需：前八列同上，末列 lidar_keyframe_id
 camera_calibration.yaml      # 原始图像尺寸、相机模型、内外参
-images/index.csv             # keyframe_id,camera_id,image_stamp_ns,file,source,status
-images/<keyframe>_cam<id>.jpg
+images/index.csv             # 新七列或旧六列索引，见下文
+images/<image_frame>_cam<id>.jpg # 旧包使用雷达关键帧编号
 rgb/<keyframe>.pcd           # 优先使用的彩色关键帧点云
 surf/<keyframe>.pcd          # RGB 点云缺失或为空时的回退几何
 global_map.pcd               # 回放背景；缺失时显示一个关键帧点云
 config/map_config.yaml       # V1 标定转换所需的地图自身配置
 ```
 
-位姿、点云编号和图像通过 `keyframe_id` 关联，不对图像时间戳做近邻匹配。
+新索引为 `image_frame_id,keyframe_id,camera_id,image_stamp_ns,file,source,status`。
+`image_frame_id` 是从 0 连续递增的同步图像组编号；索引中的 `keyframe_id` 是
+雷达锚点编号，对应 `poses_base.txt` 的行号及 `rgb/`、`surf/` 点云编号。
+每个图像组在 `poses_image_base.txt` 中对应一行，末列必须与索引的雷达关联一致。
+一个雷达帧可以关联多个图像组；使用已导出的优化后图像位姿，不做插值或时间近邻匹配。
+
+旧六列索引 `keyframe_id,camera_id,image_stamp_ns,file,source,status` 仍按雷达关键帧
+编号、位姿及原有空观测加载，无需迁移。七列索引缺少图像位姿文件，或六列索引混入
+该文件时，均明确报错。两种格式保持 V6 manifest 不变。
+
 图像使用索引中的原始纳秒时间戳；位姿时间戳按十进制解析，避免浮点换算丢失精度。
+组估计时间与各相机原始时间允许不同。处理及提示界面导航按导出编号推进，
+时间重复或回退不会合并、重排图像组；按时间戳查询遇到重复值时要求改用帧索引。
 `no_image`、`disabled`、`legacy` 是合法空观测；不会使用历史图像填补。
 索引重复、缺少已保存图像、图像解码失败、尺寸不符及非法标定会明确报错。
 
 地图坐标为米制、Z 轴向上。点云已在关键帧 `base_link` 坐标系中，
-只应用一次关键帧位姿。相机位姿为：
+只应用一次雷达锚点位姿。图像和点云分别变换：
 
 ```text
-T_map_camera = T_map_base × T_base_camera
+T_map_camera = T_map_image_base × T_base_camera
 T_map_virtual = T_map_camera × T_camera_virtual
+p_map_cloud = T_map_lidar_base × p_lidar_base
 ```
+
+新包的 `--start_n`、`--skip_n`、`--max_n` 及跟踪命中次数均按图像组计数，
+推理入口 `--start_n` 从 1 开始，提示和回放入口从 0 开始。默认命中阈值仍为 3。
+旧包继续按雷达关键帧计数。点云缓存按雷达锚点复用，完整校验只检查每个雷达点云一次。
+
+例如验证独立采样地图包：
+
+```bash
+python run_boxer.py --input /home/glory/Code/digitaltwins-x-nav/nav_map/img4 --validate_input
+```
+
+校验分别报告 `keyframes`（雷达帧数）、`image_frames`、`frames` 与 `selected_frames`。
+该地图包应为 329 个雷达帧、1776 个图像组和 3552 张图像。
 
 V2 标定的 `Rbc/Pbc` 表示 `p_base = Rbc*p_camera + Pbc`，矩阵按行存储。
 V1 的 `Rcl/Pcl` 使用地图自身保存的 `input_transform` 在内存中转换；
@@ -132,16 +158,16 @@ Z≤0 区域置黑并禁用提示；不再额外裁至 140°，因此可保留�
 点云先转到地图系，再按当前模式相机投影、筛选掩码及最近深度，
 最后确定性采样，每个观测最多 10,000 点。图像和点云使用同一份观测相机标定。
 
-各视图分别运行检测和 3D 提升。同一关键帧内以 0.3 的 3D IoU 和
+各视图分别运行检测和 3D 提升。同一处理帧内以 0.3 的 3D IoU 和
 0.7 的语义相似阈值融合重复检测，然后只更新一次跟踪器。
-跨关键帧匹配的 3D IoU 默认 0.25。确认需要三个不同关键帧的支持，
+跨处理帧匹配的 3D IoU 默认 0.25。确认需要三个不同处理帧的支持，
 同一帧的双目和重叠视图不会增加确认次数。
 
 跟踪匹配前刷新当前多视图可见性。投影视场约束匹配，点云支持约束漏检计数；
 离开视野或无图观测不会累计可见漏检。稀疏点云不会阻止已有 ID 再关联。
 候选轨迹在至少三次有几何支持的可见漏检后移除；已确认轨迹沿用 Boxer
 默认 90 次漏检的耐心参数及置信度调整。轨迹合并保留较早 ID，记录别名，
-支持数按不同关键帧去重。
+支持数按不同处理帧去重；新包中共享雷达锚点的不同图像组分别计数。
 
 这是静态物体的跨视角关联，不估计运动速度或运动轨迹。
 
@@ -154,12 +180,12 @@ Z≤0 区域置黑并禁用提示；不再额外裁至 140°，因此可保留�
 | `--xnav_cameras all` | 全部相机；也可指定 `0` 或 `0,1` |
 | `--xnav_execution auto` | CUDA 使用有界流水线；CPU/MPS 串行执行。指定 `serial` 可回退对照 |
 | `--xnav_detector_batch_size 1` | OWLv2 每批 1 或 2 个有序观测；BoxerNet 始终逐相机运行 |
-| `--start_n 1 --skip_n 1 --max_n 68` | 从第一个关键帧开始，按关键帧计数，而非虚拟视图 |
+| `--start_n 1 --skip_n 1 --max_n 68` | 从第一个处理帧开始；新包按图像组、旧包按雷达帧计数 |
 | `--labels lvisplus` | 默认开放词汇类别表；可用带引号的逗号分隔文本提示 |
 | `--thresh2d 0.25 --thresh3d 0.5` | 分别筛选 2D、3D 模型置信度；保存的框分数为二者均值 |
 | `--track` | 静态物体关联与全局框融合 |
-| `--live_viz` | 推理时自动打开 3D 窗口，跟随新完成的关键帧；需要桌面显示环境 |
-| `--track_min_hits 3` | 确认物体所需的不同关键帧数 |
+| `--live_viz` | 推理时自动打开 3D 窗口，跟随新完成的处理帧；需要桌面显示环境 |
+| `--track_min_hits 3` | 确认物体所需的不同处理帧数 |
 | `--no_sdp` | 仅图像推理，并按投影视场判断可见性 |
 | `--skip_viz` | 不输出逐帧预览和视频 |
 | `--cache2d` | 复用保存的各相机、各视图 2D 检测，重新运行 BoxerNet |
@@ -167,21 +193,30 @@ Z≤0 区域置黑并禁用提示；不再额外裁至 140°，因此可保留�
 | `--no_csv` | 保留 JSON 结果与回放，不导出 CSV |
 | `--profile` | 输出 `performance.json`：分阶段时间、前中后段速度、轨迹数、保存大小及内存峰值；默认关闭 |
 
-x-nav 自动进行关键帧内融合；全局融合使用 `--track`。`--fuse` 保持用于原有数据集。
+x-nav 自动进行处理帧内融合；全局融合使用 `--track`。`--fuse` 保持用于原有数据集。
 
-缓存以模式和 `(keyframe_id, camera_id, view_id)` 关联，区分不同相机的相同时间戳，
-并保存零检测的观测。复用前检查地图元数据、图像/点云文件状态和推理参数，
-不匹配或未覆盖选定关键帧时拒绝复用。改变 `--track_min_hits` 可从 3D 缓存重建轨迹。
+缓存以模式和 `(frame_id, camera_id, view_id)` 关联，区分共享雷达锚点的不同图像组，
+以及不同相机的相同时间戳，并保存零检测的观测。
+复用前检查地图元数据、图像/点云文件状态和推理参数，
+不匹配或未覆盖选定处理帧时拒绝复用。图像位姿文件内容纳入来源签名，位姿修改后
+缓存失效；旧包没有该文件时原签名不变。改变 `--track_min_hits` 可从 3D 缓存重建轨迹。
+
+结果保留原有 schema 2 文档和 schema 3 运行中日志格式。新增 `frame_unit`（`image` 或
+`lidar`）；帧和观测包含 `frame_id`、`image_frame_id`、`lidar_keyframe_id`。
+结果中的 `keyframe_id` 是处理编号的兼容别名，与原始索引中表示雷达关联的同名字段
+不同；`sources` 保留索引字段含义。旧结果缺少新增字段时仍可读取。
+最终统计中的 `processed_frames` 是处理次数，`keyframes` 是涉及的不同雷达帧数，
+`image_frames` 是处理的图像组数。
 
 ### 性能观测
 
 CUDA 默认命令使用图像/点云预取、单模型推理线程和独立 CPU 输出进程。
-主线程按关键帧顺序融合与跟踪；模型和跟踪使用独立 CUDA stream。
+主线程按处理帧顺序融合与跟踪；模型和跟踪使用独立 CUDA stream。
 从开始推理到可靠提交确认占用两个全局额度，最多两帧在途；不会跳帧。
 输出进程逐帧生成 CSV/预览，执行原有 fsync 和原子发布后才确认提交。
 类别、分辨率、相机、深度输入、检测阈值、投影采样及关联顺序保持原设置。
 
-OWLv2 可对同一关键帧的相邻两个观测批处理，沿用原 CPU resize/归一化和逐图 NMS。
+OWLv2 可对同一处理帧的相邻两个观测批处理，沿用原 CPU resize/归一化和逐图 NMS。
 默认 batch=1；Orin NX 的完整地图验证中，batch=2 的置信度误差超过 0.002，
 因此没有进入默认路径。BoxerNet 固定 batch=1。批量推理遇到 CUDA OOM 时，仅当前组按单图重试，
 本次运行后续使用单图；`execution` 元数据记录实际批量及回退次数。
@@ -192,7 +227,7 @@ CPU/MPS 和 `--xnav_execution serial` 使用原串行模型调用。
 bash scripts/run_local_cuda.sh --input /path/to/map --track --profile
 ```
 
-结果目录的 `performance.json` 包含每个关键帧的阶段耗时、实际关键帧 ID、轨迹数和
+结果目录的 `performance.json` 包含每个处理帧的阶段耗时、处理帧 ID、轨迹数和
 累计持久化大小，另有 CPU RSS 与本进程 CUDA 分配/保留内存峰值。
 `steady_stages` 和 `steady_frames` 排除开头两个预热帧；`segments` 将预热后的帧
 分为前、中、后三段，分别报告 p50/p95。初始化、最终完整 JSON 导出和视频编码
@@ -244,10 +279,10 @@ OWLv2 和 BoxerNet 默认均为 batch=1；batch=2 未通过置信度误差门槛
 | --- | --- |
 | `results.json` | 完整帧索引、相机/视图、各视图 2D/3D 观测、逐帧跟踪状态、参数、别名及最终物体 |
 | `owl_2dbbs.csv` | 带 `frame_id`、原图时间戳及 `cam<id>/<view>` 标识的 2D 框 |
-| `boxer_3dbbs.csv` | 每个关键帧融合后的 3D 检测，时间戳来自关键帧位姿 |
-| `boxer_3dbbs_tracks.csv` | 各关键帧的已确认跟踪框，`instance` 为持久 ID |
+| `boxer_3dbbs.csv` | 每个处理帧融合后的 3D 检测，时间戳来自对应位姿 |
+| `boxer_3dbbs_tracks.csv` | 各处理帧的已确认跟踪框，`instance` 为持久 ID |
 | `boxer_3dbbs_tracked.csv` | 最终已确认全局物体，兼容 Boxer OBB CSV |
-| `preview_frames/`、`boxer_viz_final.mp4` | 检测/跟踪预览；视频按每秒 5 个关键帧编码 |
+| `preview_frames/`、`boxer_viz_final.mp4` | 检测/跟踪预览；视频按每秒 5 个处理帧编码 |
 
 `--write_name` 会替换 3D CSV 和视频的 `boxer` 前缀。
 新版 JSON 使用 schema_version 2，包含模式、原始相机参数、图像变换、有效域策略和预处理版本。
@@ -274,7 +309,7 @@ bash scripts/run_local_cuda.sh view_tracker.py \
   --input /home/glory/Code/digitaltwins-x-nav/nav_map/img2 --live
 ```
 
-实时窗口每完成一个关键帧就更新图像、3D 框和物体 ID；第一帧完成前显示等待状态。
+实时窗口每完成一个处理帧就更新图像、3D 框和物体 ID；第一帧完成前显示等待状态。
 `Follow latest result` 默认开启；拖动帧滑块或播放历史时停止跟随，重新勾选即可回到
 最新结果。暂停查看、旋转和缩放不会暂停推理。关闭窗口也不会停止推理，推理完成后
 窗口保留并显示 `complete`，可继续查看；中断和失败会显示对应状态。

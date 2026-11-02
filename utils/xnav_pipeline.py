@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from loaders.xnav_loader import XNavMapLoader
+from loaders.xnav_loader import XNavMapLoader, frame_identity, processing_frame_id
 from utils.exception_compat import add_exception_note
 from utils.file_io import ObbCsvWriter2, save_bb2d_csv
 from utils.fuse_3d_boxes import BoundingBox3DFuser
@@ -151,6 +151,7 @@ def source_signature(loader):
     for name in (
         "manifest.txt",
         "poses_base.txt",
+        "poses_image_base.txt",
         "camera_calibration.yaml",
         "images/index.csv",
         "content_hashes.txt",
@@ -290,7 +291,7 @@ def _preview(frame, detections, tracks, path, size=960):
     if not frame["views"]:
         panel = np.zeros((size, size * 2, 3), dtype=np.uint8)
         put_text(
-            panel, f"Keyframe {frame['keyframe_id']}: no image observation", line=0
+            panel, f"Frame {processing_frame_id(frame)}: no image observation", line=0
         )
         if not cv2.imwrite(str(path), panel):
             raise OSError(f"Could not write x-nav preview: {path}")
@@ -313,7 +314,7 @@ def _preview(frame, detections, tracks, path, size=960):
         viz = draw_bb3s(
             image.copy(), datum["T_world_rig0"], datum["cam0"], boxes, texts=labels
         )
-        put_text(viz, f"{title} | keyframe {frame['keyframe_id']}", line=0)
+        put_text(viz, f"{title} | frame {processing_frame_id(frame)}", line=0)
         panels.append(viz)
     if not cv2.imwrite(str(path), np.hstack(panels)):
         raise OSError(f"Could not write x-nav preview: {path}")
@@ -334,9 +335,9 @@ def _infer_keyframe(
     device,
 ):
     """Model-only work, independent of the ordered tracker and output owner."""
-    key = frame["keyframe_id"]
+    key = processing_frame_id(frame)
     frame_record = {
-        "keyframe_id": key,
+        **frame_identity(frame),
         "time_ns": frame["time_ns"],
         "T_map_base": frame["T_map_base"].tolist(),
         "sources": frame["sources"],
@@ -419,7 +420,7 @@ def _infer_keyframe(
             bb2, scores = bb2[keep], scores[keep]
             names = [name for name, ok in zip(names, keep) if ok]
         observation = {
-            "keyframe_id": key,
+            **frame_identity(frame),
             "camera_id": cid,
             "view_id": view_id,
             "image_stamp_ns": datum["time_ns0"],
@@ -541,10 +542,10 @@ def run_xnav(args):
                 "Cached results do not match source map or inference parameters"
             )
     cached_frames = (
-        {f["keyframe_id"]: f for f in previous["frames"]} if previous else {}
+        {processing_frame_id(f): f for f in previous["frames"]} if previous else {}
     )
-    if previous and not set(loader.keyframe_ids) <= cached_frames.keys():
-        raise ValueError("Cache does not cover selected keyframes")
+    if previous and not set(loader.frame_ids) <= cached_frames.keys():
+        raise ValueError("Cache does not cover selected frames")
 
     device = (
         "cpu"
@@ -628,6 +629,7 @@ def run_xnav(args):
         "status": "running",
         "map_root": str(loader.root),
         "manifest": loader.manifest,
+        "frame_unit": loader.frame_unit,
         "source_signature": signature,
         "coordinate_frame": "map",
         "unit": "metre",
@@ -688,6 +690,7 @@ def run_xnav(args):
     observed_index, start = 0, time.perf_counter()
     store = None
     counts = Counter()
+    processed_anchors = set()
     frame_record = None
     live_viewer = None
     execution = output_worker = source = None
@@ -726,7 +729,7 @@ def run_xnav(args):
 
     def serial_source():
         for index, frame in enumerate(
-            profiler.iterate(loader.iter_keyframes(with_points=not args.no_sdp))
+            profiler.iterate(loader.iter_frames(with_points=not args.no_sdp))
         ):
             yield InferredKeyframe(index, frame, infer(frame), profiler.current)
 
@@ -746,7 +749,7 @@ def run_xnav(args):
                     on_commit=committed,
                 )
                 execution = XNavExecution(
-                    loader.iter_keyframes(with_points=not args.no_sdp),
+                    loader.iter_frames(with_points=not args.no_sdp),
                     infer,
                     profiler,
                     prepare=prepare,
@@ -761,7 +764,7 @@ def run_xnav(args):
             from utils.xnav_live import start_live_viewer
 
             live_viewer = start_live_viewer(args, output)
-        for work in tqdm(source, total=len(loader), desc="x-nav keyframes"):
+        for work in tqdm(source, total=len(loader), desc=f"x-nav {loader.frame_unit} frames"):
             with (
                 profiler.bind(work.profile),
                 (
@@ -814,7 +817,7 @@ def run_xnav(args):
                         ).reshape(-1, 4)
                         save_bb2d_csv(
                             str(output / "owl_2dbbs.csv"),
-                            frame["keyframe_id"],
+                            processing_frame_id(frame),
                             bb2[:, [0, 2, 1, 3]],
                             np.asarray(observation["scores_2d"], dtype=np.float32),
                             observation["labels_2d"],
@@ -862,7 +865,10 @@ def run_xnav(args):
                         )
                     profiler.committed()
                 counts.update(
-                    keyframes=1,
+                    processed_frames=1,
+                    image_frames=int(loader.frame_unit == "image" or any(
+                        s["status"] == "saved" for s in frame["sources"]
+                    )),
                     source_images=sum(s["status"] == "saved" for s in frame["sources"]),
                     view_observations=len(frame_record["observations"]),
                     detections_2d=sum(
@@ -870,6 +876,8 @@ def run_xnav(args):
                     ),
                     detections_3d=len(frame_record["detections"]),
                 )
+                processed_anchors.add(frame_record["lidar_keyframe_id"])
+                counts["keyframes"] = len(processed_anchors)
                 if profiler.enabled:
                     profiler.record_frame(
                         len(frame_record["tracks"]),

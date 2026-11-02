@@ -3,7 +3,7 @@
 import csv
 import re
 from collections import Counter, OrderedDict
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import cv2
@@ -21,6 +21,57 @@ def is_xnav_map(path):
     return (root / "manifest.txt").is_file() or (
         (root / "images/index.csv").is_file() and (root / "poses_base.txt").is_file()
     )
+
+
+def processing_frame_id(record):
+    """Read the processing identity, including results written before frame_id."""
+    return record["frame_id"] if "frame_id" in record else record["keyframe_id"]
+
+
+def frame_identity(record):
+    key = processing_frame_id(record)
+    return {
+        "frame_id": key,
+        "keyframe_id": key,  # Compatibility alias, never the cloud lookup key.
+        "image_frame_id": record.get("image_frame_id"),
+        "lidar_keyframe_id": record.get("lidar_keyframe_id", key),
+    }
+
+
+def _read_poses(path, with_anchors=False):
+    poses, times, anchors = [], [], []
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        fields = line.split()
+        try:
+            if len(fields) != (9 if with_anchors else 8):
+                raise ValueError(
+                    "Expected timestamp tx ty tz qx qy qz qw"
+                    + (" lidar_keyframe_id" if with_anchors else "")
+                )
+            stamp = Decimal(fields[0])
+            if not stamp.is_finite():
+                raise ValueError("Non-finite pose timestamp")
+            time_ns = int(stamp * 1_000_000_000)
+            if not -(2**63) <= time_ns < 2**63:
+                raise ValueError("Pose timestamp exceeds int64 nanoseconds")
+            values = _numbers(fields[1:8], 7)
+            q = values[3:]
+            norm = np.linalg.norm(q)
+            if not np.isfinite(norm) or abs(norm - 1) > 1e-3:
+                raise ValueError("Invalid pose quaternion/translation")
+            q = q / norm
+            T = np.eye(4)
+            T[:3, :3] = quat_to_rotmat(q[3], q[0], q[1], q[2])
+            T[:3, 3] = values[:3]
+            if with_anchors:
+                if not re.fullmatch(r"[0-9]+", fields[8]):
+                    raise ValueError("Invalid LiDAR keyframe association")
+                anchors.append(int(fields[8]))
+        except (ValueError, InvalidOperation) as error:
+            raise ValueError(f"{path.name}:{number}: {error}") from error
+        poses.append(T)
+        times.append(time_ns)
+    return poses, times, anchors
 
 
 def _numbers(value, count):
@@ -172,10 +223,11 @@ def read_pcd(path):
 
 
 class XNavMapLoader:
-    """Iterate keyframes, each containing zero or more Boxer-compatible views.
+    """Iterate image groups (or legacy LiDAR frames), with calibrated views.
 
-    start_n is one-based, as in run_boxer; skip_n/max_n count keyframes,
-    independently of how many cameras or virtual views each frame contains.
+    start_n is one-based; skip_n/max_n count processing frames. poses,
+    pose_times_ns and the keyframe_ids alias address that same timeline.
+    LiDAR poses and cloud identities are stored separately.
     """
 
     def __init__(
@@ -224,52 +276,69 @@ class XNavMapLoader:
         )
         if not self.camera_ids or not set(self.camera_ids) <= self.cameras.keys():
             raise ValueError(f"Requested cameras not in calibration: {cameras}")
-        self.poses, self.pose_times_ns = [], []
-        for line in (self.root / "poses_base.txt").read_text().splitlines():
-            fields = line.split()
-            if len(fields) != 8:
-                raise ValueError("Pose rows must be timestamp tx ty tz qx qy qz qw")
-            t = int(Decimal(fields[0]) * 1_000_000_000)
-            values = np.asarray(fields[1:], dtype=np.float64)
-            q = values[3:]
-            if not np.isfinite(values).all() or abs(np.linalg.norm(q) - 1) > 1e-3:
-                raise ValueError("Invalid pose quaternion/translation")
-            q = q / np.linalg.norm(q)
-            T = np.eye(4)
-            T[:3, :3] = quat_to_rotmat(q[3], q[0], q[1], q[2])
-            T[:3, 3] = values[:3]
-            self.poses.append(T)
-            self.pose_times_ns.append(t)
-        self.count = int(m["keyframe_count"])
+        self.lidar_poses, self.lidar_pose_times_ns, _ = _read_poses(
+            self.root / "poses_base.txt"
+        )
+        self.lidar_count = int(m["keyframe_count"])
         if (
-            self.count != len(self.poses)
-            or self.count < 1
-            or np.any(np.diff(self.pose_times_ns) <= 0)
+            self.lidar_count != len(self.lidar_poses)
+            or self.lidar_count < 1
+            or any(
+                a >= b for a, b in zip(
+                    self.lidar_pose_times_ns, self.lidar_pose_times_ns[1:]
+                )
+            )
         ):
             raise ValueError("Pose count/timeline does not match manifest")
         self.image_index = {}
         with (self.root / "images/index.csv").open(newline="") as f:
             reader = csv.DictReader(f)
-            if reader.fieldnames != [
+            legacy_header = [
                 "keyframe_id",
                 "camera_id",
                 "image_stamp_ns",
                 "file",
                 "source",
                 "status",
-            ]:
+            ]
+            if reader.fieldnames not in (
+                legacy_header, ["image_frame_id", *legacy_header]
+            ):
                 raise ValueError("Invalid image index header")
-            for row in reader:
-                key, cid, stamp = (
-                    int(row[k]) for k in ["keyframe_id", "camera_id", "image_stamp_ns"]
+            self.frame_unit = "lidar" if reader.fieldnames == legacy_header else "image"
+            image_poses_path = self.root / "poses_image_base.txt"
+            if self.frame_unit == "image":
+                if not image_poses_path.is_file():
+                    raise ValueError("New image index requires poses_image_base.txt")
+                self.poses, self.pose_times_ns, self.lidar_keyframe_ids = _read_poses(
+                    image_poses_path, with_anchors=True
                 )
+                if any(k >= self.lidar_count for k in self.lidar_keyframe_ids):
+                    raise ValueError("Image pose LiDAR association is out of range")
+            else:
+                if image_poses_path.exists():
+                    raise ValueError("Legacy image index has unexpected poses_image_base.txt")
+                self.poses, self.pose_times_ns = self.lidar_poses, self.lidar_pose_times_ns
+                self.lidar_keyframe_ids = list(range(self.lidar_count))
+            self.count = len(self.poses)
+            for row in reader:
+                if None in row or any(value is None for value in row.values()):
+                    raise ValueError("Invalid image index row column count")
+                try:
+                    anchor, cid, stamp = (
+                        int(row[k]) for k in ["keyframe_id", "camera_id", "image_stamp_ns"]
+                    )
+                    key = int(row["image_frame_id"]) if self.frame_unit == "image" else anchor
+                except ValueError as error:
+                    raise ValueError("Invalid image index row numbers") from error
                 if (
                     not 0 <= key < self.count
                     or cid not in self.cameras
                     or stamp < 0
                     or (key, cid) in self.image_index
+                    or anchor != self.lidar_keyframe_ids[key]
                 ):
-                    raise ValueError("Invalid or duplicate image index row")
+                    raise ValueError("Invalid or duplicate image index row / LiDAR association")
                 if row["status"] == "saved":
                     if (
                         row["file"] != f"{key}_cam{cid}.jpg"
@@ -285,12 +354,16 @@ class XNavMapLoader:
                     or row["source"] != "none"
                 ):
                     raise ValueError("Invalid absent image metadata")
-                row.update(keyframe_id=key, camera_id=cid, image_stamp_ns=stamp)
+                # Source keyframe_id retains the CSV's LiDAR meaning.
+                row.update(
+                    self.frame_metadata(key), keyframe_id=anchor,
+                    camera_id=cid, image_stamp_ns=stamp,
+                )
                 self.image_index[key, cid] = row
         if set(self.image_index) != {
             (k, c) for k in range(self.count) for c in self.cameras
         }:
-            raise ValueError("Image index must describe every keyframe/camera pair")
+            raise ValueError("Image index must describe every frame/camera pair")
         if (
             start_n < 1
             or skip_n < 1
@@ -298,17 +371,26 @@ class XNavMapLoader:
             or max_points < 1
         ):
             raise ValueError("Invalid keyframe range or point limit")
-        self.keyframe_ids = list(range(self.count))[start_n - 1 :: skip_n]
+        self.frame_ids = list(range(self.count))[start_n - 1 :: skip_n]
         if max_n is not None:
-            self.keyframe_ids = self.keyframe_ids[:max_n]
-        if not self.keyframe_ids:
-            raise ValueError("Selected keyframe range is empty")
+            self.frame_ids = self.frame_ids[:max_n]
+        self.keyframe_ids = self.frame_ids  # Existing callers use processing IDs.
+        if not self.frame_ids:
+            raise ValueError("Selected frame range is empty (no processing frames)")
         self.size, self.max_points, self.fov = size, max_points, fov
         self._views = {}
         self._point_cache = OrderedDict()
 
     def __len__(self):
-        return len(self.keyframe_ids)
+        return len(self.frame_ids)
+
+    def frame_metadata(self, frame_id):
+        return {
+            "frame_id": frame_id,
+            "keyframe_id": frame_id,
+            "image_frame_id": frame_id if self.frame_unit == "image" else None,
+            "lidar_keyframe_id": self.lidar_keyframe_ids[frame_id],
+        }
 
     def output_path(self, output_dir):
         return (
@@ -352,7 +434,12 @@ class XNavMapLoader:
         return img
 
     def world_points(self, keyframe_id):
-        if keyframe_id in self._point_cache:
+        """Map a processing frame to geometry at its LiDAR anchor pose."""
+        return self._lidar_world_points(self.lidar_keyframe_ids[keyframe_id])
+
+    def _lidar_world_points(self, keyframe_id, verify_fallback=False):
+        if keyframe_id in self._point_cache and not verify_fallback:
+            self._point_cache.move_to_end(keyframe_id)
             return self._point_cache[keyframe_id]
         result = None
         for folder in ("rgb", "surf"):
@@ -360,9 +447,10 @@ class XNavMapLoader:
             if not path.exists():
                 continue
             xyz, colors = read_pcd(path)
-            T = self.poses[keyframe_id]
-            result = ((xyz @ T[:3, :3].T + T[:3, 3]).astype(np.float32), colors)
-            if len(xyz):
+            if result is None or not len(result[0]):
+                T = self.lidar_poses[keyframe_id]
+                result = ((xyz @ T[:3, :3].T + T[:3, 3]).astype(np.float32), colors)
+            if len(xyz) and not verify_fallback:
                 break
         if result is None:
             raise ValueError(f"No rgb/surf cloud for keyframe {keyframe_id}")
@@ -380,16 +468,26 @@ class XNavMapLoader:
                 row = self.image_index[key, cid]
                 counts[row["status"]] += 1
                 self.read_image(key, cid)
-            # Check the chosen geometry plus any present fallback file.
-            self.world_points(key)
-            surf = self.root / "surf" / f"{key}.pcd"
-            if surf.exists():
-                read_pcd(surf)
+        # A dense image timeline can share anchors; inspect each PCD only once.
+        for key in range(self.lidar_count):
+            self._lidar_world_points(key, verify_fallback=True)
+        image_frames = self.count
+        if self.frame_unit == "lidar":
+            image_frames = sum(
+                any(self.image_index[k, c]["status"] == "saved" for c in self.cameras)
+                for k in range(self.count)
+            )
         return {
             "map_id": self.manifest["map_id"],
             "snapshot_id": self.manifest["snapshot_id"],
-            "keyframes": self.count,
-            "selected_keyframes": len(self),
+            "keyframes": self.lidar_count,
+            "selected_keyframes": len({
+                self.lidar_keyframe_ids[k] for k in self.frame_ids
+            }),
+            "frame_unit": self.frame_unit,
+            "frames": self.count,
+            "selected_frames": len(self),
+            "image_frames": image_frames,
             "images": dict(counts),
             "camera_ids": self.camera_ids,
             "camera_mode": self.camera_mode,
@@ -443,7 +541,7 @@ class XNavMapLoader:
             "time_ns0": self.image_index[keyframe_id, camera_id]["image_stamp_ns"],
             "bb2d0": torch.empty((0, 4)),
             "obbs": ObbTW(torch.empty((0, 165))),
-            "keyframe_id": keyframe_id,
+            **self.frame_metadata(keyframe_id),
             "camera_id": camera_id,
             "view_id": view_id,
             "rectification": view,
@@ -452,8 +550,8 @@ class XNavMapLoader:
             "camera_mode": self.camera_mode,
         }
 
-    def iter_keyframes(self, with_points=True):
-        for key in self.keyframe_ids:
+    def iter_frames(self, with_points=True):
+        for key in self.frame_ids:
             views = []
             for cid in self.camera_ids:
                 image = self.read_image(key, cid)
@@ -463,7 +561,7 @@ class XNavMapLoader:
                             self.load_view(key, cid, view.view_id, image, with_points)
                         )
             yield {
-                "keyframe_id": key,
+                **self.frame_metadata(key),
                 "time_ns": self.pose_times_ns[key],
                 "T_map_base": self.poses[key],
                 "views": views,
@@ -471,3 +569,7 @@ class XNavMapLoader:
                     self.image_index[key, cid].copy() for cid in self.camera_ids
                 ],
             }
+
+    def iter_keyframes(self, with_points=True):
+        """Compatibility alias for the processing-frame iterator."""
+        return self.iter_frames(with_points=with_points)

@@ -218,6 +218,7 @@ def _output_worker(config, incoming, outgoing):
     import torch
     from pathlib import Path
 
+    from loaders.xnav_loader import frame_identity, processing_frame_id
     from utils.file_io import ObbCsvWriter2, save_bb2d_csv
     from utils.tw.camera import CameraTW
     from utils.tw.obb import ObbTW
@@ -261,7 +262,7 @@ def _output_worker(config, incoming, outgoing):
                         ).reshape(-1, 4)
                         save_bb2d_csv(
                             str(output / "owl_2dbbs.csv"),
-                            record["keyframe_id"],
+                            processing_frame_id(record),
                             boxes[:, [0, 2, 1, 3]],
                             np.asarray(observation["scores_2d"], dtype=np.float32),
                             observation["labels_2d"],
@@ -281,7 +282,7 @@ def _output_worker(config, incoming, outgoing):
                 csv_ms = (time.perf_counter() - started) * 1000
                 started = time.perf_counter()
                 if not config["skip_viz"]:
-                    frame = {"keyframe_id": record["keyframe_id"], "views": []}
+                    frame = {**frame_identity(record), "views": []}
                     payload = value["preview"]
                     if payload is not None:
                         frame["views"] = [

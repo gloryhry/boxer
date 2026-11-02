@@ -8,10 +8,10 @@ from utils.tw.pose import PoseTW
 
 
 class XNavPromptLoader:
-    """One selected native or virtual observation over a keyframe timeline.
+    """One selected native or virtual observation over a processing timeline.
 
     Viewer frame indices and start_frame are zero-based. Image timestamps
-    remain in each datum; the navigation timeline uses exact keyframe times.
+    remain in each datum; navigation uses frame indices and exported group times.
     The map reader owns calibration and geometry, including V1 conversion.
     """
 
@@ -37,7 +37,8 @@ class XNavPromptLoader:
             camera_mode=camera_mode,
         )
         self.camera_mode = camera_mode
-        self.keyframe_ids = self.map.keyframe_ids
+        self.frame_ids = self.map.frame_ids
+        self.keyframe_ids = self.frame_ids
         self.camera_ids = self.map.camera_ids
         self.camera_id = self.camera_ids[0]
         self._view_id = None
@@ -45,6 +46,8 @@ class XNavPromptLoader:
             [self.map.pose_times_ns[k] for k in self.keyframe_ids], dtype=np.int64
         )
         self._time_to_index = {int(t): i for i, t in enumerate(self.timestamps_ns)}
+        unique, counts = np.unique(self.timestamps_ns, return_counts=True)
+        self._ambiguous_times = set(unique[counts > 1].tolist())
         self._cached_key = None
         self._cached_datum = None
         self._background = None
@@ -92,6 +95,8 @@ class XNavPromptLoader:
         self._cached_datum = None
 
     def frame_index(self, time_ns):
+        if int(time_ns) in self._ambiguous_times:
+            raise ValueError(f"Ambiguous x-nav navigation time {time_ns}; use frame index")
         try:
             return self._time_to_index[int(time_ns)]
         except KeyError as error:
@@ -125,6 +130,7 @@ class XNavPromptLoader:
                 self._cached_datum["keyframe_time_ns"] = int(
                     self.timestamps_ns[frame_index]
                 )
+                self._cached_datum["frame_time_ns"] = int(self.timestamps_ns[frame_index])
             self._cached_key = key
         return self._cached_datum
 
@@ -132,14 +138,20 @@ class XNavPromptLoader:
         return self.load(self.frame_index(time_ns))
 
     def rgb_at_time(self, time_ns):
-        datum = self.load_at_time(time_ns)
+        return self.rgb_at_frame(self.frame_index(time_ns))
+
+    def rgb_at_frame(self, frame_index):
+        datum = self.load(frame_index)
         if datum is None:
             return None
         image = datum["img0"][0].permute(1, 2, 0).numpy()
         return np.clip(image * 255, 0, 255).astype(np.uint8)
 
     def camera_and_pose(self, time_ns):
-        datum = self.load_at_time(time_ns)
+        return self.camera_and_pose_at_frame(self.frame_index(time_ns))
+
+    def camera_and_pose_at_frame(self, frame_index):
+        datum = self.load(frame_index)
         if datum is None:
             return None, None
         return datum["cam0"], datum["T_world_rig0"]

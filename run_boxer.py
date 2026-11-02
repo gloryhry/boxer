@@ -100,11 +100,11 @@ def main():
     )
     parser.add_argument(
         "--track_min_hits", type=int, default=None,
-        help="keyframes to confirm a track (x-nav: 3, legacy: 8)",
+        help="frames to confirm a track (x-nav image groups/legacy LiDAR frames: 3; other inputs: 8)",
     )
-    parser.add_argument("--skip_n", type=int, default=1, help="skip n frames")
-    parser.add_argument("--start_n", type=int, default=1, help="start from n-th frame")
-    parser.add_argument("--max_n", type=int, default=99999, help="run for max n frames")
+    parser.add_argument("--skip_n", type=int, default=1, help="frame stride (new x-nav maps: image groups)")
+    parser.add_argument("--start_n", type=int, default=1, help="start from n-th frame, one-based (new x-nav maps: image groups)")
+    parser.add_argument("--max_n", type=int, default=99999, help="run for max n frames (new x-nav maps: image groups)")
     parser.add_argument("--pinhole", action="store_true", help="rectify to pinhole")
     parser.add_argument(
         "--xnav_camera_mode", choices=["native", "virtual_pinhole"],

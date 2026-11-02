@@ -3064,8 +3064,8 @@ class SequenceOBBViewer(OBBViewer):
     def _load_rgb_for_timestamp(self, ts_ns: int) -> Optional[np.ndarray]:
         """Load nearest RGB frame for the given timestamp."""
         if getattr(self, "_data_source", None) == "xnav":
-            # The loader caches by keyframe/camera/view, not timestamp alone.
-            img = self._loader.rgb_at_time(ts_ns)
+            # Export order survives repeated timestamps and sensor time resets.
+            img = self._loader.rgb_at_frame(self.current_frame_idx)
             if img is None:
                 return None
             self._rgb_vrs_h, self._rgb_vrs_w = img.shape[:2]
@@ -3348,6 +3348,8 @@ class SequenceOBBViewer(OBBViewer):
         tail_ns = self.traj_tail_secs * 1e9
         start_ns = ts_ns - tail_ns
         mask = (self._traj_seg_ts >= start_ns) & (self._traj_seg_ts <= ts_ns)
+        if getattr(self, "_data_source", None) == "xnav":
+            mask &= np.arange(len(mask)) < self.current_frame_idx
         tail_data = self._traj_all_segments[mask]
         if len(tail_data) == 0:
             self.traj_instance_count = 0
@@ -3473,7 +3475,7 @@ class SequenceOBBViewer(OBBViewer):
     ) -> tuple[Optional[CameraTW], Optional[PoseTW]]:
         """Get nearest camera calibration and world pose for timestamp."""
         if getattr(self, "_data_source", None) == "xnav":
-            return self._loader.camera_and_pose(ts_ns)
+            return self._loader.camera_and_pose_at_frame(self.current_frame_idx)
         if self.traj is None or self.calibs is None:
             return None, None
         if len(self.pose_ts) == 0 or len(self.calib_ts) == 0:
@@ -3503,6 +3505,8 @@ class SequenceOBBViewer(OBBViewer):
 
     def _get_navigation_timestamp(self, frame_idx: int, fallback_ts: int) -> int:
         """Timestamp used for camera/frustum/trajectory overlays."""
+        if getattr(self, "_data_source", None) == "xnav":
+            return int(self._loader.timestamps_ns[frame_idx])
         return int(fallback_ts)
 
     def _project_obbs_for_rgb(
