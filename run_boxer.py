@@ -118,6 +118,10 @@ def main():
         "--xnav_detector_batch_size", type=int, choices=[1, 2], default=1,
         help="OWLv2 observations per call; BoxerNet remains batch=1",
     )
+    parser.add_argument(
+        "--xnav_dedup", choices=["conservative", "legacy"], default="conservative",
+        help="x-nav static-map deduplication policy (default: conservative)",
+    )
     parser.add_argument("--camera", type=str, default="rgb", choices=["rgb", "slaml", "slamr"], help="camera to use (default: rgb)")
     parser.add_argument("--detector", type=str, default="owl", choices=["owl"], help="2D detector to use (default: owl)")
     parser.add_argument("--thresh2d", type=float, default=0.25, help="detection confidence for 2d detector")

@@ -1,0 +1,4 @@
+# Add to the existing Boxer environment; do not replace its Torch/CUDA packages.
+fastapi>=0.115,<1
+pydantic>=2.9,<3
+uvicorn>=0.30,<1

@@ -175,6 +175,22 @@ python view_tracker.py --input /path/to/xnav/map --live
 python view_prompt.py --input /path/to/xnav/map
 ```
 
+The responsive x-nav Web viewer and OpenAPI service run on port **18765**:
+
+```bash
+uv pip install --python .venv/bin/python -r requirements-server.txt
+npm --prefix web ci
+npm --prefix web run build
+.venv/bin/python server.py
+```
+
+Open `http://127.0.0.1:18765/` for map loading, inference controls and replay,
+or `/docs` for the API. The server preloads default models at startup and reuses
+them across jobs. Apply changed inference parameters before starting a job.
+Successful server jobs also save the four detection/tracking CSVs to the input
+map's `3dbbox/` directory, unless CSV output is disabled.
+See [Web server guide](docs/WEB_SERVER.zh-CN.md).
+
 See [x-nav usage and input/output conventions](docs/XNAV_MAP.md) for details.
 
 

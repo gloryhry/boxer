@@ -9,10 +9,12 @@ import numpy as np
 
 import utils.imgui_compat as imgui
 from loaders.xnav_loader import XNavMapLoader, processing_frame_id, read_pcd
-from utils.image import draw_bb3s, put_text, render_bb2
+from utils.image import put_text
+from utils.orbit_camera import OrbitCamera
 from utils.tw.obb import BB3D_LINE_ORDERS
 from utils.viewer_3d import OrbitViewer, _perspective_projection, launch_viewer
 from utils.xnav_pipeline import XNavReplay, empty_obbs, source_signature
+from utils.xnav_web_scene import render_observation
 
 
 def _color(identity):
@@ -71,20 +73,39 @@ def launch_xnav_viewer(args):
             self.buffers = {}
             self.current_boxes = empty_obbs()
             self.ui_panel_width = 470
+            self.orbit = None
             super().__init__(**kwargs)
             imgui.get_style().font_scale_main = 1.2 * self.wnd.pixel_ratio
             self.bg_color_index = 0
-            self.camera_target = self.scene_center.astype(np.float32)
-            self.camera_distance = self.scene_radius * 2
+            self.orbit = OrbitCamera(
+                self.scene_center, self.scene_radius,
+                follow=getattr(args, "init_follow", False),
+            )
+            self.orbit.overview(self._viewport_aspect())
+            self.orbit.follow = getattr(args, "init_follow", False)
+            self._camera_pose(snap=True)
+
+        def _viewport_aspect(self):
+            width, height = self.wnd.size
+            return max(width - self.ui_panel_width, 1) / max(height, 1)
+
+        def _camera_pose(self, snap=False):
+            if self.orbit is None:
+                return
+            observations = replay.frame(self.index)["observations"] if replay.frames else []
+            pose = observations[self.view_index].get("T_map_view") if observations else None
+            self.orbit.set_pose(pose, snap=snap)
 
         def get_camera_matrices(self):
+            if self.orbit is not None:
+                self.camera_target = self.orbit.target.astype(np.float32)
+                self.camera_distance = self.orbit.distance
+                self.camera_azimuth = self.orbit.azimuth
+                self.camera_elevation = self.orbit.elevation
             _, view, _ = super().get_camera_matrices()
-            width, height = self.wnd.size
+            near, far = self.orbit.clipping if self.orbit is not None else (0.05, 1000)
             projection = _perspective_projection(
-                45.0,
-                width / max(height, 1),
-                0.05,
-                max(1000.0, self.camera_distance * 5),
+                45.0, self._viewport_aspect(), near, far,
             )
             return projection, view, view @ projection
 
@@ -160,7 +181,7 @@ def launch_xnav_viewer(args):
             self._geometry("trajectory", trajectory, (0.15, 0.55, 0.85))
             self._select_frame(len(replay.frames) - 1 if live else 0)
 
-        def _select_frame(self, index):
+        def _select_frame(self, index, snap=True):
             if not replay.frames:
                 self.current_boxes = empty_obbs()
                 self._geometry("boxes", [], (1, 1, 1))
@@ -170,6 +191,7 @@ def launch_xnav_viewer(args):
                     self.texture = None
                 self.image_key = None
                 self.index = 0
+                self._camera_pose(snap=snap)
                 return
             self.index = max(0, min(index, len(replay.frames) - 1))
             self.current_boxes = replay.boxes(
@@ -201,12 +223,13 @@ def launch_xnav_viewer(args):
                     rgb[::step] / 255.0 if rgb is not None else (0.2, 0.6, 0.3),
                 )
             self.image_key = None
-            self._update_image()
+            self._update_image(snap=snap)
 
-        def _update_image(self):
+        def _update_image(self, snap=True):
             frame = replay.frame(self.index)
             observations = frame["observations"]
             self.view_index = min(self.view_index, max(0, len(observations) - 1))
+            self._camera_pose(snap=snap)
             key = self.index, self.view_index, self.show_tracks, self.show_tentative
             if key == self.image_key:
                 return
@@ -217,30 +240,10 @@ def launch_xnav_viewer(args):
             if not observations:
                 return
             observation = observations[self.view_index]
-            datum = loader.load_view(
-                processing_frame_id(frame),
-                observation["camera_id"],
-                observation["view_id"],
-                with_points=False,
+            top, bottom = render_observation(
+                loader, frame, observation, self.show_tracks, self.show_tentative,
             )
-            image = (datum["img0"][0].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-            boxes2 = np.asarray(observation["boxes_2d"], dtype=np.float32).reshape(
-                -1, 4
-            )
-            top = render_bb2(image.copy(), boxes2, texts=observation["labels_2d"])
             put_text(top, "2D detections", line=0)
-            names = [
-                f"#{int(o.inst_id.item())} {name}" if self.show_tracks else name
-                for o, name in zip(self.current_boxes, self.current_boxes.text_string())
-            ]
-            bottom = draw_bb3s(
-                image.copy(),
-                datum["T_world_rig0"],
-                datum["cam0"],
-                self.current_boxes,
-                texts=names,
-            )
             put_text(
                 bottom, "Saved tracks" if self.show_tracks else "3D detections", line=0
             )
@@ -266,7 +269,8 @@ def launch_xnav_viewer(args):
                     (0.15, 0.55, 0.85),
                 )
                 self._select_frame(
-                    len(replay.frames) - 1 if self.follow_latest else self.index
+                    len(replay.frames) - 1 if self.follow_latest else self.index,
+                    snap=False,
                 )
             except (OSError, ValueError, RuntimeError) as error:
                 self.live_error = str(error)
@@ -278,10 +282,14 @@ def launch_xnav_viewer(args):
             self._refresh_live(now)
             if self.playing and now - self.last_step >= 1 / max(self.fps, 0.1):
                 if self.index + 1 < len(replay.frames):
-                    self._select_frame(self.index + 1)
+                    self._select_frame(self.index + 1, snap=False)
                 else:
                     self.playing = False
                 self.last_step = now
+            self.orbit.update(frame_time)
+            width, height = self.wnd.fbo.size
+            panel = int(self.ui_panel_width * width / max(self.wnd.size[0], 1))
+            self.ctx.viewport = (panel, 0, max(width - panel, 1), height)
             _, _, self.mvp = self.get_camera_matrices()
             self.program["mvp"].write(self.mvp.astype("f4").tobytes())
             for name, mode in (
@@ -296,6 +304,34 @@ def launch_xnav_viewer(args):
                     and (name != "observed" or self.show_obs)
                 ):
                     self.buffers[name][0].render(mode=mode)
+            self.ctx.viewport = (0, 0, width, height)
+
+        def on_mouse_press_event(self, x, y, button):
+            self.imgui.mouse_press_event(x, y, button)
+            self.mouse_dragging = self.mouse_panning = False
+            if x >= self.ui_panel_width and not imgui.get_io().want_capture_mouse:
+                self.mouse_dragging = button == 1
+                self.mouse_panning = button == 2
+
+        def on_mouse_drag_event(self, x, y, dx, dy):
+            self.imgui.mouse_drag_event(x, y, dx, dy)
+            if x < self.ui_panel_width or imgui.get_io().want_capture_mouse:
+                return
+            if self.mouse_dragging:
+                self.orbit.rotate(dx, dy, self.wnd.size[1])
+            elif self.mouse_panning:
+                self.orbit.pan(dx, dy, self.wnd.size[1])
+
+        def on_mouse_release_event(self, x, y, button):
+            self.imgui.mouse_release_event(x, y, button)
+            self.mouse_dragging = self.mouse_panning = False
+
+        def on_mouse_scroll_event(self, x_offset, y_offset):
+            io = imgui.get_io()
+            io.add_mouse_wheel_event(float(x_offset), float(y_offset))
+            mouse_x = io.mouse_pos.x if hasattr(io.mouse_pos, "x") else io.mouse_pos[0]
+            if mouse_x >= self.ui_panel_width and not io.want_capture_mouse:
+                self.orbit.zoom(y_offset)
 
         def render_ui(self):
             w, h = self.wnd.size
@@ -305,6 +341,19 @@ def launch_xnav_viewer(args):
                 "x-nav live inference" if live else "x-nav replay",
                 flags=imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_RESIZE,
             )
+            changed, self.orbit.follow = imgui.checkbox(
+                "Follow camera position", self.orbit.follow
+            )
+            if changed:
+                self._camera_pose(snap=True)
+            if imgui.button("Focus camera"):
+                self.orbit.focus()
+            imgui.same_line()
+            if imgui.button("Fit map"):
+                self.orbit.overview(self._viewport_aspect())
+            imgui.text_wrapped("Left: orbit | Right: pan | Wheel: zoom")
+            if self.orbit.follow and self.orbit.message:
+                imgui.text_wrapped(self.orbit.message)
             if live:
                 status = replay.results.get("status", "running")
                 imgui.text(
@@ -378,7 +427,7 @@ def launch_xnav_viewer(args):
                 if p[3] <= 0:
                     continue
                 x, y = (p[:2] / p[3] + 1) / 2
-                x, y = x * w, (1 - y) * h
+                x, y = self.ui_panel_width + x * max(w - self.ui_panel_width, 1), (1 - y) * h
                 if self.ui_panel_width < x < w and 0 < y < h:
                     name = obb.reshape(1, -1).text_string()[0]
                     label = (

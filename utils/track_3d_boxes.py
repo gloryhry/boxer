@@ -90,6 +90,9 @@ class ViewObservation:
     T_world_rig: PoseTW
     observed_points: Optional[torch.Tensor] = None
     valid_mask: Optional[torch.Tensor] = None
+    frame_id: Optional[int] = None
+    boxes_2d: Optional[torch.Tensor] = None  # x1,x2,y1,y2, after detector filtering
+    labels_2d: Optional[List[str]] = None
 
 
 class BoundingBox3DTracker:
@@ -111,6 +114,7 @@ class BoundingBox3DTracker:
         min_confidence_mass: float = 4.0,
         min_obs_points: int = 2,
         verbose: bool = True,
+        dedup_mode: str = "legacy",
     ) -> None:
         """
         Initialize tracker.
@@ -128,7 +132,18 @@ class BoundingBox3DTracker:
             merge_iou_2d_threshold: Min 2D IoU (projected) between tracks to consider merging as secondary criterion
             merge_interval: Run merge every N frames (1 = every frame, 10 = every 10th frame)
             min_confidence_mass: Accumulated confidence to promote TENTATIVE -> ACTIVE (alternative to min_hits)
+            dedup_mode: Static-map pair policy; the single-view path is unchanged.
         """
+        if dedup_mode not in ("legacy", "conservative"):
+            raise ValueError("dedup_mode must be legacy or conservative")
+        self.dedup_mode = dedup_mode
+        self._dedup = None
+        self._dedup_members = {}
+        if dedup_mode == "conservative":
+            from utils.xnav_dedup import ConservativeDeduplicator
+
+            device = "cuda" if not force_cpu and torch.cuda.is_available() else "cpu"
+            self._dedup = ConservativeDeduplicator(self.semantic_similarity, device)
         self.iou_threshold = iou_threshold
         self.min_hits = min_hits
         self.conf_threshold = conf_threshold
@@ -415,11 +430,14 @@ class BoundingBox3DTracker:
                 raise ValueError("Detections require at least one view observation")
             return self._get_active_tracks()
         detections = detections[(detections.prob >= self.conf_threshold).reshape(-1)]
+        if self._dedup is not None:
+            self._dedup.remember(observations, frame_idx)
         projected, supported = self._multiview_visibility(observations)
         for i, track in enumerate(self.tracks):
             track.last_visible = bool(supported[i])
         candidates = [i for i, visible in enumerate(projected) if visible]
         matched_tracks, matched_detections = set(), set()
+        changed_ids = set()
         self.last_iou_matrix_size = (len(candidates), len(detections))
         if candidates and len(detections):
             from utils.fuse_3d_boxes import linear_sum_assignment
@@ -435,6 +453,21 @@ class BoundingBox3DTracker:
             labels = detections.text_string()
             for r, i in enumerate(candidates):
                 for c, label in enumerate(labels):
+                    if self._dedup is not None:
+                        # Preserve reliable legacy IoU associations. The tight
+                        # center/size gate is for merging identities and low-IoU
+                        # recovery, not for rejecting an existing identity's
+                        # ordinary measurement jitter.
+                        if (
+                            overlap[r, c] < self.iou_threshold
+                            or self.semantic_similarity(
+                                self.tracks[i].cached_text, label
+                            )
+                            < self.merge_semantic_threshold
+                            or self._dedup.conflicts(self.tracks[i].obb, detections[c])
+                        ):
+                            cost[r, c] = 1e6
+                        continue
                     if (
                         overlap[r, c] < self.iou_threshold
                         or self.semantic_similarity(self.tracks[i].cached_text, label)
@@ -456,6 +489,42 @@ class BoundingBox3DTracker:
                     track.support_count = len(frames)
                 matched_tracks.add(i)
                 matched_detections.add(c)
+                changed_ids.add(track.track_id)
+            # Reacquire low-overlap thin objects before allocating new IDs.
+            # Primary IoU matches retain priority and each pass is one-to-one.
+            if self._dedup is not None:
+                remaining_tracks = [i for i in candidates if i not in matched_tracks]
+                remaining_detections = [
+                    c for c in range(len(detections)) if c not in matched_detections
+                ]
+                fallback = np.full(
+                    (len(remaining_tracks), len(remaining_detections)), 1e6
+                )
+                for r, i in enumerate(remaining_tracks):
+                    for c, j in enumerate(remaining_detections):
+                        score = self._dedup.score(
+                            self.tracks[i].obb, detections[j],
+                            iou_threshold=self.iou_threshold,
+                        )
+                        if score is not None:
+                            fallback[r, c] = 1 - score
+                if fallback.size:
+                    rows, cols = linear_sum_assignment(fallback)
+                    for r, c in zip(rows, cols):
+                        if fallback[r, c] >= 1:
+                            continue
+                        i, j = remaining_tracks[r], remaining_detections[c]
+                        track = self.tracks[i]
+                        frames = self._support_frames.setdefault(
+                            track.track_id, {track.last_seen_frame}
+                        )
+                        if frame_idx not in frames:
+                            self._update_track(track, detections[j], frame_idx)
+                            frames.add(frame_idx)
+                            track.support_count = len(frames)
+                        matched_tracks.add(i)
+                        matched_detections.add(j)
+                        changed_ids.add(track.track_id)
         for i, track in enumerate(self.tracks):
             if i in matched_tracks:
                 continue
@@ -465,8 +534,21 @@ class BoundingBox3DTracker:
                 track.missed_count += 1
         for j in range(len(detections)):
             if j not in matched_detections:
+                if self._dedup is not None and any(
+                    self.tracks[i].support_count >= 2
+                    and self._dedup.redundant_observation_score(
+                        self.tracks[i].obb, detections[j]
+                    ) is not None
+                    for i in sorted(matched_tracks)
+                ):
+                    # Both views saw the same static object. Its chosen match
+                    # already contributed this group's geometry and support;
+                    # do not create another identity or count the group twice.
+                    matched_detections.add(j)
+                    continue
                 self._create_track(detections[j], frame_idx)
                 track = self.tracks[-1]
+                changed_ids.add(track.track_id)
                 self._support_frames[track.track_id] = {frame_idx}
                 if self.min_hits <= 1:
                     track.state = TrackState.ACTIVE
@@ -482,7 +564,9 @@ class BoundingBox3DTracker:
                 else self._should_remove(t, frame_idx)
             )
         ]
-        if self.merge_iou_threshold > 0 and (
+        if self._dedup is not None:
+            self._merge_conservative_tracks(changed_ids=changed_ids)
+        elif self.merge_iou_threshold > 0 and (
             self.merge_interval <= 1 or frame_idx % self.merge_interval == 0
         ):
             self._merge_multiview_tracks()
@@ -490,6 +574,8 @@ class BoundingBox3DTracker:
 
     def _merge_multiview_tracks(self):
         """Keep the earliest ID; overlapping support frames count only once."""
+        if self._dedup is not None:
+            return self._merge_conservative_tracks()
         if len(self.tracks) < 2:
             return
         ordered = sorted(self.tracks, key=lambda t: t.track_id)
@@ -535,6 +621,74 @@ class BoundingBox3DTracker:
                     self.id_aliases[old] = first.track_id
             absorbed.add(second.track_id)
         self.tracks = [t for t in self.tracks if t.track_id not in absorbed]
+
+    def _merge_conservative_tracks(self, changed_ids=None, final=False):
+        ordered = sorted(
+            (t for t in self.tracks if not final or t.state != TrackState.TENTATIVE),
+            key=lambda t: t.track_id,
+        )
+        boxes = [t.obb for t in ordered]
+        changed = None if changed_ids is None else {
+            i for i, t in enumerate(ordered) if t.track_id in changed_ids
+        }
+        pairs = []
+        for i, j in self._dedup.candidate_pairs(boxes, changed):
+            # Give the two-group independent-detection veto time to form.
+            # Stereo duplicates in their first group must not irreversibly
+            # collapse two real objects before any temporal evidence exists.
+            if (
+                not final
+                and min(ordered[i].support_count, ordered[j].support_count) < 2
+            ):
+                continue
+            score = self._dedup.score(boxes[i], boxes[j])
+            if score is not None:
+                pairs.append((-score, i, j))
+        absorbed = set()
+        for _, i, j in sorted(pairs):
+            first, second = ordered[i], ordered[j]
+            if first.track_id in absorbed or second.track_id in absorbed:
+                continue
+            members_a = [first.obb, *self._dedup_members.get(first.track_id, ())]
+            members_b = [second.obb, *self._dedup_members.get(second.track_id, ())]
+            if any(
+                self._dedup.score(a, b) is None
+                for a in members_a for b in members_b
+            ):
+                continue
+            frames = (
+                self._support_frames[first.track_id]
+                | self._support_frames[second.track_id]
+            )
+            visible = first.last_visible or second.last_visible
+            missed_count = min(first.missed_count, second.missed_count)
+            self._dedup_members[first.track_id] = [
+                m.clone() for m in members_a + members_b
+            ]
+            self._dedup_members.pop(second.track_id, None)
+            self._merge_track_pair(first, second)
+            self._support_frames[first.track_id] = frames
+            self._support_frames.pop(second.track_id, None)
+            first.support_count = len(frames)
+            first.last_visible, first.missed_count = visible, missed_count
+            if first.support_count >= self.min_hits:
+                first.state = TrackState.ACTIVE if visible else TrackState.INACTIVE
+            self.id_aliases[second.track_id] = first.track_id
+            for old, target in list(self.id_aliases.items()):
+                if target == second.track_id:
+                    self.id_aliases[old] = first.track_id
+            absorbed.add(second.track_id)
+        self.tracks = [t for t in self.tracks if t.track_id not in absorbed]
+        live_ids = {t.track_id for t in self.tracks}
+        self._dedup_members = {
+            k: v for k, v in self._dedup_members.items() if k in live_ids
+        }
+
+    def finalize_multiview(self):
+        """Consolidate the confirmed map before publishing its final snapshot."""
+        if self._dedup is not None:
+            self._merge_conservative_tracks(final=True)
+        return self._get_active_tracks()
 
     def _visible_merge_pairs(self, boxes, visible):
         """Evaluate only eligible orientations, retaining the original i<j order."""
@@ -785,6 +939,20 @@ class BoundingBox3DTracker:
             text=text_padded,
             sem_id=sem_id,
         )
+        # Members share the track's refined translation estimate. Preserve
+        # their pairwise offsets for complete-link checks, rather than fixing
+        # noisy early measurements permanently at their old world positions.
+        members = self._dedup_members.get(track.track_id, ())
+        if members:
+            translation = (
+                track.obb.T_world_object.t.reshape(3)
+                - old_obb.T_world_object.t.reshape(3)
+            )
+            for member in members:
+                pose = member.T_world_object
+                member.set_T_world_object(
+                    PoseTW.from_Rt(pose.R, pose.t + translation)
+                )
 
     def _merge_track_pair(
         self, absorber: TrackedInstance, absorbed: TrackedInstance
@@ -1236,3 +1404,6 @@ class BoundingBox3DTracker:
         self._support_frames.clear()
         self._mask_integrals.clear()
         self._xnav_geometry = None
+        self._dedup_members.clear()
+        if self._dedup is not None:
+            self._dedup.reset()

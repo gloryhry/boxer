@@ -25,9 +25,11 @@ from utils.tw.obb import ObbTW
 from utils.tw.pose import PoseTW
 from utils.tw.tensor_utils import pad_string, string2tensor
 from utils.tw.xnav_camera import PREPROCESS_VERSION
+from utils.xnav_dedup import ConservativeDeduplicator
 from utils.xnav_execution import InferredKeyframe, XNavExecution, XNavOutput
 from utils.xnav_profile import XNavProfiler
 from utils.xnav_result_store import ResultFollower, ResultStore, read_result_file
+from utils.xnav_runtime import inference_dtype, select_device, semantic_embeddings
 
 
 def empty_obbs():
@@ -247,6 +249,8 @@ def _validate_results(results, camera_mode=None):
         raise ValueError("Saved results use an incompatible x-nav hemisphere policy")
     if camera_mode is not None and parameters.get("camera_mode") != camera_mode:
         raise ValueError("Saved results use a different x-nav camera mode")
+    # Reading old results never silently opts them into a new tracking policy.
+    results.setdefault("tracking", {}).setdefault("dedup", {"mode": "legacy"})
     return results
 
 
@@ -472,7 +476,7 @@ def _infer_keyframe(
 
 
 @torch.inference_mode()
-def run_xnav(args):
+def run_xnav(args, *, runtime=None):
     profiler = XNavProfiler(getattr(args, "profile", False))
     if getattr(args, "pinhole", False):
         raise ValueError(
@@ -504,7 +508,9 @@ def run_xnav(args):
         )
     if args.gt2d:
         raise ValueError("x-nav maps contain no ground-truth object boxes; omit --gt2d")
-    labels = load_text_labels(args.labels)
+    if runtime is not None:
+        runtime.validate(args)
+    labels = list(runtime.labels) if runtime is not None else load_text_labels(args.labels)
     if not labels:
         raise ValueError("At least one text label is required")
     output = loader.output_path(args.output_dir)
@@ -547,17 +553,7 @@ def run_xnav(args):
     if previous and not set(loader.frame_ids) <= cached_frames.keys():
         raise ValueError("Cache does not cover selected frames")
 
-    device = (
-        "cpu"
-        if args.force_cpu
-        else (
-            "cuda"
-            if torch.cuda.is_available()
-            else "mps"
-            if torch.backends.mps.is_available()
-            else "cpu"
-        )
-    )
+    device = runtime.device if runtime is not None else select_device(args.force_cpu)
     parallel = device == "cuda" and getattr(args, "xnav_execution", "auto") != "serial"
     detector_state = {
         "requested": getattr(args, "xnav_detector_batch_size", 1),
@@ -570,8 +566,11 @@ def run_xnav(args):
     if not args.cache3d:
         from boxernet.boxernet import BoxerNet
 
-        with profiler.stage("init.boxer", cuda=True):
-            boxer = BoxerNet.load_from_checkpoint(args.ckpt, device=device)
+        if runtime is not None:
+            boxer = runtime.boxer
+        else:
+            with profiler.stage("init.boxer", cuda=True):
+                boxer = BoxerNet.load_from_checkpoint(args.ckpt, device=device)
         if previous and boxer.hw != loader.size:
             raise ValueError(
                 "Cached rectification does not match Boxer checkpoint image size"
@@ -581,19 +580,19 @@ def run_xnav(args):
         if not args.cache2d:
             from owl.owl_wrapper import OwlWrapper
 
-            with profiler.stage("init.owl", cuda=True):
-                owl = OwlWrapper(
-                    device,
-                    text_prompts=labels,
-                    min_confidence=args.thresh2d,
-                    precision=args.force_precision,
-                    warmup=False,
-                )
-            values = owl.text_embeddings.detach().float().cpu().reshape(len(labels), -1)
-            embeddings = {
-                label.lower(): torch.nn.functional.normalize(values[i], dim=0)
-                for i, label in enumerate(labels)
-            }
+            if runtime is not None:
+                owl = runtime.owl
+                embeddings = runtime.embeddings
+            else:
+                with profiler.stage("init.owl", cuda=True):
+                    owl = OwlWrapper(
+                        device,
+                        text_prompts=labels,
+                        min_confidence=args.thresh2d,
+                        precision=args.force_precision,
+                        warmup=False,
+                    )
+                embeddings = semantic_embeddings(owl, labels)
     if previous:
         embeddings = {
             k: torch.tensor(v)
@@ -602,6 +601,9 @@ def run_xnav(args):
     min_hits = args.track_min_hits if args.track_min_hits is not None else 3
     if min_hits < 1:
         raise ValueError("--track_min_hits must be positive")
+    dedup_mode = getattr(args, "xnav_dedup", "conservative")
+    if dedup_mode not in ("conservative", "legacy"):
+        raise ValueError("--xnav_dedup must be conservative or legacy")
     tracker = (
         BoundingBox3DTracker(
             min_hits=min_hits,
@@ -614,6 +616,7 @@ def run_xnav(args):
             verbose=False,
             merge_semantic_threshold=0.7 if embeddings else 1.0,
             merge_iou_threshold=0,
+            dedup_mode=dedup_mode,
         )
         if args.track
         else None
@@ -647,6 +650,11 @@ def run_xnav(args):
             "min_hits": min_hits,
             "iou_threshold": 0.25,
             "max_missed": 90,
+            # Tracking settings do not invalidate model-output caches.
+            "dedup": (
+                ConservativeDeduplicator.metadata()
+                if dedup_mode == "conservative" else {"mode": "legacy"}
+            ),
         },
         "calibration": loader.calibration,
         "views": {},
@@ -674,18 +682,7 @@ def run_xnav(args):
         # A shorter rerun must not encode stale frames from the previous run.
         for path in preview_dir.glob("frame_*.jpg"):
             path.unlink()
-    dtype = (
-        torch.bfloat16
-        if (
-            args.force_precision == "bfloat16"
-            or (
-                args.force_precision is None
-                and device == "cuda"
-                and torch.cuda.is_bf16_supported()
-            )
-        )
-        else torch.float32
-    )
+    dtype = inference_dtype(device, args.force_precision)
     sem_map = {label: i for i, label in enumerate(labels)}
     observed_index, start = 0, time.perf_counter()
     store = None
@@ -793,11 +790,18 @@ def run_xnav(args):
                             d["T_world_rig0"],
                             None if args.no_sdp else d["sdp_w"],
                             torch.from_numpy(d["view_geometry"].valid_mask),
+                            frame_id=processing_frame_id(frame),
+                            boxes_2d=torch.tensor(o["boxes_2d"]).reshape(-1, 4),
+                            labels_2d=o["labels_2d"],
                         )
-                        for d in frame["views"]
+                        for d, o in zip(frame["views"], frame_record["observations"])
                     ]
                     with profiler.stage("tracking", cuda=True):
                         tracker.update(fused, observed_index, observations=observations)
+                        if work.index == len(loader) - 1:
+                            # Final consolidation precedes every last-frame
+                            # consumer: journal, CSV, preview and live replay.
+                            tracker.finalize_multiview()
                     if observations:
                         observed_index += 1
                     with profiler.stage("records"):
