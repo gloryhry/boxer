@@ -1,5 +1,8 @@
 # Docker 部署 x-nav Web 服务
 
+首次部署可先阅读[完整部署指南](DEPLOYMENT.zh-CN.md)，包含宿主机安装、权重下载与
+SHA256 校验、词表部署、首次推理验收、离线迁移及常见问题处理。
+
 在 Boxer 仓库根目录执行以下命令。x86 NVIDIA 与 Jetson Orin 使用各自独立的
 Dockerfile 和 Compose 文件；两者默认启动 `server.py`，提供 Web 页面、API 和常驻
 GPU 推理进程。镜像只包含源码、运行依赖和编译后的前端，模型、地图及词表由宿主机提供。

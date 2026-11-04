@@ -201,6 +201,9 @@ For container deployment, use `docker-compose.x86.yaml` for Linux x86 NVIDIA GPU
 or `docker-compose.jetson.yaml` for Jetson Orin. Both start the Web server by
 default and bind mount maps at `/nav_map`, with external checkpoints and
 vocabulary files. See [Docker deployment](docs/DOCKER.zh-CN.md) for setup.
+For a complete Chinese walkthrough covering Docker installation, checkpoint
+downloads and verification, vocabularies, offline deployment and troubleshooting,
+see the [deployment guide](docs/DEPLOYMENT.zh-CN.md).
 
 See [x-nav usage and input/output conventions](docs/XNAV_MAP.md) for details.
 
