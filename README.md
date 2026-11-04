@@ -175,7 +175,12 @@ python view_tracker.py --input /path/to/xnav/map --live
 python view_prompt.py --input /path/to/xnav/map
 ```
 
-The responsive x-nav Web viewer and OpenAPI service run on port **18765**:
+The responsive x-nav Web viewer and OpenAPI service run on port **18765**.
+
+The Web UI and API also accept ZIP map uploads with durable chunks, restart-safe
+resume, SHA-256 verification and automatic map registration. Defaults: 8 MiB
+chunks, 20 GiB per ZIP and 24-hour idle retention. See the
+[upload API and Python client](docs/OPENAPI.zh-CN.md#66-zip-地图包分块上传与续传).
 
 ```bash
 uv pip install --python .venv/bin/python -r requirements-server.txt

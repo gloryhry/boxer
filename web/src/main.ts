@@ -2,6 +2,7 @@ import './style.css';
 import { SceneView } from './camera';
 import { initializeWorkspaceLayout } from './layout';
 import { inferenceControls, shouldSyncOptions } from './inference';
+import { initializeUploadPanel } from './upload-ui';
 import type { InferenceState } from './inference';
 import type { Frame, FrameSummary, Job, MapDirectories, MapDirectory, MapInfo, Observation, SceneInfo } from './types';
 
@@ -19,6 +20,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     <div class="input-action"><select id="map-path" aria-describedby="map-directory-note" disabled><option value="">正在读取地图列表…</option></select><button id="load-map" class="secondary" disabled>加载地图</button></div>
     <p id="map-directory-note" class="hint" role="status" aria-live="polite">正在读取 /nav_map 下的地图包…</p>
     <p id="map-info" class="hint">选择地图后加载点云与相机信息。</p>
+    <div id="map-upload"></div>
     <form id="options">
       <details class="settings"><summary>推理参数 <span>词表 · 相机 · 阈值</span></summary>
         <label for="labels">词表或自定义标签</label><input id="labels" value="indoor" list="vocabularies" placeholder="indoor 或 chair,table,lamp"><datalist id="vocabularies"><option value="lvisplus"><option value="indoor"><option value="small"></datalist>
@@ -422,4 +424,13 @@ void action(async () => {
   const saved = localStorage.getItem('boxer-job-id');
   const value = jobs.find(item => item.id === saved) || jobs.find(item => item.id === activeJobId);
   if (value) await selectJob(value);
+});
+initializeUploadPanel(element('map-upload'), async info => {
+  while (busy) await new Promise(resolve => setTimeout(resolve, 50));
+  await action(async () => {
+    rememberMapPath(info.path);
+    await refreshMapDirectories();
+    detachJob(); localStorage.removeItem('boxer-job-id');
+    await activateMap(info);
+  });
 });

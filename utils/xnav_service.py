@@ -131,8 +131,10 @@ def list_map_directories(root):
         # A missing or unreadable subtree must not hide the other maps.
 
     directories = []
-    for folder, _, _ in os.walk(root, onerror=walk_error, followlinks=False):
+    for folder, children, _ in os.walk(root, onerror=walk_error, followlinks=False):
         path = Path(folder)
+        if path == root:
+            children[:] = [name for name in children if name != ".boxer_uploads"]
         if path == root:
             continue
         try:
@@ -412,6 +414,10 @@ class JobManager:
 
     def add_map(self, path):
         scene = MapScene(path)
+        return self.register_map(scene)
+
+    def register_map(self, scene, *, identity=None):
+        """Register a fully validated scene without reading its assets twice."""
         with self.lock:
             for record in self.map_records.values():
                 if (
@@ -420,7 +426,9 @@ class JobManager:
                 ):
                     self.maps[record["id"]] = scene
                     return self.map_info(record["id"])
-            identity = uuid.uuid4().hex
+            identity = identity or uuid.uuid4().hex
+            if identity in self.map_records:
+                raise HTTPException(409, "Map identity already registered")
             record = {
                 "id": identity,
                 "path": str(scene.loader.root),

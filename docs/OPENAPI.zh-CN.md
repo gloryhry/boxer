@@ -1,8 +1,8 @@
 # Boxer x-nav OpenAPI 详细使用文档
 
-本文介绍项目 `server.py` 提供的 HTTP API，适用于第三方程序接入、批量推理控制和结果回放。接口接收服务器本地的 x-nav 地图包，调用常驻 OWLv2 / BoxerNet 模型，并提供任务进度、逐帧检测、跟踪、图像和点云。
+本文介绍项目 `server.py` 提供的 HTTP API，适用于第三方程序接入、批量推理控制和结果回放。接口支持服务器本地地图注册和 ZIP 地图包分块上传，调用常驻 OWLv2 / BoxerNet 模型，并提供任务进度、逐帧检测、跟踪、图像和点云。
 
-文档核对日期：2026-11-04；API 版本：`1.0.0`；OpenAPI 版本：`3.1.0`。内容依据当前工作树中的路由、请求模型和服务实现整理。部署版本的字段与约束可通过该服务的 `/openapi.json` 核对。
+文档核对日期：2026-11-04；API 版本：`1.1.0`；OpenAPI 版本：`3.1.0`。内容依据当前工作树中的路由、请求模型和服务实现整理。部署版本的字段与约束可通过该服务的 `/openapi.json` 核对。
 
 ## 目录
 
@@ -62,6 +62,7 @@ npm --prefix web run build
 | `--host` | `0.0.0.0` | HTTP 监听地址 |
 | `--port` | `18765` | HTTP 端口 |
 | `--output_dir` | 仓库下的 `output/server` | 地图注册记录、任务、日志和结果的存储根目录 |
+| `--map_root` | `/nav_map` | 地图发现、上传暂存与发布的根目录；需提前创建且可写 |
 
 例如只允许本机访问，并指定持久化目录：
 
@@ -93,12 +94,12 @@ API 中的 `path`、`results_path`、`ckpt` 都是**服务进程可见的文件�
 
 ### 2.1 请求与响应
 
-- 请求体使用 JSON，并设置 `Content-Type: application/json`。
+- 普通请求体使用 JSON，并设置 `Content-Type: application/json`；分块上传使用 `application/octet-stream`。
 - JSON 接口成功返回 `application/json`；点云为 `application/octet-stream`，图像为 `image/jpeg`，事件流为 `text/event-stream`。
 - 请求体模型禁止额外字段；字段拼写错误或传入不支持的参数通常返回 `422`。
 - 地图 ID 和任务 ID 是服务生成的不透明字符串。`map_id` 应使用 `POST /api/maps` 返回的 `id`，与地图清单中的业务 `map_id` 区分。
 - 当前服务面向可信本机或局域网，没有账号、API Key 或 Token 认证，也没有配置跨域中间件。浏览器客户端可通过同源路径或开发代理访问；项目 Vite 开发代理将 `/api` 转发到本机 `18765`。
-- 地图和已有结果通过服务器本地路径引用，当前没有文件上传接口。
+- 地图可通过服务器本地路径注册或上传 ZIP；已有推理结果通过服务器本地路径导入。
 
 ### 2.2 时间、编号与坐标
 
@@ -196,7 +197,7 @@ curl --fail-with-body -sS \
 
 ## 4. 接口总览
 
-下表列出全部 23 个业务 API 操作。成功状态码指正常受理或读取时的状态。
+下表列出全部 29 个业务 API 操作。成功状态码指正常受理或读取时的状态。
 
 | 方法 | 路径 | 成功码 | 用途 |
 | --- | --- | --- | --- |
@@ -205,6 +206,12 @@ curl --fail-with-body -sS \
 | `PUT` | `/api/inference` | `202` | 应用推理参数并准备模型 |
 | `GET` | `/api/maps/directories` | `200` | 递归发现地图包目录 |
 | `POST` | `/api/maps` | `200` | 注册并完整校验地图 |
+| `POST` | `/api/maps/uploads` | `201` | 创建 ZIP 上传会话 |
+| `GET` | `/api/maps/uploads` | `200` | 查询上传限制和会话列表 |
+| `GET` | `/api/maps/uploads/{upload_id}` | `200` | 查询分块、处理进度和结果 |
+| `PUT` | `/api/maps/uploads/{upload_id}/chunks/{index}` | `200` | 上传一个二进制分块 |
+| `POST` | `/api/maps/uploads/{upload_id}/complete` | `202` | 提交合并、解压、校验和注册 |
+| `DELETE` | `/api/maps/uploads/{upload_id}` | `200` | 取消未完成上传 |
 | `GET` | `/api/maps/{map_id}` | `200` | 查询已注册地图 |
 | `GET` | `/api/maps/{map_id}/scene` | `200` | 查询全局场景元数据 |
 | `GET` | `/api/maps/{map_id}/cloud` | `200` / `304` | 获取全局可视化点云 |
@@ -436,6 +443,66 @@ curl --fail-with-body -sS -X PUT "$API_BASE/api/inference" \
 返回场景点云二进制，格式见第 8.5 节。全局点云最多 500,000 点。当前实现不使用 `global_map.pcd` 的颜色，采用固定展示色 `[0.5, 0.55, 0.6]`。
 
 支持 `ETag` 和 `If-None-Match`；内容相同可返回 `304`，此时没有响应体。
+
+### 6.6 ZIP 地图包分块上传与续传
+
+每个 ZIP 包含一张完整 V6 地图：`manifest.txt` 可以直接位于 ZIP 根目录，或位于一个外层文件夹内。支持 ZIP64、Stored 和 Deflate；拒绝多地图、加密包、其他压缩方法、重复目标、危险路径、符号链接和特殊文件。地图中的新旧图像索引沿用现有校验规则。
+
+默认分块为 **8 MiB**，单 ZIP 上限 **20 GiB**，解压上限 **100 GiB**，最多 **200,000 个条目**。`GET /api/maps/uploads` 返回 `{ "limits": {...}, "uploads": [...] }`，客户端应使用服务返回的参数。部署配置见 [Docker 文档](DOCKER.zh-CN.md#地图上传配置)。
+
+**创建会话**：
+
+```http
+POST /api/maps/uploads
+Content-Type: application/json
+
+{"filename":"园区A.zip","size":12345678,"sha256":"<整个 ZIP 的 64 位十六进制 SHA-256>"}
+```
+
+`filename` 必须是 `.zip` 文件名，不能包含目录；`size` 为正整数字节数，`sha256` 必填。新建请求总是创建独立会话；续传时应保存并复用返回的 `id`。
+
+**上传分块**：`index` 从 0 开始，块大小以会话的 `chunk_size` 为准，最后一块取剩余长度。
+
+```bash
+curl --fail-with-body -X PUT "$API_BASE/api/maps/uploads/$UPLOAD_ID/chunks/0" \
+  -H 'Content-Type: application/octet-stream' \
+  -H "X-Chunk-SHA256: $CHUNK_SHA256" --data-binary @chunk-0.bin
+```
+
+接口流式读取，不使用 multipart。分块落盘、同步并原子提交记录后才返回成功；支持乱序及并发上传。同一块相同内容重复上传成功返回，不同校验值返回 `409`。长度或哈希错误不会记为已接收；断连时只需重传该块。
+
+所有写操作和单会话查询返回 `UploadInfo`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `id`、`filename`、`size`、`sha256` | 会话与原始 ZIP 标识 |
+| `chunk_size`、`total_chunks` | 本次会话的分块参数，配置改变后旧会话仍沿用原参数 |
+| `received_chunks`、`received_bytes` | 已持久化的分块编号及字节数 |
+| `status` | `uploading` / `processing` / `complete` / `failed` / `cancelled` |
+| `stage` | `uploading`、`queued`、`merging`、`extracting`、`validating`、`publishing` 或终态 |
+| `progress` | `0..1`；上传时为已接收字节比例，处理时为当前阶段比例 |
+| `created_at`、`expires_at` | UTC 创建时间和闲置清理时间；正在处理的会话暂不清理 |
+| `error`、`error_code` | 失败原因与对应 HTTP 错误码；正常时为 `null` |
+| `map` | 完成后的 `MapInfo`，包含可直接创建任务的 `map.id`；完成前为 `null` |
+
+**完成处理**：调用 `POST /api/maps/uploads/{upload_id}/complete`。缺块或仍有块正在写入返回 `409`；受理后返回 `202`，通过 GET 查询后台处理进度。合并时重查每块及整包 SHA-256；损坏块会从已接收列表移除，状态回到 `uploading`，补传后再次 complete。解压或地图校验失败时，GET 本身仍返回 `200`，会话的 `status=failed`，应检查 `error_code`；保留期限内可以重试 complete 或取消。
+
+校验通过后，地图原子发布到 `<map_root>/uploads/<安全化包名>-<upload_id>` 并注册，不覆盖已有地图。重复 complete 返回同一结果及 `map_id`，不会重复处理已经完成的上传。发布目录中的 `.boxer-upload.json` 为服务恢复标记，应随地图保留。
+
+**恢复与清理**：服务重启后保留已提交分块，自动恢复已经受理的处理流程。客户端重新选择原 ZIP，核对大小及整包哈希，查询 `received_chunks` 后只传缺块。默认连续 **24 小时没有成功数据写入或提交处理**的未完成会话清理；GET 不续期。成功后立即清理分块、合并 ZIP 和解压暂存，完成记录保留 24 小时；记录清理不会删除地图。取消正在写入或处理的上传时先标记取消，待使用文件的操作退出后清理。已发布地图不能通过 DELETE 上传接口删除。
+
+服务的 `.boxer_uploads/` 暂存目录不会出现在地图发现列表；发布过程异常时会优先保留已发布目录，允许恢复注册。空间检查覆盖分块、合并和解压，峰值需求约为 `2 × ZIP 大小 + 解压大小`，多个上传还需叠加占用。
+
+**Python 客户端**：示例只依赖标准库，运行相同命令可凭本地记录续传，支持服务重启：
+
+```bash
+python scripts/upload_xnav_map.py /path/to/园区A.zip --url http://SERVER_IP:18765
+# 默认在 ZIP 旁保存 .upload.json，也可指定：
+python scripts/upload_xnav_map.py /path/to/园区A.zip \
+  --url http://SERVER_IP:18765 --state /path/to/upload-state.json
+```
+
+成功打印 `MapInfo`；`--new` 创建独立上传。网络故障或 `5xx` 按 1、2、4 秒退避重试，超出后保留记录，重新运行即可恢复。Web 页面提供相同能力，刷新后需要重新选择原文件才能继续传块，完成后自动加载地图。
 
 ## 7. 任务管理接口
 
@@ -1130,9 +1197,12 @@ CSV 取决于 `no_csv`，`performance.json` 取决于 `profile`。始终以任�
 | `400` | 地图损坏、路径不可读、相机选择无效、采样范围为空、来源签名或结果格式不匹配 | 检查路径、输入文件和业务参数；地图变化后重新注册 |
 | `404` | 未知地图/任务、发现根目录不存在、结果尚未发布、帧未提交或无匹配图像观测 | 区分 ID 错误与等待结果；检查任务进度和观测列表 |
 | `409` | 已有活动推理/模型加载、任务 options 与当前配置不同、停止只读结果 | 等待空闲、先应用配置，或使用源推理任务 ID |
-| `422` | 缺字段、额外字段、越界值、非法枚举或无法解析的路径/查询参数 | 按 OpenAPI schema 修正请求 |
+| `413` | ZIP、分块、解压容量或条目数超限 | 核对上传限制及 ZIP 内容 |
+| `415` | 分块请求没有使用 `application/octet-stream` | 修正 Content-Type |
+| `422` | 请求字段错误，或分块哈希、ZIP/地图校验失败 | 按 schema 修正请求或检查地图内容 |
 | `500` | 未处理的服务内部异常 | 查看服务日志和任务日志 |
 | `503` | 模型尚未就绪或服务正在关闭；根页面也可能因缺少构建资源返回此码 | 查询 `/api/inference`，等待/重试配置，或构建前端 |
+| `507` | 上传、解压或持久化时磁盘空间不足 | 释放空间后恢复上传或重试 complete |
 
 OpenAPI 为各业务路由统一声明了上述错误模型，不表示每个路由都会产生所有错误码。未处理的 `500` 当前没有统一 JSON 异常包装，客户端应能回退读取纯文本，不能假设所有失败响应都可用 `.json()` 解码。
 
@@ -1166,6 +1236,7 @@ OpenAPI 为各业务路由统一声明了上述错误模型，不表示每个路
 | --- | --- |
 | [server.py](../server.py) | HTTP 路由、状态码、SSE、JPEG 与二进制响应、Swagger UI |
 | [utils/xnav_service.py](../utils/xnav_service.py) | 请求/响应模型、配置与任务状态、目录发现、持久化和恢复 |
+| [utils/xnav_upload.py](../utils/xnav_upload.py) | 上传会话、分块提交、ZIP 安全解压、后台校验和发布恢复 |
 | [utils/xnav_runtime.py](../utils/xnav_runtime.py) | 模型加载复用、设备和精度选择 |
 | [utils/xnav_web_scene.py](../utils/xnav_web_scene.py) | 地图场景、点云编码、图像渲染与缓存 |
 | [loaders/xnav_loader.py](../loaders/xnav_loader.py) | 地图校验、帧身份、采样、相机和点云读取 |

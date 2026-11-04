@@ -459,8 +459,13 @@ class XNavMapLoader:
             self._point_cache.popitem(last=False)
         return result
 
-    def validate(self):
+    def validate(self, progress=None):
+        """Validate all assets; an optional callback may report or cancel work."""
         counts = Counter()
+        total = self.count * len(self.cameras) + self.lidar_count
+        done = 0
+        if progress:
+            progress(done, total)
         # Verify usable geometry before the entry point constructs any model.
         view_counts = {cid: len(self.views(cid)) for cid in self.camera_ids}
         for key in range(self.count):
@@ -468,9 +473,15 @@ class XNavMapLoader:
                 row = self.image_index[key, cid]
                 counts[row["status"]] += 1
                 self.read_image(key, cid)
+                done += 1
+                if progress:
+                    progress(done, total)
         # A dense image timeline can share anchors; inspect each PCD only once.
         for key in range(self.lidar_count):
             self._lidar_world_points(key, verify_fallback=True)
+            done += 1
+            if progress:
+                progress(done, total)
         image_frames = self.count
         if self.frame_unit == "lidar":
             image_frames = sum(

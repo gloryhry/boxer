@@ -11,11 +11,12 @@ from pathlib import Path
 from typing import Literal
 
 import cv2
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.requests import ClientDisconnect
 
 from loaders.xnav_loader import processing_frame_id
 from utils.xnav_service import (
@@ -35,6 +36,14 @@ from utils.xnav_service import (
     MapRequest,
     SceneInfo,
     list_map_directories,
+)
+from utils.xnav_upload import (
+    Interrupted,
+    UploadInfo,
+    UploadList,
+    UploadManager,
+    UploadRequest,
+    storage_error,
 )
 from utils.xnav_web_scene import cloud_bytes, render_observation
 
@@ -56,13 +65,22 @@ class LogInfo(BaseModel):
     text: str
 
 
-ERRORS = {code: {"model": ErrorResponse} for code in (400, 404, 409, 422, 500, 503)}
+ERRORS = {
+    code: {"model": ErrorResponse}
+    for code in (400, 404, 409, 413, 415, 422, 500, 503, 507)
+}
 
 
 def create_app(
-    output_dir="output/server", *, manager=None, web_dir=None, map_root="/nav_map"
+    output_dir="output/server",
+    *,
+    manager=None,
+    web_dir=None,
+    map_root="/nav_map",
+    upload_limits=None,
 ):
     manager = manager or JobManager(output_dir)
+    uploads = UploadManager(map_root, manager, limits=upload_limits)
     web_dir = Path(web_dir) if web_dir is not None else REPO / "web" / "dist"
 
     @asynccontextmanager
@@ -75,6 +93,7 @@ def create_app(
             "device": torch.cuda.get_device_name(0) if available else "cpu",
         }
         await asyncio.to_thread(manager.open)
+        await asyncio.to_thread(uploads.open)
 
         async def monitor():
             while True:
@@ -88,11 +107,12 @@ def create_app(
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+            await asyncio.to_thread(uploads.close)
             await asyncio.to_thread(manager.close)
 
     app = FastAPI(
         title="Boxer x-nav API",
-        version="1.0.0",
+        version="1.1.0",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -103,12 +123,20 @@ def create_app(
         ),
     )
     app.state.manager = manager
+    app.state.uploads = uploads
     app.state.stopping = False
+
+    @app.exception_handler(Interrupted)
+    def upload_interrupted(request, error):
+        return JSONResponse(
+            status_code=409, content={"detail": "Upload cancelled or service stopping"}
+        )
 
     @app.exception_handler(ValueError)
     @app.exception_handler(OSError)
     def input_error(request, error):
-        return JSONResponse(status_code=400, content={"detail": str(error)})
+        code = storage_error(error).status_code if isinstance(error, OSError) else 400
+        return JSONResponse(status_code=code, content={"detail": str(error)})
 
     @app.get("/api/health", response_model=HealthInfo, responses=ERRORS)
     def health():
@@ -151,6 +179,82 @@ def create_app(
     )
     def map_directories():
         return list_map_directories(map_root)
+
+    @app.post(
+        "/api/maps/uploads",
+        response_model=UploadInfo,
+        status_code=201,
+        responses=ERRORS,
+    )
+    def create_upload(body: UploadRequest):
+        return uploads.create(body)
+
+    @app.get("/api/maps/uploads", response_model=UploadList, responses=ERRORS)
+    def list_uploads():
+        return uploads.list()
+
+    @app.get(
+        "/api/maps/uploads/{upload_id}", response_model=UploadInfo, responses=ERRORS
+    )
+    def upload_info(upload_id: str):
+        return uploads.get(upload_id)
+
+    @app.put(
+        "/api/maps/uploads/{upload_id}/chunks/{index}",
+        response_model=UploadInfo,
+        responses=ERRORS,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/octet-stream": {
+                        "schema": {"type": "string", "format": "binary"}
+                    },
+                },
+            }
+        },
+        description="Stream one exact-length chunk. Identical retries are idempotent. "
+        "Only durably committed chunks appear in received_chunks.",
+    )
+    async def upload_chunk(
+        upload_id: str,
+        index: int,
+        request: Request,
+        x_chunk_sha256: str = Header(pattern=r"^[a-fA-F0-9]{64}$"),
+        content_length: int | None = Header(default=None, ge=0),
+    ):
+        if (
+            request.headers.get("content-type", "").split(";")[0]
+            != "application/octet-stream"
+        ):
+            raise HTTPException(415, "Use application/octet-stream for chunks")
+        writer = uploads.begin_chunk(upload_id, index, x_chunk_sha256, content_length)
+        try:
+            async for data in request.stream():
+                if data:
+                    await asyncio.to_thread(writer.write, data)
+            return await asyncio.to_thread(writer.finish)
+        except ClientDisconnect as error:
+            raise HTTPException(400, "Upload interrupted; retry this chunk") from error
+        except Interrupted as error:
+            raise HTTPException(409, "Upload cancelled or service stopping") from error
+        finally:
+            await asyncio.shield(asyncio.to_thread(writer.abort))
+
+    @app.post(
+        "/api/maps/uploads/{upload_id}/complete",
+        response_model=UploadInfo,
+        status_code=202,
+        responses=ERRORS,
+    )
+    def complete_upload(upload_id: str):
+        return uploads.complete(upload_id)
+
+    @app.delete(
+        "/api/maps/uploads/{upload_id}", response_model=UploadInfo, responses=ERRORS
+    )
+    def cancel_upload(upload_id: str):
+        return uploads.cancel(upload_id)
 
     @app.get("/api/maps/{map_id}", response_model=MapInfo, responses=ERRORS)
     def map_info(map_id: str):
@@ -457,13 +561,15 @@ def main(*, manager_factory=JobManager):
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18765)
     parser.add_argument("--output_dir", default=str(REPO / "output" / "server"))
+    parser.add_argument("--map_root", default="/nav_map")
     args = parser.parse_args()
-    app = create_app(manager=manager_factory(args.output_dir))
+    app = create_app(manager=manager_factory(args.output_dir), map_root=args.map_root)
 
     class LocalServer(uvicorn.Server):
         def handle_exit(self, sig, frame):
             # End SSE connections before Uvicorn waits for HTTP requests to drain.
             app.state.stopping = True
+            app.state.uploads.stop.set()
             for identity in list(app.state.manager.processes):
                 app.state.manager.stop(identity)
             super().handle_exit(sig, frame)

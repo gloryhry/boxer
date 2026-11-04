@@ -8,8 +8,9 @@
     "build": "tsc --noEmit && vite build"
   },
   "dependencies": {
-    "three": "^0.180.0",
-    "swagger-ui-dist": "^5.29.0"
+    "@noble/hashes": "2.0.1",
+    "swagger-ui-dist": "^5.29.0",
+    "three": "^0.180.0"
   },
   "devDependencies": {
     "@types/three": "^0.180.0",

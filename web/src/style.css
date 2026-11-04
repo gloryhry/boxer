@@ -53,6 +53,11 @@ h1, h2 { font-size: 14px; font-weight: 650; }
 .hint { color: #7a8c98; font-size: 11px; line-height: 1.7; overflow-wrap: anywhere; }
 .map-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 9px 0 5px; }
 .map-heading label { margin: 0; }
+.upload-panel { margin-top: 10px; padding: 9px 0; border-top: 1px solid #e7edf1; }
+.upload-panel input[type=file] { height: auto; padding: 6px; }
+.upload-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.upload-actions button { flex: 1; }
+.upload-panel .error { margin-top: 6px; }
 #map-info, #map-directory-note { margin-top: 7px; }
 #map-info { white-space: pre-line; }
 #map-directory-note[data-state=failed] { color: #985343; }

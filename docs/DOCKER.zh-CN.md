@@ -75,6 +75,29 @@ owlv2-base-patch16-ensemble.pt
 
 ## 构建和启动
 
+### 地图上传配置
+
+Web 和 OpenAPI 支持 ZIP 地图包分块上传、暂停和重启续传。地图根目录默认 `/nav_map`，
+暂存位于 `.boxer_uploads/`，成功后保存到 `uploads/<包名>-<upload_id>`，并自动注册。
+需同时持久化地图挂载和服务输出目录；现有 Compose 已提供这两个挂载。
+
+可在 `.env` 中调整以下变量，x86 和 Jetson 配置均会传入容器；原生部署设置同名环境变量：
+
+| 变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| `BOXER_UPLOAD_CHUNK_SIZE` | `8388608` | 8 MiB 分块；最大允许 64 MiB |
+| `BOXER_UPLOAD_MAX_ZIP_BYTES` | `21474836480` | ZIP 最大 20 GiB |
+| `BOXER_UPLOAD_MAX_EXPANDED_BYTES` | `107374182400` | 解压最大 100 GiB |
+| `BOXER_UPLOAD_MAX_FILES` | `200000` | ZIP 最大条目数，包含目录 |
+| `BOXER_UPLOAD_TTL_SECONDS` | `86400` | 未完成会话闲置 24 小时清理；状态查询不续期 |
+
+合并时保留原分块，磁盘峰值约为 `2 × ZIP 大小 + 解压大小`；成功后立即回收暂存，
+完成记录保留上述期限，已发布地图继续保留。处理失败可在期限内重试或取消。
+已有会话沿用创建时的分块大小，其他限制采用当前部署配置。
+原生服务可用 `--map_root /path/to/maps` 更换地图根目录，该目录需提前创建且可写。
+
+### 启动命令
+
 选择目标平台的一条命令：
 
 ```bash

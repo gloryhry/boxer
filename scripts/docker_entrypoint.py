@@ -61,9 +61,10 @@ def main(argv=None):
     if is_server and not {"-h", "--help"}.intersection(command[2:]):
         parser = argparse.ArgumentParser(add_help=False)
         parser.add_argument("--output_dir", default=str(REPO / "output" / "server"))
+        parser.add_argument("--map_root", default="/nav_map")
         options, _ = parser.parse_known_args(command[2:])
         try:
-            check_mounts(REPO, Path("/nav_map"), Path(options.output_dir))
+            check_mounts(REPO, Path(options.map_root), Path(options.output_dir))
             for variable in (
                 "TORCHINDUCTOR_CACHE_DIR",
                 "TRITON_CACHE_DIR",

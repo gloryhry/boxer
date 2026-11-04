@@ -58,9 +58,9 @@ def render_observation(loader, frame, observation, tracked=True, tentative=False
 
 
 class MapScene:
-    def __init__(self, root):
+    def __init__(self, root, *, progress=None):
         self.loader = XNavMapLoader(root)
-        self.validation = self.loader.validate()
+        self.validation = self.loader.validate(progress=progress)
         self.signature = source_signature(self.loader)
         self.lock = threading.RLock()
         self.cloud = None
