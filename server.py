@@ -28,9 +28,11 @@ from utils.xnav_service import (
     JobInfo,
     JobManager,
     JobRequest,
+    MapDirectories,
     MapInfo,
     MapRequest,
     SceneInfo,
+    list_map_directories,
 )
 from utils.xnav_web_scene import cloud_bytes, render_observation
 
@@ -55,7 +57,9 @@ class LogInfo(BaseModel):
 ERRORS = {code: {"model": ErrorResponse} for code in (400, 404, 409, 422, 500, 503)}
 
 
-def create_app(output_dir="output/server", *, manager=None, web_dir=None):
+def create_app(
+    output_dir="output/server", *, manager=None, web_dir=None, map_root="/nav_map"
+):
     manager = manager or JobManager(output_dir)
     web_dir = Path(web_dir) if web_dir is not None else REPO / "web" / "dist"
 
@@ -127,6 +131,20 @@ def create_app(output_dir="output/server", *, manager=None, web_dir=None):
     @app.post("/api/maps", response_model=MapInfo, responses=ERRORS)
     def add_map(body: MapRequest):
         return manager.add_map(body.path)
+
+    @app.get(
+        "/api/maps/directories",
+        response_model=MapDirectories,
+        responses=ERRORS,
+        description=(
+            "Recursively list x-nav map packages under /nav_map, sorted by relative "
+            "path. Directory symlinks are not followed. Discovery does not perform "
+            "full map validation; POST /api/maps still accepts full server-local "
+            "paths outside this root."
+        ),
+    )
+    def map_directories():
+        return list_map_directories(map_root)
 
     @app.get("/api/maps/{map_id}", response_model=MapInfo, responses=ERRORS)
     def map_info(map_id: str):

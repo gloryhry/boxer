@@ -1,0 +1,55 @@
+# syntax=docker/dockerfile:1
+
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
+WORKDIR /build/web
+COPY web/package.json web/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY web/ ./
+RUN npm run build
+
+# Build with --platform linux/amd64; docker-compose.x86.yaml sets this explicitly.
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential libglib2.0-0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m venv /opt/venv
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    PIP_CACHE_DIR=/root/.cache/pip \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    BOXER_LABELS_DIR=/vocab \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    OMP_NUM_THREADS=4 \
+    MKL_NUM_THREADS=4 \
+    TORCHINDUCTOR_COMPILE_THREADS=1 \
+    TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor \
+    TRITON_CACHE_DIR=/cache/triton \
+    CUDA_CACHE_PATH=/cache/cuda \
+    XDG_CACHE_HOME=/cache \
+    TMPDIR=/cache/tmp
+
+WORKDIR /app
+COPY requirements-server.txt requirements-docker.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --index-url https://download.pytorch.org/whl/cu128 \
+        'torch==2.10.0+cu128' \
+    && python -m pip install 'numpy==2.2.6' -r requirements-docker.txt \
+    && python -m pip check
+
+COPY server.py server_worker.py ./
+COPY boxernet/ ./boxernet/
+COPY loaders/ ./loaders/
+COPY owl/ ./owl/
+COPY utils/ ./utils/
+COPY scripts/check_cuda.py scripts/docker_entrypoint.py ./scripts/
+COPY --from=web /build/web/dist ./web/dist
+RUN mkdir -p /app/ckpts /app/output/server /nav_map /vocab /cache/tmp
+
+EXPOSE 18765
+STOPSIGNAL SIGINT
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["python", "-c", "import json, urllib.request; h=json.load(urllib.request.urlopen('http://127.0.0.1:18765/api/health', timeout=3)); assert h['status']=='ok' and h['cuda_available'] and h['inference_status']!='failed', h"]
+ENTRYPOINT ["python", "/app/scripts/docker_entrypoint.py"]
+CMD ["python", "/app/server.py", "--host", "0.0.0.0", "--port", "18765", "--output_dir", "/app/output/server"]

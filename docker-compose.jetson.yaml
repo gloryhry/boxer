@@ -1,0 +1,47 @@
+name: boxer
+
+services:
+  server:
+    image: boxer-server:jetson
+    platform: linux/arm64
+    build:
+      context: .
+      dockerfile: Dockerfile.jetson
+    runtime: nvidia
+    init: true
+    restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 90s
+    shm_size: 1gb
+    ports:
+      - "${SERVER_PORT:-18765}:18765"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      TORCHDYNAMO_DISABLE: "1"
+      OMP_NUM_THREADS: "${OMP_NUM_THREADS:-4}"
+      MKL_NUM_THREADS: "${MKL_NUM_THREADS:-4}"
+    volumes:
+      - type: bind
+        source: ${NAV_MAP_DIR:-./nav_map}
+        target: /nav_map
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CKPTS_DIR:-./ckpts}
+        target: /app/ckpts
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${VOCAB_DIR:-./owl}
+        target: /vocab
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${OUTPUT_DIR:-./output/server}
+        target: /app/output/server
+      - cache:/cache
+
+volumes:
+  cache:

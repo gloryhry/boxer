@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import os
 import signal
 import threading
 import time
@@ -13,7 +14,7 @@ from typing import Literal
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from loaders.xnav_loader import XNavMapLoader, processing_frame_id
+from loaders.xnav_loader import XNavMapLoader, is_xnav_map, processing_frame_id
 from utils.taxonomy import load_text_labels
 from utils.xnav_export import export_map_csv
 from utils.xnav_pipeline import XNavReplay
@@ -31,11 +32,14 @@ class RequestModel(BaseModel):
 
 
 class MapRequest(RequestModel):
-    path: str = Field(min_length=1)
+    path: str = Field(
+        min_length=1,
+        description="Server-local map path; full paths outside /nav_map are supported.",
+    )
 
 
 class InferenceOptions(RequestModel):
-    labels: str = Field(default="lvisplus", min_length=1, max_length=8192)
+    labels: str = Field(default="indoor", min_length=1, max_length=8192)
     thresh2d: float = Field(default=0.25, ge=0, le=1)
     thresh3d: float = Field(default=0.5, ge=0, le=1)
     xnav_cameras: str = Field(default="all", min_length=1)
@@ -102,6 +106,45 @@ class MapInfo(BaseModel):
     path: str
     validation: dict
     cameras: list[dict]
+
+
+class MapDirectory(BaseModel):
+    name: str = Field(description="Map path relative to the directory root.")
+    path: str = Field(description="Full server-local path accepted by POST /api/maps.")
+
+
+class MapDirectories(BaseModel):
+    root: str
+    directories: list[MapDirectory]
+
+
+def list_map_directories(root):
+    """Discover map packages without loading their images, clouds or calibration."""
+    root = Path(root).expanduser().absolute()
+
+    def walk_error(error):
+        if Path(error.filename) == root:
+            if isinstance(error, FileNotFoundError):
+                raise HTTPException(404, f"Map directory not found: {root}") from error
+            raise error
+        # A missing or unreadable subtree must not hide the other maps.
+
+    directories = []
+    for folder, _, _ in os.walk(root, onerror=walk_error, followlinks=False):
+        path = Path(folder)
+        if path == root:
+            continue
+        try:
+            if is_xnav_map(path):
+                directories.append(
+                    {"name": path.relative_to(root).as_posix(), "path": str(path)}
+                )
+        except OSError:
+            continue
+    return {
+        "root": str(root),
+        "directories": sorted(directories, key=lambda item: item["name"]),
+    }
 
 
 class SceneInfo(BaseModel):

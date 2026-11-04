@@ -191,6 +191,11 @@ Successful server jobs also save the four detection/tracking CSVs to the input
 map's `3dbbox/` directory, unless CSV output is disabled.
 See [Web server guide](docs/WEB_SERVER.zh-CN.md).
 
+For container deployment, use `docker-compose.x86.yaml` for Linux x86 NVIDIA GPUs
+or `docker-compose.jetson.yaml` for Jetson Orin. Both start the Web server by
+default and bind mount maps at `/nav_map`, with external checkpoints and
+vocabulary files. See [Docker deployment](docs/DOCKER.zh-CN.md) for setup.
+
 See [x-nav usage and input/output conventions](docs/XNAV_MAP.md) for details.
 
 

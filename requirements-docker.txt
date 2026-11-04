@@ -1,0 +1,7 @@
+# Headless x-nav server dependencies shared by both Docker images.
+# Torch and NumPy are installed separately for each platform.
+-r requirements-server.txt
+dill==0.4.1
+opencv-python-headless==4.11.0.86
+pyyaml==6.0.3
+tqdm==4.70.1

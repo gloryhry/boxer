@@ -3,7 +3,7 @@ import { SceneView } from './camera';
 import { initializeWorkspaceLayout } from './layout';
 import { inferenceControls, shouldSyncOptions } from './inference';
 import type { InferenceState } from './inference';
-import type { Frame, FrameSummary, Job, MapInfo, Observation, SceneInfo } from './types';
+import type { Frame, FrameSummary, Job, MapDirectories, MapDirectory, MapInfo, Observation, SceneInfo } from './types';
 
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
 <header class="app-header">
@@ -15,12 +15,13 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   <section id="parameter-panel" class="panel controls" aria-label="地图与推理控制">
     <div class="section-heading"><h1>推理控制</h1><span class="eyebrow">LOCAL / LAN</span></div>
     <div id="error" role="alert" class="error" hidden></div>
-    <label for="map-path">x-nav 地图包路径</label>
-    <div class="input-action"><input id="map-path" placeholder="/path/to/x-nav/map" spellcheck="false" autocomplete="off"><button id="load-map" class="secondary">加载地图</button></div>
-    <p id="map-info" class="hint">输入服务器上的地图目录，加载点云与相机信息。</p>
+    <div class="map-heading"><label for="map-path">x-nav 地图包</label><button id="refresh-maps" class="text-button" type="button" disabled>刷新列表</button></div>
+    <div class="input-action"><select id="map-path" aria-describedby="map-directory-note" disabled><option value="">正在读取地图列表…</option></select><button id="load-map" class="secondary" disabled>加载地图</button></div>
+    <p id="map-directory-note" class="hint" role="status" aria-live="polite">正在读取 /nav_map 下的地图包…</p>
+    <p id="map-info" class="hint">选择地图后加载点云与相机信息。</p>
     <form id="options">
       <details class="settings"><summary>推理参数 <span>词表 · 相机 · 阈值</span></summary>
-        <label for="labels">词表或自定义标签</label><input id="labels" value="lvisplus" list="vocabularies" placeholder="indoor 或 chair,table,lamp"><datalist id="vocabularies"><option value="lvisplus"><option value="indoor"><option value="small"></datalist>
+        <label for="labels">词表或自定义标签</label><input id="labels" value="indoor" list="vocabularies" placeholder="indoor 或 chair,table,lamp"><datalist id="vocabularies"><option value="lvisplus"><option value="indoor"><option value="small"></datalist>
         <div class="fields"><div><label for="thresh2d">2D 阈值</label><input id="thresh2d" type="number" min="0" max="1" step="0.01" value="0.25"></div><div><label for="thresh3d">3D 阈值</label><input id="thresh3d" type="number" min="0" max="1" step="0.01" value="0.5"></div></div>
         <div class="fields"><div><label for="cameras">相机</label><input id="cameras" value="all" list="camera-list" placeholder="all 或 0,1"><datalist id="camera-list"></datalist></div><div><label for="camera-mode">图像模式</label><select id="camera-mode"><option value="native">原生相机</option><option value="virtual_pinhole">虚拟针孔</option></select></div></div>
         <label class="check"><input id="track" type="checkbox" checked>启用全局目标跟踪</label>
@@ -73,6 +74,8 @@ let inference: InferenceState | null = null, connected = false, draftEdited = fa
 let serviceGeneration = 0;
 let events: EventSource | undefined, frameRequest: AbortController | undefined;
 let imageUrls: string[] = [];
+let mapDirectories: MapDirectory[] = [], loadingDirectories = false;
+let preferredMapPath = localStorage.getItem('boxer-map-path') || '';
 try { scene = new SceneView(element('canvas-host')); }
 catch { showError('浏览器无法初始化 WebGL。请启用硬件加速或使用支持 WebGL 的浏览器；接口和图像回放仍可使用。'); }
 
@@ -94,7 +97,10 @@ function buttons() {
   element<HTMLButtonElement>('apply-options').disabled = busy || !state.canApply;
   element('inference-note').textContent = state.message;
   element<HTMLButtonElement>('stop').disabled = busy || !active(job) || !!job?.readonly || job?.status === 'stopping';
-  element<HTMLButtonElement>('load-map').disabled = busy;
+  const selectedMapPath = element<HTMLSelectElement>('map-path').value;
+  element<HTMLButtonElement>('load-map').disabled = busy || loadingDirectories || !mapDirectories.some(item => item.path === selectedMapPath);
+  element<HTMLSelectElement>('map-path').disabled = busy || loadingDirectories || !mapDirectories.length;
+  element<HTMLButtonElement>('refresh-maps').disabled = busy || loadingDirectories;
   element<HTMLButtonElement>('import').disabled = busy || !map;
   element<HTMLButtonElement>('play').disabled = !job?.processed_frames;
   input('frame').disabled = !job?.processed_frames;
@@ -148,9 +154,12 @@ async function activateMap(info: MapInfo) {
     fetchOk(`/api/maps/${info.id}/cloud`).then(response => response.arrayBuffer()),
   ]);
   if (generation !== mapGeneration) return;
-  map = info; input('map-path').value = info.path;
-  localStorage.setItem('boxer-map-path', info.path);
-  element('map-info').textContent = `${info.validation.frames} 个${info.validation.frame_unit === 'image' ? '图像组' : '关键帧'} · ${info.validation.keyframes} 个 LiDAR 锚点 · ${info.cameras.length} 个相机`;
+  map = info;
+  const selector = element<HTMLSelectElement>('map-path');
+  selector.value = mapDirectories.some(item => item.path === info.path) ? info.path : '';
+  if (loadingDirectories) preferredMapPath = info.path;
+  else rememberMapPath(selector.value);
+  element('map-info').textContent = `当前地图：${info.path}\n${info.validation.frames} 个${info.validation.frame_unit === 'image' ? '图像组' : '关键帧'} · ${info.validation.keyframes} 个 LiDAR 锚点 · ${info.cameras.length} 个相机`;
   element('scene-info').textContent = `${metadata.point_count.toLocaleString()} 点 · Z ↑ · 米`;
   scene?.setMap(metadata, cloud); scene?.showMap(checked('show-map'));
   element('empty-scene').hidden = true; syncFollow();
@@ -298,6 +307,35 @@ async function selectFrame(next: number, snap: boolean) {
   } finally { if (frameRequest === request) loadingFrame = false; }
 }
 
+function rememberMapPath(path: string) {
+  preferredMapPath = path;
+  if (path) localStorage.setItem('boxer-map-path', path);
+  else localStorage.removeItem('boxer-map-path');
+}
+async function refreshMapDirectories() {
+  if (loadingDirectories) return;
+  loadingDirectories = true; buttons();
+  const selector = element<HTMLSelectElement>('map-path');
+  const note = element('map-directory-note');
+  note.textContent = '正在读取 /nav_map 下的地图包…';
+  delete note.dataset.state;
+  try {
+    const value = await api<MapDirectories>('/api/maps/directories');
+    mapDirectories = value.directories;
+    const placeholder = new Option(mapDirectories.length ? '请选择地图' : '未找到地图包', '');
+    placeholder.disabled = true;
+    selector.replaceChildren(placeholder, ...mapDirectories.map(item => new Option(item.name, item.path)));
+    selector.value = mapDirectories.some(item => item.path === preferredMapPath) ? preferredMapPath : '';
+    rememberMapPath(selector.value);
+    note.textContent = mapDirectories.length ? `${value.root} 下共 ${mapDirectories.length} 个地图包（包含子文件夹）。` : `${value.root} 下未找到 x-nav 地图包，请放入地图后刷新列表。`;
+  } catch (error) {
+    mapDirectories = [];
+    selector.replaceChildren(new Option('无法读取地图列表', ''));
+    note.dataset.state = 'failed';
+    note.textContent = `无法读取 /nav_map 地图列表：${error instanceof Error ? error.message : String(error)}。请检查目录和读取权限后刷新列表。`;
+  } finally { loadingDirectories = false; buttons(); }
+}
+
 async function refreshHistory() {
   jobs = await api<Job[]>('/api/jobs');
   const history = element<HTMLSelectElement>('history');
@@ -324,9 +362,13 @@ async function health() {
 }
 
 element('load-map').onclick = () => void action(async () => {
-  const info = await post<MapInfo>('/api/maps', { path: input('map-path').value.trim() });
+  const path = element<HTMLSelectElement>('map-path').value;
+  if (loadingDirectories || !mapDirectories.some(item => item.path === path)) return;
+  const info = await post<MapInfo>('/api/maps', { path });
   detachJob(); localStorage.removeItem('boxer-job-id'); await activateMap(info);
 });
+element('map-path').onchange = () => { rememberMapPath(element<HTMLSelectElement>('map-path').value); buttons(); };
+element('refresh-maps').onclick = () => void refreshMapDirectories();
 element('start').onclick = () => void action(async () => {
   if (!element<HTMLFormElement>('options').reportValidity() || !map) return;
   if (!inferenceControls(inference, options(), connected, activeJobId).canStart) return;
@@ -374,7 +416,7 @@ setInterval(() => {
   }
 }, 40);
 setInterval(() => { void health().catch(() => {}); }, 1500);
-input('map-path').value = localStorage.getItem('boxer-map-path') || '';
+void refreshMapDirectories();
 void action(async () => {
   await Promise.all([health(), refreshHistory()]);
   const saved = localStorage.getItem('boxer-job-id');

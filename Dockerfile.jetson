@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1
+
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
+WORKDIR /build/web
+COPY web/package.json web/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY web/ ./
+RUN npm run build
+
+# JetPack 6.2.1 / L4T 36.4.4 hosts, CUDA 12.6, Orin SM 8.7.
+# r36.4.0 is the published L4T JetPack container tag for this CUDA generation.
+FROM nvcr.io/nvidia/l4t-jetpack:r36.4.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-venv python3-pip curl ca-certificates xz-utils \
+        libopenblas0 libnuma1 libglib2.0-0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/venv
+
+# Use the same independent cuDSS archive as scripts/setup_jetson.sh. Installing
+# the PyPI cuDSS wheel would replace JetPack's cuBLAS with incompatible libraries.
+RUN curl --fail --location --retry 3 \
+        https://developer.download.nvidia.com/compute/cudss/redist/libcudss/linux-aarch64/libcudss-linux-aarch64-0.7.1.4_cuda12-archive.tar.xz \
+        --output /tmp/cudss.tar.xz \
+    && echo 'f283c31b6badf4a5277014295705eac8e6e28f27de30d746719ea1cef7a750b8  /tmp/cudss.tar.xz' | sha256sum --check \
+    && mkdir -p /opt/cudss \
+    && tar -xJf /tmp/cudss.tar.xz --strip-components=1 --directory /opt/cudss \
+    && rm /tmp/cudss.tar.xz \
+    && echo /opt/cudss/lib > /etc/ld.so.conf.d/boxer-cudss.conf \
+    && ldconfig
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    PIP_CACHE_DIR=/root/.cache/pip \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    BOXER_LABELS_DIR=/vocab \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    TORCHDYNAMO_DISABLE=1 \
+    OMP_NUM_THREADS=4 \
+    MKL_NUM_THREADS=4 \
+    TORCHINDUCTOR_COMPILE_THREADS=1 \
+    TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor \
+    TRITON_CACHE_DIR=/cache/triton \
+    CUDA_CACHE_PATH=/cache/cuda \
+    XDG_CACHE_HOME=/cache \
+    TMPDIR=/cache/tmp
+
+WORKDIR /app
+COPY requirements-server.txt requirements-docker.txt ./
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install 'numpy==1.26.4' -r requirements-docker.txt \
+        'torch @ https://pypi.jetson-ai-lab.io/jp6/cu126/+f/37d/7e156cfb4a646/torch-2.10.0-cp310-cp310-linux_aarch64.whl#sha256=37d7e156cfb4a646c4d7347597727db1529d184108f703324dfff1842cec094e' \
+    && python -m pip check
+
+COPY server.py server_worker.py ./
+COPY boxernet/ ./boxernet/
+COPY loaders/ ./loaders/
+COPY owl/ ./owl/
+COPY utils/ ./utils/
+COPY scripts/check_cuda.py scripts/docker_entrypoint.py ./scripts/
+COPY --from=web /build/web/dist ./web/dist
+RUN mkdir -p /app/ckpts /app/output/server /nav_map /vocab /cache/tmp
+
+EXPOSE 18765
+STOPSIGNAL SIGINT
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["python", "-c", "import json, urllib.request; h=json.load(urllib.request.urlopen('http://127.0.0.1:18765/api/health', timeout=3)); assert h['status']=='ok' and h['cuda_available'] and h['inference_status']!='failed', h"]
+ENTRYPOINT ["python", "/app/scripts/docker_entrypoint.py"]
+CMD ["python", "/app/server.py", "--host", "0.0.0.0", "--port", "18765", "--output_dir", "/app/output/server"]

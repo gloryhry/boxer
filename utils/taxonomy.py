@@ -9,7 +9,7 @@
 import os
 from typing import List, Union
 
-# Directory containing label files (owl/ directory, sibling of utils/)
+# Default label directory; Docker can mount vocabularies independently of code.
 _LABELS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "owl"
 )
@@ -19,6 +19,8 @@ def load_text_labels(
     label_list: Union[str, List[str]], verbose: bool = False
 ) -> List[str]:
     """Load text labels from a plain-text file (one label per line).
+
+    BOXER_LABELS_DIR overrides the built-in owl/ vocabulary directory.
 
     Args:
         label_list: Name of the label set to load (e.g. "lvisplus"),
@@ -34,7 +36,8 @@ def load_text_labels(
         label_list = [label_list]
 
     first_label = label_list[0]
-    txt_path = os.path.join(_LABELS_DIR, f"{first_label}_classes.csv")
+    labels_dir = os.environ.get("BOXER_LABELS_DIR") or _LABELS_DIR
+    txt_path = os.path.join(labels_dir, f"{first_label}_classes.csv")
     if not os.path.exists(txt_path):
         return label_list
 

@@ -1,3 +1,5 @@
+export interface MapDirectory { name: string; path: string }
+export interface MapDirectories { root: string; directories: MapDirectory[] }
 export interface MapInfo {
   id: string; path: string;
   cameras: { id: number; model: string }[];
