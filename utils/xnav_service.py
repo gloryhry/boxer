@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Literal
 
@@ -224,6 +225,133 @@ class FramePage(BaseModel):
     total: int
     offset: int
     frames: list[FrameSummary]
+
+
+class Box3DRow(BaseModel):
+    """Saved 3D box values using the boxer_3dbbs CSV column names."""
+
+    time_ns: str = Field(description="Frame time in nanoseconds; global objects use 0.")
+    tx_world_object: float
+    ty_world_object: float
+    tz_world_object: float
+    qw_world_object: float
+    qx_world_object: float
+    qy_world_object: float
+    qz_world_object: float
+    scale_x: float
+    scale_y: float
+    scale_z: float
+    name: str
+    instance: int
+    sem_id: int
+    prob: float
+
+
+class Box2DRow(BaseModel):
+    """Saved 2D box values using the owl_2dbbs CSV column names."""
+
+    time_ns: str = Field(description="Source image timestamp in nanoseconds.")
+    frame_id: int
+    sensor: str
+    device: str
+    img_width: int
+    img_height: int
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    name: str
+    instance: int
+    sem_id: int
+    prob: float
+
+
+class BoxPage(BaseModel):
+    status: Status
+    processed_frames: int = Field(ge=0)
+    total: int = Field(ge=0, description="Box count in this committed snapshot.")
+    offset: int = Field(ge=0)
+    limit: int = Field(ge=1, le=1000)
+
+
+class Box3DPage(BoxPage):
+    items: list[Box3DRow]
+
+
+class Box2DPage(BoxPage):
+    items: list[Box2DRow]
+
+
+def _box3d_row(record, time_ns):
+    tx, ty, tz = record["center"]
+    qw, qx, qy, qz = record["quaternion_wxyz"]
+    sx, sy, sz = record["size"]
+    return {
+        "time_ns": str(time_ns),
+        "tx_world_object": tx,
+        "ty_world_object": ty,
+        "tz_world_object": tz,
+        "qw_world_object": qw,
+        "qx_world_object": qx,
+        "qy_world_object": qy,
+        "qz_world_object": qz,
+        "scale_x": sx,
+        "scale_y": sy,
+        "scale_z": sz,
+        "name": record["label"],
+        "instance": record["track_id"],
+        "sem_id": record["sem_id"],
+        "prob": record["prob"],
+    }
+
+
+def _box2d_row(frame, observation, index, *, image_size, sem_map):
+    x1, x2, y1, y2 = observation["boxes_2d"][index]
+    labels, scores = observation["labels_2d"], observation["scores_2d"]
+    name = labels[index] if index < len(labels) else "unknown"
+    return {
+        "time_ns": str(observation["image_stamp_ns"]),
+        "frame_id": processing_frame_id(frame),
+        "sensor": f"cam{observation['camera_id']}/{observation['view_id']}",
+        "device": "x-nav",
+        "img_width": image_size,
+        "img_height": image_size,
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+        "name": name,
+        "instance": -1,
+        "sem_id": sem_map.get(name, -1),
+        "prob": scores[index] if index < len(scores) else 0.0,
+    }
+
+
+def _box3d_entries(replay, kind):
+    if kind in ("3dbbox_tracked", "3dbbox_tracks"):
+        if not replay.results["tracking"]["enabled"]:
+            return
+        if kind == "3dbbox_tracked":
+            if (
+                replay.results.get("status") == "complete"
+                and "objects" in replay.results
+            ):
+                for record in replay.results["objects"]:
+                    yield record, 0
+            elif replay.frames:
+                for record in replay.frames[-1]["tracks"]:
+                    if record.get("state") != "TENTATIVE":
+                        yield record, 0
+            return
+        key = "tracks"
+    elif kind == "3dbbox":
+        key = "detections"
+    else:
+        raise ValueError(f"Unknown box result kind: {kind}")
+    for frame in replay.frames:
+        for record in frame[key]:
+            if key != "tracks" or record.get("state") != "TENTATIVE":
+                yield record, frame["time_ns"]
 
 
 def timestamps(value):
@@ -639,7 +767,10 @@ class JobManager:
                             job,
                             {
                                 "status": "failed",
-                                "error": f"Inference worker exited with code {code}.\n{self.log(job['id'])[-4000:]}",
+                                "error": (
+                                    f"Inference worker exited with code {code}.\n"
+                                    f"{self.log(job['id'])[-4000:]}"
+                                ),
                             },
                         )
                     recycle = True
@@ -737,6 +868,43 @@ class JobManager:
                     }
                 )
             return {"total": len(replay.frames), "offset": offset, "frames": frames}
+
+    def box_page(self, identity, kind, offset, limit):
+        """Project one page from the replay cache, never from in-progress CSVs."""
+        with self.lock:
+            replay = self.replay(identity)
+            if kind == "owl_2dbbox":
+                parameters = replay.results["parameters"]
+                entries = (
+                    (frame, observation, index)
+                    for frame in replay.frames
+                    for observation in frame["observations"]
+                    for index in range(len(observation["boxes_2d"]))
+                )
+                project = partial(
+                    _box2d_row,
+                    image_size=parameters.get("image_size", -1),
+                    sem_map={
+                        label: index
+                        for index, label in enumerate(parameters.get("labels", []))
+                    },
+                )
+            else:
+                entries = _box3d_entries(replay, kind)
+                project = _box3d_row
+            total, items = 0, []
+            for entry in entries:
+                if offset <= total < offset + limit:
+                    items.append(project(*entry))
+                total += 1
+            return {
+                "status": self.jobs[identity]["status"],
+                "processed_frames": len(replay.frames),
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "items": items,
+            }
 
     def close(self):
         with self.lock:

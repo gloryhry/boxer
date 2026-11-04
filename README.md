@@ -189,7 +189,8 @@ or `/docs` for the API. The server preloads default models at startup and reuses
 them across jobs. Apply changed inference parameters before starting a job.
 Successful server jobs also save the four detection/tracking CSVs to the input
 map's `3dbbox/` directory, unless CSV output is disabled.
-See [Web server guide](docs/WEB_SERVER.zh-CN.md).
+See [Web server guide](docs/WEB_SERVER.zh-CN.md) and the
+[detailed OpenAPI usage guide (Chinese)](docs/OPENAPI.zh-CN.md).
 
 For container deployment, use `docker-compose.x86.yaml` for Linux x86 NVIDIA GPUs
 or `docker-compose.jetson.yaml` for Jetson Orin. Both start the Web server by

@@ -20,6 +20,8 @@ from pydantic import BaseModel
 from loaders.xnav_loader import processing_frame_id
 from utils.xnav_service import (
     REPO,
+    Box2DPage,
+    Box3DPage,
     FrameData,
     FramePage,
     ImportRequest,
@@ -94,7 +96,11 @@ def create_app(
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
-        description="Local/LAN map inference and committed-result replay. Nanosecond timestamps are strings. Cloud responses contain little-endian float32 xyzrgb vertices (24 bytes per point).",
+        description=(
+            "Local/LAN map inference and committed-result replay. "
+            "Nanosecond timestamps are strings. Cloud responses contain "
+            "little-endian float32 xyzrgb vertices (24 bytes per point)."
+        ),
     )
     app.state.manager = manager
     app.state.stopping = False
@@ -226,7 +232,10 @@ def create_app(
             **ERRORS,
             200: {
                 "content": {"text/event-stream": {"schema": {"type": "string"}}},
-                "description": "Initial snapshot, then changed job summaries; reconnect always sends the latest snapshot.",
+                "description": (
+                    "Initial snapshot, then changed job summaries; "
+                    "reconnect always sends the latest snapshot."
+                ),
             },
         },
     )
@@ -266,6 +275,73 @@ def create_app(
     )
     def frame(job_id: str, index: int):
         return manager.frame(job_id, index)
+
+    @app.get(
+        "/api/jobs/{job_id}/3dbbox_tracked",
+        response_model=Box3DPage,
+        responses=ERRORS,
+        description=(
+            "Current confirmed global objects from the latest committed frame; "
+            "uses final objects after inference completes. CSV column names, "
+            "time_ns is the string 0. Paginated by boxes; live pages may change."
+        ),
+    )
+    def tracked_boxes(
+        job_id: str,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(200, ge=1, le=1000),
+    ):
+        return manager.box_page(job_id, "3dbbox_tracked", offset, limit)
+
+    @app.get(
+        "/api/jobs/{job_id}/3dbbox_tracks",
+        response_model=Box3DPage,
+        responses=ERRORS,
+        description=(
+            "Confirmed tracking boxes from all committed frames in frame order. "
+            "Excludes TENTATIVE tracks and preserves historical instance IDs. "
+            "CSV column names; paginated by boxes, including during inference."
+        ),
+    )
+    def track_boxes(
+        job_id: str,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(200, ge=1, le=1000),
+    ):
+        return manager.box_page(job_id, "3dbbox_tracks", offset, limit)
+
+    @app.get(
+        "/api/jobs/{job_id}/3dbbox",
+        response_model=Box3DPage,
+        responses=ERRORS,
+        description=(
+            "Fused 3D detections from all committed frames in frame order. "
+            "CSV column names; paginated by boxes, including during inference."
+        ),
+    )
+    def detection_boxes(
+        job_id: str,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(200, ge=1, le=1000),
+    ):
+        return manager.box_page(job_id, "3dbbox", offset, limit)
+
+    @app.get(
+        "/api/jobs/{job_id}/owl_2dbbox",
+        response_model=Box2DPage,
+        responses=ERRORS,
+        description=(
+            "OWL 2D detections from all committed frames, cameras and views in "
+            "saved order. CSV column names and image timestamps; coordinates "
+            "refer to preprocessed views. Paginated by boxes during inference."
+        ),
+    )
+    def owl_boxes(
+        job_id: str,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(200, ge=1, le=1000),
+    ):
+        return manager.box_page(job_id, "owl_2dbbox", offset, limit)
 
     def frame_context(job_id, index):
         with manager.lock:
@@ -362,7 +438,9 @@ def create_app(
             return JSONResponse(
                 status_code=503,
                 content={
-                    "detail": "Build the Web UI first: cd web && npm ci && npm run build"
+                    "detail": (
+                        "Build the Web UI first: cd web && npm ci && npm run build"
+                    )
                 },
             )
         return FileResponse(path)

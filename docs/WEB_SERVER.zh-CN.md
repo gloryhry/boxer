@@ -109,3 +109,14 @@ curl -X POST http://127.0.0.1:18765/api/jobs \
 帧索引从 0 开始，推理 `start_n` 从 1 开始。接口分别保留 `frame_id`、`image_frame_id` 和 `lidar_keyframe_id`；所有 `*_ns` 字段均编码为字符串。回放直接读取已保存的检测、轨迹和 ID，不重复运行跟踪器。读入旧、新结果格式以及 native/virtual_pinhole 模式时会验证来源地图签名和预处理版本。
 
 首版面向可信本机和局域网，没有账号系统或上传地图功能。相机视角和回放位置属于各浏览器，不会互相覆盖。
+
+## 验证
+
+```bash
+uv pip install --python .venv/bin/python pytest httpx
+.venv/bin/python -m pytest -q tests/test_xnav_map_directories.py tests/test_xnav_server.py tests/test_xnav_runtime.py tests/test_xnav.py tests/test_xnav_execution.py tests/test_xnav_result_store.py tests/test_xnav_profile.py tests/test_orbit_camera.py
+npm --prefix web test
+npm --prefix web run build
+```
+
+服务测试使用真实地图格式、结果日志与常驻子进程协议，配合微型 CPU 模型验证预加载、参数应用、连续任务、跟踪重置、CSV 导出、并发冲突、失败、停止升级、服务清理和重启恢复。模型运行时测试单独核对权重加载次数及词表更新。真实 GPU 推理和显存释放需要在 NVIDIA 驱动可用的环境另行验收。
