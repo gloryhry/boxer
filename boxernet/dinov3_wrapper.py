@@ -1523,16 +1523,19 @@ class DinoV3Wrapper(torch.nn.Module):
         model = DINOV3_MODEL_FUNC[model_name](pretrained=True, weights=weights_path)
         model.eval()
         self.model = model
+        self.model_name = model_name
         self.feat_dim = DINOV3_OUTPUT_DIM[model_name]
         self.patch_size = 16
 
-    def forward(self, img):
+    def forward(self, img, *, return_class_token=False):
         """
         Input:
             img : torch.Tensor : batch of images shaped BxCxHxW of type float32 in range [0,1],
                                  where C can be 1 or 3, they get resized to a fixed size
         Returns:
             feats : torch.Tensor : shaped BxDxpHxpW where D is feature dim, pH & pW = img_size / patch_size,
+            With return_class_token=True, returns (feats, cls_token),
+            where cls_token is shaped BxD.
         """
         B, C, H, W = img.shape
         assert C in [1, 3], "must be either 1 or 3 channel input (BxCxHxW)"
@@ -1558,6 +1561,7 @@ class DinoV3Wrapper(torch.nn.Module):
                 img_norm,
                 reshape=True,
                 norm=True,
+                return_class_token=return_class_token,
             )
 
         assert len(feats) == 1, "should be only last layer"
@@ -1566,7 +1570,7 @@ class DinoV3Wrapper(torch.nn.Module):
         return feats
 
 
-def batch_dino(dino_wrapper, torch_img):
+def batch_dino(dino_wrapper, torch_img, *, return_class_token=False):
     patch_size = dino_wrapper.patch_size
 
     # Pad image to be divisible by patch_size if needed.
@@ -1576,7 +1580,10 @@ def batch_dino(dino_wrapper, torch_img):
     if pad_h > 0 or pad_w > 0:
         torch_img = torch.nn.functional.pad(torch_img, (0, pad_w, 0, pad_h))
 
-    feat = dino_wrapper.forward(torch_img)
+    if return_class_token:
+        feat, cls_token = dino_wrapper.forward(torch_img, return_class_token=True)
+    else:
+        feat = dino_wrapper.forward(torch_img)
 
     # Crop features back to original grid size if we padded.
     if pad_h > 0 or pad_w > 0:
@@ -1584,4 +1591,4 @@ def batch_dino(dino_wrapper, torch_img):
         fW = W // patch_size
         feat = feat[:, :, :fH, :fW]
 
-    return feat
+    return (feat, cls_token) if return_class_token else feat

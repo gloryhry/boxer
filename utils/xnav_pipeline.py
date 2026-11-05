@@ -27,6 +27,8 @@ from utils.tw.tensor_utils import pad_string, string2tensor
 from utils.tw.xnav_camera import PREPROCESS_VERSION
 from utils.xnav_dedup import ConservativeDeduplicator
 from utils.xnav_execution import InferredKeyframe, XNavExecution, XNavOutput
+from utils.xnav_export import MAP_VOCABULARY_PATH, save_map_vocabulary
+from utils.xnav_features import DinoFeatureCsvStore, image_feature_payload
 from utils.xnav_profile import XNavProfiler
 from utils.xnav_result_store import ResultFollower, ResultStore, read_result_file
 from utils.xnav_runtime import inference_dtype, select_device, semantic_embeddings
@@ -344,13 +346,43 @@ def _infer_keyframe(
         **frame_identity(frame),
         "time_ns": frame["time_ns"],
         "T_map_base": frame["T_map_base"].tolist(),
-        "sources": frame["sources"],
+        "sources": [dict(source) for source in frame["sources"]],
         "observations": [],
         "detections": [],
         "tracks": [],
     }
     raw = []
     views = {}
+    frame["dino_features"] = []
+    native_features = {}
+    sources = {source["camera_id"]: source for source in frame_record["sources"]}
+    for native in frame.get("native_images", []):
+        from boxernet.dinov3_wrapper import batch_dino
+
+        image = native["img0"].to(device).float()
+        autocast = (
+            torch.autocast(device_type=device, dtype=dtype)
+            if device == "cuda"
+            else contextlib.nullcontext()
+        )
+        with profiler.stage("dino", cuda=True), autocast:
+            patches, cls_token = batch_dino(boxer.dino, image, return_class_token=True)
+        cid = native["camera_id"]
+        payload = image_feature_payload(
+            frame,
+            sources[cid],
+            native,
+            patches,
+            cls_token,
+            boxer.dino.model_name,
+            args.ckpt,
+        )
+        frame["dino_features"].append(payload)
+        sources[cid]["dino_feature_file"] = payload["path"]
+        if getattr(args, "xnav_camera_mode", "native") == "native":
+            native_features[cid] = patches
+        # Virtual views must not retain the original image's dense feature map.
+        del patches, cls_token
     cached_views = {
         (o["camera_id"], o["view_id"]): o
         for o in cached_frames.get(key, {}).get("observations", [])
@@ -444,7 +476,12 @@ def _infer_keyframe(
                 else contextlib.nullcontext()
             )
             with profiler.stage("boxer", cuda=True), autocast:
-                predictions = boxer.forward(datum)
+                features = native_features.pop(cid, None)
+                predictions = (
+                    boxer.forward(datum, dino_features=features)
+                    if features is not None
+                    else boxer.forward(datum)
+                )
             boxes = predictions["obbs_pr_w"].cpu()[0]
             keep = (boxes.prob >= args.thresh3d).reshape(-1)
             boxes = boxes[keep].clone()
@@ -563,36 +600,36 @@ def run_xnav(args, *, runtime=None):
     owl = boxer = None
     profiler.set_device(device)
     embeddings = {}
-    if not args.cache3d:
-        from boxernet.boxernet import BoxerNet
+    from boxernet.boxernet import BoxerNet
+
+    # Cached 3D boxes still need the image backbone to export all source images.
+    if runtime is not None:
+        boxer = runtime.boxer
+    else:
+        with profiler.stage("init.boxer", cuda=True):
+            boxer = BoxerNet.load_from_checkpoint(args.ckpt, device=device)
+    if previous and boxer.hw != loader.size:
+        raise ValueError(
+            "Cached rectification does not match Boxer checkpoint image size"
+        )
+    loader.size = boxer.hw
+    parameters["image_size"] = loader.size
+    if not args.cache3d and not args.cache2d:
+        from owl.owl_wrapper import OwlWrapper
 
         if runtime is not None:
-            boxer = runtime.boxer
+            owl = runtime.owl
+            embeddings = runtime.embeddings
         else:
-            with profiler.stage("init.boxer", cuda=True):
-                boxer = BoxerNet.load_from_checkpoint(args.ckpt, device=device)
-        if previous and boxer.hw != loader.size:
-            raise ValueError(
-                "Cached rectification does not match Boxer checkpoint image size"
-            )
-        loader.size = boxer.hw
-        parameters["image_size"] = loader.size
-        if not args.cache2d:
-            from owl.owl_wrapper import OwlWrapper
-
-            if runtime is not None:
-                owl = runtime.owl
-                embeddings = runtime.embeddings
-            else:
-                with profiler.stage("init.owl", cuda=True):
-                    owl = OwlWrapper(
-                        device,
-                        text_prompts=labels,
-                        min_confidence=args.thresh2d,
-                        precision=args.force_precision,
-                        warmup=False,
-                    )
-                embeddings = semantic_embeddings(owl, labels)
+            with profiler.stage("init.owl", cuda=True):
+                owl = OwlWrapper(
+                    device,
+                    text_prompts=labels,
+                    min_confidence=args.thresh2d,
+                    precision=args.force_precision,
+                    warmup=False,
+                )
+            embeddings = semantic_embeddings(owl, labels)
     if previous:
         embeddings = {
             k: torch.tensor(v)
@@ -639,6 +676,7 @@ def run_xnav(args, *, runtime=None):
         "up_axis": "+Z",
         "device": device,
         "parameters": parameters,
+        "vocabulary_file": MAP_VOCABULARY_PATH,
         "execution": {
             "mode": "pipeline" if parallel else "serial",
             "detector_batch_size": detector_state["effective"],
@@ -726,7 +764,9 @@ def run_xnav(args, *, runtime=None):
 
     def serial_source():
         for index, frame in enumerate(
-            profiler.iterate(loader.iter_frames(with_points=not args.no_sdp))
+            profiler.iterate(loader.iter_frames(
+                with_points=not args.no_sdp, include_native_images=True
+            ))
         ):
             yield InferredKeyframe(index, frame, infer(frame), profiler.current)
 
@@ -736,6 +776,7 @@ def run_xnav(args, *, runtime=None):
                 output_worker = XNavOutput(
                     {
                         "output": str(output),
+                        "map_root": str(loader.root),
                         "metadata": results,
                         "prefix": prefix,
                         "no_csv": args.no_csv,
@@ -746,7 +787,9 @@ def run_xnav(args, *, runtime=None):
                     on_commit=committed,
                 )
                 execution = XNavExecution(
-                    loader.iter_frames(with_points=not args.no_sdp),
+                    loader.iter_frames(
+                        with_points=not args.no_sdp, include_native_images=True
+                    ),
                     infer,
                     profiler,
                     prepare=prepare,
@@ -756,6 +799,7 @@ def run_xnav(args, *, runtime=None):
                 source = execution
             else:
                 store = ResultStore(result_path, results)
+                feature_store = DinoFeatureCsvStore(loader.root)
                 source = serial_source()
         if getattr(args, "live_viz", False):
             from utils.xnav_live import start_live_viewer
@@ -857,9 +901,12 @@ def run_xnav(args, *, runtime=None):
                                 "fused": fused._data.numpy().copy(),
                                 "tracks": tracks._data.numpy().copy(),
                                 "preview": preview,
+                                "dino_features": frame["dino_features"],
                             }
                         )
                 else:
+                    with profiler.stage("features"):
+                        feature_store.upsert(frame["dino_features"])
                     with profiler.stage("persistence"):
                         store.append(
                             frame_record,
@@ -874,6 +921,7 @@ def run_xnav(args, *, runtime=None):
                         s["status"] == "saved" for s in frame["sources"]
                     )),
                     source_images=sum(s["status"] == "saved" for s in frame["sources"]),
+                    dino_feature_rows=len(frame["dino_features"]),
                     view_observations=len(frame_record["observations"]),
                     detections_2d=sum(
                         len(o["boxes_2d"]) for o in frame_record["observations"]
@@ -944,6 +992,7 @@ def run_xnav(args, *, runtime=None):
                         output_name=f"{prefix}_viz_final.mp4",
                     )
             with profiler.stage("final.export"):
+                save_map_vocabulary(loader.root, labels)
                 store.finish(results)
     except BaseException as error:
         results["status"] = (

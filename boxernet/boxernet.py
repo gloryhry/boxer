@@ -653,7 +653,7 @@ class BoxerNet(nn.Module):
 
         return inputs
 
-    def encode(self, batch):
+    def encode(self, batch, *, dino_features=None):
         out = {}
 
         torch_img = batch["img0"]
@@ -672,8 +672,23 @@ class BoxerNet(nn.Module):
         B, _, H, W = torch_img.shape
 
         with torch.no_grad():
-            # Run DinoV3.
-            dino_feat = batch_dino(self.dino, torch_img)
+            # Reuse native image features when the caller already extracted them.
+            dino_feat = (
+                batch_dino(self.dino, torch_img)
+                if dino_features is None
+                else dino_features
+            )
+            if dino_features is not None:
+                expected_shape = (
+                    B, self.dino.feat_dim, H // self.patch_size, W // self.patch_size
+                )
+                if (
+                    dino_feat.shape != expected_shape
+                    or dino_feat.device != torch_img.device
+                ):
+                    raise ValueError(
+                        "DINO features must match the input image grid and device"
+                    )
             out["dino0"] = dino_feat.clone()
             _, _, fH, fW = dino_feat.shape
             dino_feat = dino_feat.reshape(B, -1, fH * fW).permute(0, 2, 1)
@@ -748,8 +763,8 @@ class BoxerNet(nn.Module):
         return output
 
     @torch.no_grad()
-    def forward(self, datum):
+    def forward(self, datum, *, dino_features=None):
         inputs = self.prepare_inputs(datum)
-        out = self.encode(inputs)
+        out = self.encode(inputs, dino_features=dino_features)
         out = self.query(inputs, out)
         return out

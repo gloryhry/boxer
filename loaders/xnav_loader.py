@@ -379,6 +379,7 @@ class XNavMapLoader:
             raise ValueError("Selected frame range is empty (no processing frames)")
         self.size, self.max_points, self.fov = size, max_points, fov
         self._views = {}
+        self._native_views = {}
         self._point_cache = OrderedDict()
 
     def __len__(self):
@@ -561,17 +562,34 @@ class XNavMapLoader:
             "camera_mode": self.camera_mode,
         }
 
-    def iter_frames(self, with_points=True):
+    def iter_frames(self, with_points=True, *, include_native_images=False):
         for key in self.frame_ids:
             views = []
+            native_images = []
             for cid in self.camera_ids:
                 image = self.read_image(key, cid)
                 if image is not None:
                     for view in self.views(cid):
-                        views.append(
-                            self.load_view(key, cid, view.view_id, image, with_points)
+                        datum = self.load_view(
+                            key, cid, view.view_id, image, with_points
                         )
-            yield {
+                        views.append(datum)
+                        if include_native_images and self.camera_mode == "native":
+                            native_images.append(datum)
+                    if include_native_images and self.camera_mode != "native":
+                        cache_key = (cid, self.size)
+                        if cache_key not in self._native_views:
+                            self._native_views[cache_key] = NativeView(
+                                self.cameras[cid], self.size
+                            )
+                        native = self._native_views[cache_key]
+                        rgb = cv2.cvtColor(native.remap(image), cv2.COLOR_BGR2RGB)
+                        native_images.append({
+                            "img0": BaseLoader.img_to_tensor(rgb),
+                            "camera_id": cid,
+                            "view_geometry": native,
+                        })
+            frame = {
                 **self.frame_metadata(key),
                 "time_ns": self.pose_times_ns[key],
                 "T_map_base": self.poses[key],
@@ -580,6 +598,9 @@ class XNavMapLoader:
                     self.image_index[key, cid].copy() for cid in self.camera_ids
                 ],
             }
+            if include_native_images:
+                frame["native_images"] = native_images
+            yield frame
 
     def iter_keyframes(self, with_points=True):
         """Compatibility alias for the processing-frame iterator."""

@@ -316,7 +316,7 @@ curl --fail-with-body -sS -X PUT "$API_BASE/api/inference" \
 | `xnav_dedup` | `"conservative"` / `"legacy"` | `"conservative"` | 静态多视图跟踪的去重策略 |
 | `force_cpu` | 布尔值 | `false` | 强制使用 CPU；否则优先 CUDA，再按环境选择 MPS/CPU |
 | `no_sdp` | 布尔值 | `false` | 关闭稀疏深度点输入，以图像执行推理 |
-| `no_csv` | 布尔值 | `false` | 跳过任务 CSV 和源地图 `3dbbox/` 导出，仍保留 JSON 回放 |
+| `no_csv` | 布尔值 | `false` | 跳过检测与跟踪 CSV 导出，仍保存地图包特征、词表与 JSON 回放 |
 | `profile` | 布尔值 | `false` | 输出 `performance.json` 性能统计 |
 | `ckpt` | 字符串或 `null` | `null` | BoxerNet checkpoint 的服务端路径；空白字符串会转为 `null` |
 
@@ -1131,13 +1131,33 @@ output/server/
 
 CSV 取决于 `no_csv`，`performance.json` 取决于 `profile`。始终以任务返回的 `results_path` 为实际结果位置，不要仅凭服务 ID 拼接源地图清单 ID。
 
-检测框可通过第 8.7 节的四个 JSON 接口分页读取；整份 `results.json`、原始 CSV、模型或源地图文件通过服务端共享目录读取。
+成功推理还会在地图包内原子保存 `3dbbox/labels.csv`，表头为 `sem_id,label`，UTF-8 编码。
+完整词表取自实际解析/加载的 `parameters.labels`，按原始顺序从 0 编号，包含未检测出的类别，
+支持内置词表与自定义标签。`no_csv=true` 时仍保存词表；重跑覆盖为本次成功推理的完整词表。
+`results.json` 的 `vocabulary_file` 为地图内相对路径 `3dbbox/labels.csv`，写入失败使任务失败。
+
+DINOv3 特征默认合并到地图包的 `3dbbox/dino_features.csv`，每张有效原图一行。
+表头为 `相机帧序号,相机序号,cls_token,patch_mean_pooling`，UTF-8 编码。
+帧号使用原图 `image_frame_id`（旧地图为处理帧 `frame_id`），相机号使用 `camera_id`。
+两个向量各占一个单元格，保存为含 384 个数值的一维 JSON 数组，可恢复 float32 `[1, 384]`。
+无检测框、`no_csv=true` 或关闭跟踪均不影响特征保存。两种相机模式统一使用 native
+预处理，每张原图只生成一对向量；保存位置由 `results.json` 的源图记录中
+`dino_feature_file` 字段引用该地图内相对路径，按帧号和相机号定位行。重复推理更新同键，
+保留其他历史行；`statistics.dino_feature_rows` 统计本次写入行数。
+新流程不写 PT，初始化时直接删除地图特征目录中的旧 PT，不转换其内容。
+数值定义和 Python 读取示例见 [x-nav 输出说明](XNAV_MAP.md#输出与回放)。
+
+检测框可通过第 8.7 节的四个 JSON 接口分页读取；整份 `results.json`、DINOv3 特征 CSV、原始检测 CSV、模型或源地图文件通过服务端共享目录读取。
 
 ### 11.2 提交语义与结果格式
 
 运行中 `results.json` 使用 schema 3 描述文件，引用静态元数据和本次独立的 JSONL 帧日志，并记录已提交帧数及字节边界。失败或中断时保留可回放前缀和侧文件，迁移这种结果时需要保留关联文件。
 
 成功完成后生成可独立读取的完整 schema 2 `results.json`；项目读取器兼容 schema 1、2、3。API 回放会统一读取这些格式，并把纳秒时间戳转换为字符串。
+
+特征 CSV 在地图级文件锁保护下逐处理帧合并，在对应帧提交前完成同步和原子替换，
+写入失败不会发布该帧为已提交。迁移后需要使用图像向量时，应保留地图包的
+`3dbbox/dino_features.csv`。
 
 运行中不要把磁盘上的 schema 3 描述文件当作完整帧数组；通过 HTTP 帧接口读取，或在服务器 Python 环境使用 `utils.xnav_pipeline.read_results()`。完整磁盘 JSON 的纳秒字段可能仍是整数，外部 JavaScript 读取时也需要处理精度问题。
 
@@ -1156,7 +1176,7 @@ CSV 取决于 `no_csv`，`performance.json` 取决于 `profile`。始终以任�
 
 缺少所需 CSV 或地图目录不可写时，任务显示 `failed`，即使推理结果自身已经完整。此时可继续从任务目录或帧接口读取已提交结果，并查看 `error` 中的导出失败原因。
 
-`no_csv=true`、推理失败、中断或导入历史结果时不执行地图导出。无检测或关闭跟踪时，相关 CSV 仍可只有表头。新增的 `3dbbox/` 不计入地图来源签名。
+`no_csv=true`、推理失败、中断或导入历史结果时不执行 CSV 地图导出；已逐帧保存的 DINOv3 特征会保留。无检测或关闭跟踪时，相关 CSV 仍可只有表头。新增的 `3dbbox/` 不计入地图来源签名。
 
 ### 11.4 重启与恢复
 

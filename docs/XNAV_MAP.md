@@ -208,8 +208,8 @@ Z≤0 区域置黑并禁用提示；不再额外裁至 140°，因此可保留�
 | `--no_sdp` | 仅图像推理，并按投影视场判断可见性 |
 | `--skip_viz` | 不输出逐帧预览和视频 |
 | `--cache2d` | 复用保存的各相机、各视图 2D 检测，重新运行 BoxerNet |
-| `--cache3d` | 复用各视图的 3D 检测，重新融合和跟踪，不加载推理模型 |
-| `--no_csv` | 保留 JSON 结果与回放，不导出 CSV |
+| `--cache3d` | 复用各视图的 3D 检测，重新融合和跟踪；仍提取原图 DINOv3 特征 |
+| `--no_csv` | 跳过检测与跟踪 CSV，仍保存 JSON、DINOv3 特征和词表 |
 | `--profile` | 输出 `performance.json`：分阶段时间、前中后段速度、轨迹数、保存大小及内存峰值；默认关闭 |
 
 x-nav 自动进行处理帧内融合；全局融合使用 `--track`。`--fuse` 保持用于原有数据集。
@@ -245,7 +245,8 @@ OWLv2 可对同一处理帧的相邻两个观测批处理，沿用原 CPU resize
 因此没有进入默认路径。BoxerNet 固定 batch=1。批量推理遇到 CUDA OOM 时，仅当前组按单图重试，
 本次运行后续使用单图；`execution` 元数据记录实际批量及回退次数。
 CPU/MPS 和 `--xnav_execution serial` 使用原串行模型调用。
-`--cache2d`、`--cache3d` 保持各自的模型跳过规则，执行模式不参与缓存参数匹配。
+`--cache2d` 跳过 OWLv2，`--cache3d` 跳过 OWLv2 和 3D 预测；两者均提取原图 DINOv3 特征。
+执行模式不参与缓存参数匹配。
 
 ```bash
 bash scripts/run_local_cuda.sh --input /path/to/map --track --profile
@@ -309,6 +310,57 @@ OWLv2 和 BoxerNet 默认均为 batch=1；batch=2 未通过置信度误差门槛
 | `preview_frames/`、`boxer_viz_final.mp4` | 检测/跟踪预览；视频按每秒 5 个处理帧编码 |
 
 `--write_name` 会替换 3D CSV 和视频的 `boxer` 前缀。
+成功推理会将实际使用的完整词汇表保存到地图包的 `3dbbox/labels.csv`，
+UTF-8 编码，表头为 `sem_id,label`。语义 ID 从 0 开始，对应解析后的 `parameters.labels`
+顺序，保留未检测出的类别、原始大小写和文本提示；内置词表与自定义标签均适用。
+命令行、Web、缓存推理以及 `--no_csv` 模式都会保存该表。
+收尾时原子替换词表，写入失败使任务失败；重跑覆盖为本次成功推理的完整类别集合。
+`results.json` 的 `vocabulary_file` 给出相对地图包根目录的路径 `3dbbox/labels.csv`。
+
+DINOv3 特征默认汇总到地图包的 `3dbbox/dino_features.csv`，每张原图一行。
+命令行与 Web 使用相同位置，两种相机模式共享该文件。重复推理按帧号和相机号更新，
+保留其他帧和相机的历史行，按帧号、相机号升序保存。
+
+表头固定为 `相机帧序号,相机序号,cls_token,patch_mean_pooling`，文件使用 UTF-8。
+相机帧序号使用 `image_frame_id`，旧地图使用处理帧 `frame_id`，与原图文件名编号一致；
+相机序号使用原始 `camera_id`，均不重新编号。
+两个向量各占一个单元格，编码为含 384 个数值的一维 JSON 数组，由标准 CSV 引号规则处理逗号。
+计算仍使用 float32，写入数值可往返还原为原来的 `[1, 384]` 张量。
+
+特征覆盖所选相机和帧范围内所有 `status=saved` 的原图，
+包括没有检测框的图像。`--no_csv`、关闭预览、`--cache2d` 和 `--cache3d` 均不关闭特征保存；
+`--cache3d` 仍加载/复用 BoxerNet 的 DINOv3 骨干，只跳过检测与 3D 预测。
+两种相机模式的特征都使用 native 预处理（等比缩放、补黑边、相机有效域遮罩），
+virtual_pinhole 下每张原图只生成一份特征，不为虚拟视图重复保存。
+native 下复用相同 patch 特征进行 3D 预测，virtual_pinhole 下额外提取一次原图特征。
+
+CLS 和 patch 均取模型最后一层经过 LayerNorm 的结果；均值使用 float32，排除 CLS 和
+storage/register tokens，覆盖 native 输入全部 patch（含补边和遮罩区域），不额外做 L2 归一化。
+
+```python
+import csv
+import json
+from pathlib import Path
+import numpy as np
+
+map_root = Path("/path/to/xnav-map")
+with (map_root / "3dbbox/dino_features.csv").open(encoding="utf-8", newline="") as stream:
+    for row in csv.DictReader(stream):
+        frame_id, camera_id = int(row["相机帧序号"]), int(row["相机序号"])
+        cls = np.asarray(json.loads(row["cls_token"]), dtype=np.float32).reshape(1, 384)
+        mean = np.asarray(json.loads(row["patch_mean_pooling"]), dtype=np.float32).reshape(1, 384)
+        print(frame_id, camera_id, cls.shape, mean.shape)
+```
+
+每个处理帧批量合并一次，通过地图级文件锁保护读取、合并和发布；临时文件写入、同步并
+原子替换 CSV 后才提交对应 JSON 帧记录。写入失败保留原 CSV 和已提交的回放前缀。
+`results.json` 源图的 `dino_feature_file` 为地图内相对路径 `3dbbox/dino_features.csv`，
+按原图帧号与相机号定位行。统计字段 `dino_feature_rows` 表示本次处理的特征行数，
+CSV 还可能包含先前其他处理范围的行。
+
+新流程不再写 PT，初始化保存时清理地图包 `3dbbox/dino_features/` 下的旧 PT，
+不将旧 PT 转换到 CSV；目录清空后移除目录。历史 JSON 不改写，检测与跟踪回放继续可用。
+
 通过 Web/API server 推理时，任务输出仍按任务隔离保存；成功完成后，另外将上述四个
 检测/跟踪 CSV 覆盖保存到源地图包的 `3dbbox/`。勾选“不写 CSV”、失败、中断或导入
 历史结果时不执行此导出。命令行入口的输出路径保持不变，详见 [Web 服务说明](WEB_SERVER.zh-CN.md)。

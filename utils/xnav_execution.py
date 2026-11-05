@@ -214,20 +214,24 @@ class XNavExecution:
 
 def _output_worker(config, incoming, outgoing):
     """Spawn target: one owner for every result/CSV handle, CPU operations only."""
+    from pathlib import Path
+
     import numpy as np
     import torch
-    from pathlib import Path
 
     from loaders.xnav_loader import frame_identity, processing_frame_id
     from utils.file_io import ObbCsvWriter2, save_bb2d_csv
     from utils.tw.camera import CameraTW
     from utils.tw.obb import ObbTW
     from utils.tw.pose import PoseTW
+    from utils.xnav_export import save_map_vocabulary
+    from utils.xnav_features import DinoFeatureCsvStore
     from utils.xnav_pipeline import _preview, records_to_obbs
     from utils.xnav_result_store import ResultStore
 
     torch.set_num_threads(1)
     output = Path(config["output"])
+    map_root = Path(config["map_root"])
     metadata = config["metadata"]
     prefix = config["prefix"]
     writers = {}
@@ -249,12 +253,16 @@ def _output_worker(config, incoming, outgoing):
             for path in preview.glob("frame_*.jpg"):
                 path.unlink()
         store = ResultStore(output / "results.json", metadata)
+        feature_store = DinoFeatureCsvStore(map_root)
         outgoing.put(("ready", None))
         while True:
             kind, value = incoming.get()
             if kind == "frame":
                 started = time.perf_counter()
                 record = value["record"]
+                feature_store.upsert(value.get("dino_features", []))
+                features_ms = (time.perf_counter() - started) * 1000
+                started = time.perf_counter()
                 if writers:
                     for observation in record["observations"]:
                         boxes = np.asarray(
@@ -316,6 +324,7 @@ def _output_worker(config, incoming, outgoing):
                             "index": value["index"],
                             "result_bytes": store.result_bytes,
                             "stages": {
+                                "features": features_ms,
                                 "csv": csv_ms,
                                 "preview": preview_ms,
                                 "persistence": (time.perf_counter() - started) * 1000,
@@ -347,6 +356,9 @@ def _output_worker(config, incoming, outgoing):
                 # Keep the durable prefix available on any export failure.
                 # Publish complete only after every requested output succeeds.
                 started = time.perf_counter()
+                labels = value.get("parameters", {}).get("labels")
+                if labels is not None:
+                    save_map_vocabulary(map_root, labels)
                 store.finish(value)
                 stages["final.export"] += (time.perf_counter() - started) * 1000
                 outgoing.put(("finished", stages))
