@@ -197,7 +197,7 @@ curl --fail-with-body -sS \
 
 ## 4. 接口总览
 
-下表列出全部 29 个业务 API 操作。成功状态码指正常受理或读取时的状态。
+下表列出全部 30 个业务 API 操作。成功状态码指正常受理或读取时的状态。
 
 | 方法 | 路径 | 成功码 | 用途 |
 | --- | --- | --- | --- |
@@ -222,6 +222,7 @@ curl --fail-with-body -sS \
 | `POST` | `/api/jobs/{job_id}/stop` | `202` | 请求停止推理任务 |
 | `GET` | `/api/jobs/{job_id}/log` | `200` | 获取任务日志尾部 |
 | `GET` | `/api/jobs/{job_id}/events` | `200` | 订阅任务 SSE 事件 |
+| `GET` | `/api/jobs/{job_id}/3dbbox.zip` | `200` | 下载成功任务的 `3dbbox/` ZIP 快照 |
 | `GET` | `/api/jobs/{job_id}/frames` | `200` | 分页查询已提交帧摘要 |
 | `GET` | `/api/jobs/{job_id}/frames/{index}` | `200` | 获取单帧完整结果 |
 | `GET` | `/api/jobs/{job_id}/frames/{index}/images/{kind}` | `200` / `304` | 获取 2D 或 3D 叠加 JPEG |
@@ -577,11 +578,11 @@ python scripts/upload_xnav_map.py /path/to/园区A.zip \
 | `starting` | 任务已记录，等待 worker 开始 | 继续等待 |
 | `running` | 正在推理、提交帧或进行收尾 | 读取已提交结果并继续等待 |
 | `stopping` | 已请求中断，正在等待退出 | 继续等待最终状态 |
-| `complete` | 推理、输出关闭及要求的地图 CSV 导出均完成 | 本次推理成功结束 |
-| `failed` | 推理、结果读取或导出失败 | 读取 `error` 和日志；已提交帧可能仍可回放 |
+| `complete` | 推理、输出关闭及要求的地图 CSV 导出和 ZIP 归档均完成 | 本次推理成功结束 |
+| `failed` | 推理、结果读取、导出或 ZIP 归档失败 | 读取 `error` 和日志；已提交帧可能仍可回放 |
 | `interrupted` | 用户停止、服务重启或其他中断 | 已提交帧保留，不会自动续推 |
 
-对普通推理任务，`complete`、`failed`、`interrupted` 是客户端等待的结束状态。`processed_frames == total_frames` 不等于任务成功：输出收尾和地图 CSV 导出仍可能未完成或失败。
+对普通推理任务，`complete`、`failed`、`interrupted` 是客户端等待的结束状态。`processed_frames == total_frames` 不等于任务成功：输出收尾、地图 CSV 导出和 ZIP 归档仍可能未完成或失败。`no_csv=true` 跳过检测 CSV 导出和 ZIP 归档，任务仍可正常完成。
 
 ### 7.4 `POST /api/jobs/{job_id}/stop`
 
@@ -648,6 +649,40 @@ curl --fail-with-body -N "$API_BASE/api/jobs/$JOB_ID/events"
 - 事件不包含完整帧、轨迹和点云。客户端通过 `processed_frames` 的变化再读取帧接口。
 - 任务结束后流不会自动关闭；客户端收到结束状态后应主动关闭连接。
 - 未知任务在建立流之前返回 `404`。
+
+### 7.8 `GET /api/jobs/{job_id}/3dbbox.zip`
+
+无请求体和查询参数。新建普通推理任务在 `no_csv=false` 且成功完成后，提供完成时源地图
+`3dbbox/` 的持久化 ZIP 快照；下载不会重新压缩当前地图目录。同一地图后续重跑或服务
+重启不会改变该任务的 ZIP 内容。
+
+```bash
+# 先查询任务并等待 status == "complete"，再下载。
+curl --fail-with-body -sS \
+  "$API_BASE/api/jobs/$JOB_ID/3dbbox.zip" -o "3dbbox-$JOB_ID.zip"
+```
+
+成功响应为 `200 application/zip`，响应头为
+`Content-Disposition: attachment; filename="3dbbox-<job_id>.zip"`。
+ZIP 保留顶层 `3dbbox/` 及业务子目录，包含四个检测/跟踪 CSV、`labels.csv`、
+`dino_features.csv` 和目录内其他业务文件；空结果 CSV 仍保留表头。
+DINO 特征保留归档时的地图级累计行，并不只包含该任务新增的行。
+内部 `.dino_features.lock`、`.boxer-*` 暂存项和原子写入临时文件不进入 ZIP；
+遇到符号链接、特殊文件或不可读文件时归档失败。
+
+| 情况 | 状态码 | 客户端处理 |
+| --- | --- | --- |
+| 成功完成且归档存在 | `200` | 保存二进制 ZIP |
+| `starting`、`running`、`stopping`、`failed` 或 `interrupted` | `409` | 等待成功完成，或检查任务错误 |
+| `no_csv=true` | `409` | 此类任务不生成 ZIP，即使目录保留旧 CSV 也不提供下载 |
+| 未知任务、导入的只读任务、历史任务无归档或归档已删除 | `404` | 不会用当前地图目录补生成历史 ZIP |
+
+地图导出和压缩由单线程后台任务完成，不持有任务管理器全局锁；期间任务保持 `running`，
+查询和健康检查仍可用，新推理任务须等待收尾。ZIP 使用 DEFLATE、ZIP64 和分块读写，
+临时写入后原子发布；发布成功后任务才进入 `complete`。
+磁盘空间、权限等归档错误会使任务进入 `failed`，`error` 记录原因，已有推理结果保留。
+收尾期间可以请求停止，任务经过 `stopping` 进入 `interrupted`，未发布 ZIP 被清理；
+此时地图 CSV 可能已经导出。服务关闭时取消并等待收尾退出，重启不自动续做归档。
 
 ## 8. 帧数据、检测框、图像与点云接口
 
@@ -1117,6 +1152,7 @@ output/server/
     └── <任务ID>/
         ├── job.json
         ├── inference.log
+        ├── 3dbbox.zip
         └── output/
             └── <地图清单map_id>/
                 └── <snapshot_id>/
@@ -1129,7 +1165,7 @@ output/server/
                         └── performance.json
 ```
 
-CSV 取决于 `no_csv`，`performance.json` 取决于 `profile`。始终以任务返回的 `results_path` 为实际结果位置，不要仅凭服务 ID 拼接源地图清单 ID。
+CSV 和新任务的 `3dbbox.zip` 取决于 `no_csv`；ZIP 仅在成功收尾时发布，历史任务不补生成。`performance.json` 取决于 `profile`。始终以任务返回的 `results_path` 为实际结果位置，不要仅凭服务 ID 拼接源地图清单 ID。
 
 成功推理还会在地图包内原子保存 `3dbbox/labels.csv`，表头为 `sem_id,label`，UTF-8 编码。
 完整词表取自实际解析/加载的 `parameters.labels`，按原始顺序从 0 编号，包含未检测出的类别，
@@ -1147,7 +1183,7 @@ DINOv3 特征默认合并到地图包的 `3dbbox/dino_features.csv`，每张有�
 新流程不写 PT，初始化时直接删除地图特征目录中的旧 PT，不转换其内容。
 数值定义和 Python 读取示例见 [x-nav 输出说明](XNAV_MAP.md#输出与回放)。
 
-检测框可通过第 8.7 节的四个 JSON 接口分页读取；整份 `results.json`、DINOv3 特征 CSV、原始检测 CSV、模型或源地图文件通过服务端共享目录读取。
+检测框可通过第 8.7 节的四个 JSON 接口分页读取；成功新任务的词表、DINOv3 特征 CSV 和原始检测 CSV 可通过第 7.8 节的 ZIP 接口下载。整份 `results.json`、模型或源地图文件通过服务端共享目录读取。
 
 ### 11.2 提交语义与结果格式
 
@@ -1174,13 +1210,15 @@ DINOv3 特征默认合并到地图包的 `3dbbox/dino_features.csv`，每张有�
 
 服务先暂存四份文件，再逐个原子替换，任务目录保留原件。这是逐文件发布，不是四个文件整体的事务；同步读取多个文件时，应在任务 `complete` 后读取。
 
-缺少所需 CSV 或地图目录不可写时，任务显示 `failed`，即使推理结果自身已经完整。此时可继续从任务目录或帧接口读取已提交结果，并查看 `error` 中的导出失败原因。
+地图 CSV 导出后，服务保存该任务的 `3dbbox.zip` 快照，ZIP 原子发布后才标记任务 `complete`。缺少所需 CSV、地图目录不可写或 ZIP 归档失败时，任务显示 `failed`，即使推理结果自身已经完整。此时可继续从任务目录或帧接口读取已提交结果，并查看 `error` 中的导出或归档失败原因。
 
 `no_csv=true`、推理失败、中断或导入历史结果时不执行 CSV 地图导出；已逐帧保存的 DINOv3 特征会保留。无检测或关闭跟踪时，相关 CSV 仍可只有表头。新增的 `3dbbox/` 不计入地图来源签名。
 
 ### 11.4 重启与恢复
 
 持久化相同服务输出目录后，重启会恢复已注册地图与历史任务。之前处于 `starting`、`running`、`stopping` 的普通任务会被标记为 `interrupted`，错误说明服务重启后未恢复推理。
+
+已成功归档任务的 `3dbbox.zip` 直接从持久化文件下载；重启不会重新生成。中断收尾的未发布 ZIP 和临时 ZIP 会被清理，历史任务与导入任务不会补归档。
 
 恢复记录不等于断点续推；创建新任务会重新建立跟踪器。地图和结果的服务端路径仍需可用，来源签名仍需匹配。服务进程重启后当前推理配置回到默认值，应重新查询和应用所需配置。
 

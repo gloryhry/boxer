@@ -7,6 +7,7 @@ import signal
 import threading
 import time
 import uuid
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -17,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from loaders.xnav_loader import XNavMapLoader, is_xnav_map, processing_frame_id
 from utils.taxonomy import load_text_labels
+from utils.xnav_archive import create_map_archive
 from utils.xnav_export import export_map_csv
 from utils.xnav_pipeline import XNavReplay
 from utils.xnav_result_store import _atomic_json
@@ -392,6 +394,10 @@ class JobManager:
         self.inference_device = "initializing"
         self.inference_error = None
         self.finished = {}
+        self._finalizer = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="xnav-finalize"
+        )
+        self._finalizations = {}
         self._closing = False
         self._recovering = False
         for path in (self.root / "maps").glob("*.json"):
@@ -405,6 +411,10 @@ class JobManager:
                     error="Service restarted; inference was not resumed",
                 )
                 _atomic_json(path, record)
+                # Only our atomic ZIP temporaries can be left by a killed server.
+                for temporary in path.parent.glob(".3dbbox.zip.*.tmp"):
+                    temporary.unlink(missing_ok=True)
+                (path.parent / "3dbbox.zip").unlink(missing_ok=True)
             self.jobs[record["id"]] = record
 
     def _save(self, job):
@@ -683,6 +693,12 @@ class JobManager:
 
     def _complete_job(self, job, message):
         identity = job["id"]
+        if identity in self._finalizations:
+            return
+        # job_finished acknowledges all output handles are closed. The worker is
+        # idle now, even while this job continues exporting and compressing files.
+        self.processes.pop(identity, None)
+        self.stop_deadlines.pop(identity, None)
         replay = self.replays.get(identity)
         if job.get("stop_requested") or message["status"] == "interrupted":
             job["status"] = "interrupted"
@@ -692,15 +708,21 @@ class JobManager:
             and replay.results.get("status") == "complete"
             and not job["error"]
         ):
-            try:
-                if not job["options"]["no_csv"]:
-                    export_map_csv(
-                        Path(job["results_path"]).parent,
-                        self.map_records[job["map_id"]]["path"],
-                    )
+            if job["options"]["no_csv"]:
                 job["status"] = "complete"
-            except Exception as error:
-                job.update(status="failed", error=f"Could not export map CSVs: {error}")
+            else:
+                cancel = threading.Event()
+                future = self._finalizer.submit(
+                    self._export_results,
+                    Path(job["results_path"]).parent,
+                    self.map_records[job["map_id"]]["path"],
+                    self.root / "jobs" / identity / "3dbbox.zip",
+                    cancel,
+                )
+                self._finalizations[identity] = (future, cancel)
+                job["status"] = "running"
+                self._save(job)
+                return
         else:
             job["status"] = "failed"
             job["error"] = (
@@ -708,10 +730,52 @@ class JobManager:
                 or message.get("error")
                 or ("Worker finished without a complete committed result")
             )
-        self.processes.pop(identity, None)
-        self.stop_deadlines.pop(identity, None)
-        self.active_id = None
+        self._finish_job(job)
+
+    def _finish_job(self, job):
+        if self.active_id == job["id"]:
+            self.active_id = None
         self._save(job)
+
+    @staticmethod
+    def _export_results(source, map_root, archive, cancel):
+        if cancel.is_set():
+            raise CancelledError()
+        try:
+            export_map_csv(source, map_root)
+        except Exception as error:
+            raise RuntimeError(f"Could not export map CSVs: {error}") from error
+        try:
+            create_map_archive(map_root, archive, cancel)
+        except CancelledError:
+            raise
+        except Exception as error:
+            raise RuntimeError(f"Could not archive map 3dbbox: {error}") from error
+
+    def _poll_finalizations(self):
+        for identity, (future, _) in list(self._finalizations.items()):
+            if not future.done():
+                continue
+            job = self.jobs[identity]
+            try:
+                future.result()
+            except CancelledError:
+                job["status"] = "interrupted"
+            except Exception as error:
+                job.update(status="failed", error=str(error))
+            else:
+                job["status"] = "failed" if job["error"] else "complete"
+            # A stop may arrive after the archive was atomically published but
+            # before its future was collected. It still wins over completion.
+            if job.get("stop_requested"):
+                job["status"] = "interrupted"
+            if job["status"] != "complete":
+                with contextlib.suppress(OSError):
+                    (self.root / "jobs" / identity / "3dbbox.zip").unlink(
+                        missing_ok=True
+                    )
+            del self._finalizations[identity]
+            self._finish_job(job)
 
     def _recover_worker(self):
         if self.worker is not None:
@@ -754,6 +818,7 @@ class JobManager:
                 self._complete_job(self.jobs[identity], message)
                 recycle = recycle or not message.get("reusable", False)
             self.finished.clear()
+            self._poll_finalizations()
             if self.worker is not None:
                 if self.active_id is not None:
                     deadline = self.stop_deadlines.get(self.active_id)
@@ -769,7 +834,7 @@ class JobManager:
                     self.inference_error = (
                         self.inference_error or f"Model worker exited with code {code}"
                     )
-                    if self.active_id is not None:
+                    if self.active_id in self.processes:
                         job = self.jobs[self.active_id]
                         self._complete_job(
                             job,
@@ -808,6 +873,11 @@ class JobManager:
             job = self.info(identity)
             if job["readonly"]:
                 raise HTTPException(409, "Imported replay is read-only")
+            if identity in self._finalizations:
+                self.jobs[identity].update(status="stopping", stop_requested=True)
+                self._finalizations[identity][1].set()
+                self._save(self.jobs[identity])
+                return self.info(identity)
             if identity in self.processes and identity not in self.stop_deadlines:
                 self.jobs[identity]["status"] = "stopping"
                 self.jobs[identity]["stop_requested"] = True
@@ -821,6 +891,20 @@ class JobManager:
                     self._interrupt(self.jobs[identity])
                 self._save(self.jobs[identity])
             return self.info(identity)
+
+    def archive_path(self, identity):
+        with self.lock:
+            job = self.info(identity)
+            if job["readonly"]:
+                raise HTTPException(404, "Imported replay has no job archive")
+            if job["status"] != "complete":
+                raise HTTPException(409, "Job has not completed successfully")
+            if job["options"].get("no_csv"):
+                raise HTTPException(409, "ZIP download is disabled for no_csv jobs")
+            path = self.root / "jobs" / identity / "3dbbox.zip"
+            if path.is_symlink() or not path.is_file():
+                raise HTTPException(404, "Job 3dbbox archive not found")
+            return path
 
     def _interrupt(self, job):
         if not job.get("interrupt_sent"):
@@ -917,11 +1001,13 @@ class JobManager:
     def close(self):
         with self.lock:
             self._closing = True
-        for identity in list(self.processes):
+            pending = set(self.processes) | set(self._finalizations)
+        for identity in pending:
             self.stop(identity)
-        while self.processes:
+        while self.processes or self._finalizations:
             self.poll()
             time.sleep(0.05)
+        self._finalizer.shutdown(wait=True)
         with self.lock:
             if self.worker is not None:
                 self.worker.close()

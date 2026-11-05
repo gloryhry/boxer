@@ -366,6 +366,41 @@ def create_app(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.get(
+        "/api/jobs/{job_id}/3dbbox.zip",
+        response_class=FileResponse,
+        responses={
+            **ERRORS,
+            200: {
+                "description": "Immutable 3dbbox directory snapshot for this job.",
+                "content": {
+                    "application/zip": {
+                        "schema": {"type": "string", "format": "binary"}
+                    }
+                },
+                "headers": {
+                    "Content-Disposition": {
+                        "description": "Attachment named 3dbbox-{job_id}.zip",
+                        "schema": {"type": "string"},
+                    }
+                },
+            },
+        },
+        description=(
+            "Download the 3dbbox snapshot published before a new inference job "
+            "becomes complete. ZIP entries include the top-level 3dbbox/ directory "
+            "and map-wide accumulated DINO features. Returns 409 for jobs that "
+            "have not completed successfully or used no_csv=true; 404 for unknown "
+            "jobs, imported replays, or historical jobs without an archive."
+        ),
+    )
+    def download_job_archive(job_id: str):
+        return FileResponse(
+            manager.archive_path(job_id),
+            media_type="application/zip",
+            filename=f"3dbbox-{job_id}.zip",
+        )
+
     @app.get("/api/jobs/{job_id}/frames", response_model=FramePage, responses=ERRORS)
     def frames(
         job_id: str,
@@ -570,7 +605,8 @@ def main(*, manager_factory=JobManager):
             # End SSE connections before Uvicorn waits for HTTP requests to drain.
             app.state.stopping = True
             app.state.uploads.stop.set()
-            for identity in list(app.state.manager.processes):
+            identity = app.state.manager.active_id
+            if identity is not None:
                 app.state.manager.stop(identity)
             super().handle_exit(sig, frame)
 
