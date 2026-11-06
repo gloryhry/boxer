@@ -1173,9 +1173,15 @@ CSV 和新任务的 `3dbbox.zip` 取决于 `no_csv`；ZIP 仅在成功收尾时�
 `results.json` 的 `vocabulary_file` 为地图内相对路径 `3dbbox/labels.csv`，写入失败使任务失败。
 
 DINOv3 特征默认合并到地图包的 `3dbbox/dino_features.csv`，每张有效原图一行。
-表头为 `相机帧序号,相机序号,cls_token,patch_mean_pooling`，UTF-8 编码。
+文件使用 UTF-8，保留原有四列 `相机帧序号,相机序号,cls_token,patch_mean_pooling`，
+末尾依次追加 `base_link_x,base_link_y,base_link_z,base_link_qx,base_link_qy,base_link_qz,base_link_qw`。
 帧号使用原图 `image_frame_id`（旧地图为处理帧 `frame_id`），相机号使用 `camera_id`。
 两个向量各占一个单元格，保存为含 384 个数值的一维 JSON 数组，可恢复 float32 `[1, 384]`。
+七个位姿列使用 float64，保存该图像对应的 base 在全局 `map` 系下的位置（米）及归一化
+四元数（`qx,qy,qz,qw`）。新地图取图像组位姿，旧地图取对应关键帧位姿，均来自
+`T_map_base`，不叠加相机外参或做时间插值。同一图像组各相机的 base 位姿相同。
+下次推理初始化时自动为旧四列文件的全部历史行补齐位姿，保留特征，不受本次选择范围限制；
+空文件仅升级表头。旧行匹配失败、位姿缺失、数据非法或升级写入失败时保留原 CSV 并报错。
 无检测框、`no_csv=true` 或关闭跟踪均不影响特征保存。两种相机模式统一使用 native
 预处理，每张原图只生成一对向量；保存位置由 `results.json` 的源图记录中
 `dino_feature_file` 字段引用该地图内相对路径，按帧号和相机号定位行。重复推理更新同键，

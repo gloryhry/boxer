@@ -50,8 +50,14 @@ Web 界面、Swagger UI 脚本和 Three.js 均由本服务提供，不依赖浏�
 重跑原子覆盖该文件；`results.json` 的 `vocabulary_file` 记录地图内相对路径。
 
 每次推理默认将原图特征合并到地图包的 `3dbbox/dino_features.csv`，每张原图一行。
-四列为 `相机帧序号,相机序号,cls_token,patch_mean_pooling`，两个向量各为单元格内
+原有四列为 `相机帧序号,相机序号,cls_token,patch_mean_pooling`，两个向量各为单元格内
 含 384 个数值的一维 JSON 数组，读取后可恢复 float32 `[1, 384]`。
+末尾依次追加 `base_link_x,base_link_y,base_link_z,base_link_qx,base_link_qy,base_link_qz,base_link_qw`，
+以 float64 保存图像对应的 base 在全局 `map` 系下的位置（米）和归一化四元数
+（`qx,qy,qz,qw`）。新地图取图像组位姿，旧地图取对应关键帧位姿；同一图像组各相机
+共用 base 位姿，不叠加相机外参或按相机时间戳插值。
+下次推理初始化时自动升级已有四列文件，为全部历史行补齐位姿并保留特征，不受本次
+选帧、选相机范围限制。空文件仅升级表头；数据匹配、校验或写入失败时保留原 CSV 并报错。
 覆盖本次选择的所有有效原图，包括无检测框图像；勾选“不写 CSV”仍会保存特征。
 两种相机模式都采用 native 预处理，每张原图只保存一对向量。
 `results.json` 的 `dino_feature_file` 引用该地图内相对路径，按帧号与相机号定位行。

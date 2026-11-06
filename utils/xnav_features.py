@@ -9,14 +9,27 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
+import numpy as np
 import torch
 
-from loaders.xnav_loader import frame_identity
+from loaders.xnav_loader import XNavMapLoader, frame_identity
+from utils.tw.pose import rotmat_to_quat
 from utils.tw.xnav_camera import PREPROCESS_VERSION
 from utils.xnav_result_store import _atomic_file, _sync_directory
 
 FEATURE_CSV_PATH = "3dbbox/dino_features.csv"
-FEATURE_CSV_FIELDS = ("相机帧序号", "相机序号", "cls_token", "patch_mean_pooling")
+FEATURE_VECTOR_FIELDS = ("cls_token", "patch_mean_pooling")
+FEATURE_POSE_FIELDS = (
+    "base_link_x",
+    "base_link_y",
+    "base_link_z",
+    "base_link_qx",
+    "base_link_qy",
+    "base_link_qz",
+    "base_link_qw",
+)
+_LEGACY_CSV_FIELDS = ("相机帧序号", "相机序号", *FEATURE_VECTOR_FIELDS)
+FEATURE_CSV_FIELDS = (*_LEGACY_CSV_FIELDS, *FEATURE_POSE_FIELDS)
 
 
 def _csv_line(fields):
@@ -42,6 +55,39 @@ def _vector_json(value, name, *, shape):
     return json.dumps(
         vector.reshape(-1).tolist(), allow_nan=False, separators=(",", ":")
     )
+
+
+def _pose_values(value):
+    try:
+        pose = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "Invalid DINOv3 base_link pose: expected seven numbers"
+        ) from error
+    if pose.shape != (7,) or not np.isfinite(pose).all():
+        raise ValueError("Invalid DINOv3 base_link pose: expected seven finite numbers")
+    norm = np.linalg.norm(pose[3:])
+    if not np.isfinite(norm) or abs(norm - 1) > 1e-3:
+        raise ValueError("Invalid DINOv3 base_link pose: expected unit quaternion")
+    return [*pose[:3].tolist(), *(pose[3:] / norm).tolist()]
+
+
+def _base_link_pose(matrix):
+    """Convert T_map_base in float64, without camera or virtual-view extrinsics."""
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if (
+        matrix.shape != (4, 4)
+        or not np.isfinite(matrix).all()
+        or not np.allclose(matrix[3], [0, 0, 0, 1], rtol=0, atol=1e-9)
+    ):
+        raise ValueError("Invalid DINOv3 T_map_base: expected finite 4x4 rigid pose")
+    rotation = matrix[:3, :3]
+    if not np.allclose(
+        rotation.T @ rotation, np.eye(3), rtol=0, atol=1e-6
+    ) or not np.isclose(np.linalg.det(rotation), 1, rtol=0, atol=1e-6):
+        raise ValueError("Invalid DINOv3 T_map_base rotation")
+    qw, qx, qy, qz = rotmat_to_quat(rotation)
+    return _pose_values([*matrix[:3, 3], qx, qy, qz, qw])
 
 
 def cleanup_legacy_features(map_root):
@@ -77,6 +123,7 @@ def image_feature_payload(
         **frame_identity(frame),
         "camera_id": source["camera_id"],
         "image_stamp_ns": source["image_stamp_ns"],
+        **dict(zip(FEATURE_POSE_FIELDS, _base_link_pose(frame["T_map_base"]))),
         "model_name": model_name,
         "checkpoint": str(Path(checkpoint).expanduser().resolve()),
         "preprocessing": {
@@ -130,23 +177,43 @@ class DinoFeatureCsvStore:
         if version == self._version:
             return
         rows = {}
+        legacy = False
         if version is not None:
             with self.path.open(encoding="utf-8", newline="") as stream:
                 reader = csv.reader(stream, strict=True)
-                if next(reader, None) != list(FEATURE_CSV_FIELDS):
+                header = next(reader, None)
+                legacy = header is None or header == list(_LEGACY_CSV_FIELDS)
+                if not legacy and header != list(FEATURE_CSV_FIELDS):
                     raise ValueError(f"Invalid DINOv3 CSV header: {self.path}")
+                loader = None
                 for fields in reader:
-                    if len(fields) != 4:
+                    if len(fields) != len(header):
                         raise ValueError(f"Invalid DINOv3 CSV row: {self.path}")
                     key = _index(fields[0]), _index(fields[1])
                     if key in rows:
                         raise ValueError(f"Duplicate DINOv3 CSV image/camera: {key}")
                     vectors = [
                         _vector_json(json.loads(value), name, shape=(384,))
-                        for name, value in zip(FEATURE_CSV_FIELDS[2:], fields[2:])
+                        for name, value in zip(FEATURE_VECTOR_FIELDS, fields[2:4])
                     ]
-                    rows[key] = _csv_line([*key, *vectors])
-        self._rows, self._version = rows, version
+                    if legacy:
+                        if loader is None:
+                            # Migration uses all source frames and cameras.
+                            loader = XNavMapLoader(self.map_root)
+                        source = loader.image_index.get(key)
+                        if source is None or source["status"] != "saved":
+                            raise ValueError(
+                                f"Cannot upgrade DINOv3 CSV image/camera: {key}"
+                            )
+                        pose = _base_link_pose(loader.poses[key[0]])
+                    else:
+                        pose = _pose_values(fields[4:])
+                    rows[key] = _csv_line([*key, *vectors, *pose])
+        if legacy:
+            # Publish only after every legacy row has been validated and enriched.
+            self._publish(rows)
+        else:
+            self._rows, self._version = rows, version
 
     def _publish(self, rows):
         with _atomic_file(self.path) as stream:
@@ -165,9 +232,10 @@ class DinoFeatureCsvStore:
             key = _index(frame_id), _index(data["camera_id"])
             vectors = [
                 _vector_json(data[name], name, shape=(1, 384))
-                for name in FEATURE_CSV_FIELDS[2:]
+                for name in FEATURE_VECTOR_FIELDS
             ]
-            updates[key] = _csv_line([*key, *vectors])
+            pose = _pose_values([data[name] for name in FEATURE_POSE_FIELDS])
+            updates[key] = _csv_line([*key, *vectors, *pose])
         if updates:
             with self._locked():
                 self._refresh()

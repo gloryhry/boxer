@@ -321,11 +321,28 @@ DINOv3 特征默认汇总到地图包的 `3dbbox/dino_features.csv`，每张原�
 命令行与 Web 使用相同位置，两种相机模式共享该文件。重复推理按帧号和相机号更新，
 保留其他帧和相机的历史行，按帧号、相机号升序保存。
 
-表头固定为 `相机帧序号,相机序号,cls_token,patch_mean_pooling`，文件使用 UTF-8。
+文件使用 UTF-8，共十一列。原有四列保持不变，末尾追加七个位姿数值列，完整表头为：
+
+```text
+相机帧序号,相机序号,cls_token,patch_mean_pooling,base_link_x,base_link_y,base_link_z,base_link_qx,base_link_qy,base_link_qz,base_link_qw
+```
+
 相机帧序号使用 `image_frame_id`，旧地图使用处理帧 `frame_id`，与原图文件名编号一致；
 相机序号使用原始 `camera_id`，均不重新编号。
 两个向量各占一个单元格，编码为含 384 个数值的一维 JSON 数组，由标准 CSV 引号规则处理逗号。
 计算仍使用 float32，写入数值可往返还原为原来的 `[1, 384]` 张量。
+
+七个位姿列使用 float64：`base_link_x/y/z` 是该图像对应的 `base_link` 在全局 `map`
+坐标系中的位置，单位为米；`base_link_qx/qy/qz/qw` 是从 base 到 map 的旋转四元数，
+按 `qx,qy,qz,qw` 顺序保存并归一化。位姿直接来自处理帧的 `T_map_base`：新地图使用
+`image_frame_id` 对应的 `poses_image_base.txt` 图像组位姿，旧地图使用 `poses_base.txt`
+对应的关键帧位姿。同一图像组各相机的 base 位姿相同，不叠加相机或虚拟视图外参，
+也不按各相机原始图像时间戳插值。
+
+下次推理初始化特征存储时，自动识别旧四列 CSV，读取地图完整索引和位姿，为全部历史行
+补齐七列后原子替换；不受本次选帧、选相机范围限制，保留已有特征值，无需重新提取。
+空文件或仅有旧表头的文件直接升级表头。旧行无法匹配已保存图像、位姿缺失、数据非法或
+写入失败时任务报错，保留原 CSV；升级成功后不重复迁移。
 
 特征覆盖所选相机和帧范围内所有 `status=saved` 的原图，
 包括没有检测框的图像。`--no_csv`、关闭预览、`--cache2d` 和 `--cache3d` 均不关闭特征保存；
@@ -349,7 +366,14 @@ with (map_root / "3dbbox/dino_features.csv").open(encoding="utf-8", newline="") 
         frame_id, camera_id = int(row["相机帧序号"]), int(row["相机序号"])
         cls = np.asarray(json.loads(row["cls_token"]), dtype=np.float32).reshape(1, 384)
         mean = np.asarray(json.loads(row["patch_mean_pooling"]), dtype=np.float32).reshape(1, 384)
-        print(frame_id, camera_id, cls.shape, mean.shape)
+        position = np.asarray(
+            [row[f"base_link_{axis}"] for axis in ("x", "y", "z")], dtype=np.float64
+        )
+        quaternion_xyzw = np.asarray(
+            [row[f"base_link_q{axis}"] for axis in ("x", "y", "z", "w")],
+            dtype=np.float64,
+        )
+        print(frame_id, camera_id, cls.shape, mean.shape, position, quaternion_xyzw)
 ```
 
 每个处理帧批量合并一次，通过地图级文件锁保护读取、合并和发布；临时文件写入、同步并
