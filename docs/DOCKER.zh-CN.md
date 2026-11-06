@@ -115,6 +115,80 @@ docker compose -f docker-compose.jetson.yaml up -d --build
 `boxer` 项目名，在各自主机上选择一套运行。首次构建需要联网下载基础镜像、Python
 依赖和前端依赖；Node.js 仅用于前端构建，运行时不需要 Node.js。
 
+### GitLab CI 自动构建与发布 x64 镜像
+
+仓库根目录的 `.gitlab-ci.yml` 复用 `Dockerfile.x86`，通过
+`scripts/ci_build_x86.sh` 构建 `linux/amd64` 镜像，并推送到**当前 GitLab 项目的
+Container Registry**。自建 GitLab 的域名和项目路径由 CI 自动提供，无需写进仓库。
+当前本地 Git remote 若仍指向 GitHub，需要将代码和 CI 配置推送到自建 GitLab 项目
+才能触发该流水线。
+
+启用前在 GitLab 和 Runner 主机上完成以下配置：
+
+1. 在自建 GitLab 启用 Container Registry，并确保项目可使用该功能。Registry 使用
+   HTTPS，证书应已被 Runner 主机及 Docker 信任。
+2. 为项目启用现有的 **Linux x64 Shell Runner**，勾选 **Run untagged jobs**。
+   此任务没有 Runner `tags`，也不使用 Docker executor 或 DinD；Runner 的保护规则
+   需允许目标 `master` 分支及要发布的 Git 标签。
+3. Runner 主机安装 Docker Engine 和系统级 Buildx 插件，使用默认 Docker context。
+   以 Runner 实际运行用户执行 `docker info` 和 `docker buildx version`，确认 Docker
+   权限及插件可用。构建和冒烟检查不需要 GPU、模型或地图挂载。
+4. 任务超时为 **2 小时**；Runner 的最大超时应至少为两小时。主机需要足够空间保存
+   PyTorch/CUDA 依赖、镜像和 BuildKit 缓存，并能访问基础镜像、APT、PyPI、PyTorch
+   wheel 源和 npm。连续构建复用默认 builder 在 Docker daemon 中的缓存。
+
+流水线使用 GitLab 内置的 `CI_REGISTRY`、`CI_REGISTRY_IMAGE`、`CI_REGISTRY_USER`
+和 `CI_REGISTRY_PASSWORD`；无需另建长期推送密码。登录通过 `--password-stdin`，
+凭据保存在检出目录外的任务临时目录，退出时清理，不改写 Runner 用户原有的登录。
+
+| 触发事件 | 发布到 `$CI_REGISTRY_IMAGE` 的镜像标签 |
+| --- | --- |
+| `master` 分支 push | `sha-<完整提交 SHA>`、`latest` |
+| 任意 Git 标签 push | `sha-<完整提交 SHA>`、对应版本标签、`latest` |
+| 其他分支、MR、定时或手动创建的流水线 | 不触发发布 |
+
+合法的 Docker 标签保留 Git 标签原名，例如 `v1.2.3`；含 `/` 等不合法字符或超过
+128 字符时改用 `tag-${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}`。
+例如 `release/v1.2.3` 会发布为 `tag-release-v1-2-3-<短 SHA>`。
+Git 标签为 `latest` 或与本次提交标签相同时，只推送一次该镜像标签。
+
+每次构建先使用任务独立的本地镜像标签，确认架构、Python 依赖、服务模块和前端
+静态文件后，再推送提交及版本标签，最后更新 `latest`。构建、冒烟检查或前序推送
+失败时不会执行 `latest` 推送；已推送成功的提交／版本标签会保留。
+发布任务通过同一个 `resource_group` 串行执行；`latest` 始终表示最后一次成功发布
+的镜像，可以来自 `master`，也可以来自某个 Git 标签，不按版本号或提交时间排序。
+重试旧流水线也会在成功后更新 `latest`。
+退出时清理任务临时凭据、冒烟容器和临时镜像标签；发布标签及构建缓存保留在 Runner。
+
+首次发布前，在自建 GitLab 的 **CI Lint / Pipeline editor 校验**中检查配置。
+分别推送一次 `master` 提交和版本标签，检查任务日志及项目的 Container Registry；
+本次发布的提交／版本标签和 `latest` 应有相同的 manifest digest，平台为 `linux/amd64`。
+流水线只发布镜像，GPU 运算和真实推理仍按下文在部署主机验收。
+
+### 拉取已发布镜像并使用现有 Compose
+
+在 x64 GPU 部署主机准备上述挂载目录及 `.env` 后执行；替换示例中的 Registry
+域名和项目路径。`docker login` 使用交互输入，建议使用具有 `read_registry`
+权限的 Deploy Token 用户名和 token，避免把密码写进命令行：
+
+```bash
+docker login registry.gitlab.example.com
+BOXER_IMAGE=registry.gitlab.example.com/group/boxer:latest
+# 需要固定版本时，将 latest 换成 v1.2.3 或 sha-<完整提交 SHA>。
+docker pull --platform linux/amd64 "$BOXER_IMAGE"
+docker image tag "$BOXER_IMAGE" boxer-server:x86
+docker compose -f docker-compose.x86.yaml up -d --no-build --pull never
+```
+
+现有 Compose 使用本地 `boxer-server:x86` 标签，因此拉取后需完成上述重新打标签步骤。
+每次更新重复 pull、tag 和 up 即可；模型、词表和地图仍通过原挂载提供。
+
+参考：[GitLab Shell executor 构建 Docker 镜像](https://docs.gitlab.com/ci/docker/using_docker_build/#use-the-shell-executor)、
+[Registry 认证](https://docs.gitlab.com/user/packages/container_registry/authenticate_with_container_registry/)、
+[流水线资源组](https://docs.gitlab.com/ci/resource_groups/)。
+
+### 运行检查与停止
+
 访问 <http://127.0.0.1:18765/>，API 文档位于 <http://127.0.0.1:18765/docs>。
 若修改了 `SERVER_PORT`，使用对应端口。Web 自动递归列出容器 `/nav_map` 下的地图包，
 选择相对路径并点击“加载地图”，也可点击“刷新列表”重新查找。例如宿主机
