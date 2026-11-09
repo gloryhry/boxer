@@ -18,7 +18,8 @@
 - [10. 客户端接入示例](#10-客户端接入示例)
 - [11. 文件输出与历史恢复](#11-文件输出与历史恢复)
 - [12. 错误处理与排查](#12-错误处理与排查)
-- [13. 实现位置与维护](#13-实现位置与维护)
+- [13. 势场法房间分割](#13-势场法房间分割)
+- [14. 实现位置与维护](#14-实现位置与维护)
 
 ## 1. 服务入口与部署
 
@@ -1292,7 +1293,71 @@ OpenAPI 为各业务路由统一声明了上述错误模型，不表示每个路
 | 任务完成后 SSE 仍保持连接 | 收到结束状态后调用 `EventSource.close()` 或关闭流式请求 |
 | 重启后任务未继续或参数变回默认 | 这是当前恢复行为；重新应用配置并创建新任务 |
 
-## 13. 实现位置与维护
+## 13. 势场法房间分割
+
+势场法使用已注册地图目录里的完整 `global_map.pcd`，坐标为米制、Z 轴向上。
+任务在独立 CPU 进程运行，调用 `room_instance_seg` 的现有势场法入口。
+
+### Ubuntu 配置
+
+在启动 Boxer 服务前设置下面两个环境变量。路径按实际部署调整。
+
+```bash
+export BOXER_PF_PROJECT=/home/wck/project/room_instance_seg
+export BOXER_PF_PYTHON=/home/wck/miniconda3/envs/3dseg/bin/python
+```
+
+`BOXER_PF_PROJECT` 指向已有的房间分割源码目录。`BOXER_PF_PYTHON` 指向安装了
+该项目依赖的 Python，省略时使用 Boxer 的 Python。可用下面的命令先验证算法入口。
+
+```bash
+"$BOXER_PF_PYTHON" -m potential_field \
+  --input /path/to/map/global_map.pcd \
+  --output-dir "$(mktemp -d)"
+```
+
+容器部署时，使用容器内可见的源码路径与 Python。Python 环境需要 NumPy、SciPy、
+scikit-learn、Pillow、plyfile 和 PyYAML 等 `room_instance_seg` 依赖。
+
+使用已支持 YAML 配置的 `room_instance_seg` 时，Boxer 与原网页共用
+`$BOXER_PF_PROJECT/config/potential_field.yaml`。如果设置了 `ROOMSEG_PF_CONFIG`，
+两者读取指定的 YAML。调整 `max_grid_voxels`、`max_stacks` 或其他默认值后，
+新势场任务会读取最新配置。容器内的配置路径需要对推理进程可读。
+
+### 提交任务和获取结果
+
+先用 `POST /api/maps` 注册地图。将返回的 `id` 传给势场法任务。
+
+```bash
+curl --fail-with-body -sS -X POST http://127.0.0.1:18765/api/potential-field/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"map_id":"MAP_ID","options":{"voxel":0.2}}'
+```
+
+`options` 可省略。可选字段是 `voxel`、`min_room_points`、`min_room_area`、
+`merge_opening` 和 `max_projection_distance`，当前算法默认值依次为
+`0.2` m、`0` 点、`2.0` m²、`1.6` m、`0.8` m。显式提供的字段优先于 YAML 默认值。
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `POST` | `/api/potential-field/jobs` | 提交任务，返回 `202` 及任务 ID |
+| `GET` | `/api/potential-field/jobs` | 查询任务列表 |
+| `GET` | `/api/potential-field/jobs/{id}` | 查询状态与结果地址 |
+| `POST` | `/api/potential-field/jobs/{id}/stop` | 停止任务 |
+| `GET` | `/api/potential-field/jobs/{id}/log` | 读取日志尾部 |
+| `GET` | `/api/potential-field/jobs/{id}/artifacts/{filename}` | 获取已完成任务的结果文件 |
+
+同一时刻可运行一个势场任务。重复提交会返回 `409`。运行环境未配置时返回 `503`。
+轮询任务状态，`complete` 时按 `artifacts` 中的地址获取文件。遇到 `failed` 或
+`interrupted` 时，通过日志接口查看原因。
+
+- `result_colored.ply` 包含完整有效点的坐标、颜色和整数 `label`。`-1` 表示未分配。
+- `rooms.json` 包含房间 `id`、颜色、点数及包围盒。`id` 对应 PLY 的 `label`。
+- `summary.json` 包含房间数、点数、标签覆盖率和各阶段耗时。
+
+PLY 保留有效输入点的顺序。前端可以直接加载它来着色和选择房间。
+
+## 14. 实现位置与维护
 
 文档主要依据以下项目文件；扩展接口或调整参数后，应同步更新本文并核对部署服务的 schema：
 
