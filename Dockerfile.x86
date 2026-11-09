@@ -32,10 +32,13 @@ ENV PATH="/opt/venv/bin:$PATH" \
 
 WORKDIR /app
 COPY requirements-server.txt requirements-docker.txt ./
+# 默认使用官方源；国内部署可 --build-arg 覆盖为镜像站，不改变镜像内容。
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
+ARG PIP_INDEX_URL=https://pypi.org/simple
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python -m pip install --index-url https://download.pytorch.org/whl/cu128 \
+    python -m pip install --index-url "$TORCH_INDEX_URL" \
         'torch==2.10.0+cu128' \
-    && python -m pip install 'numpy==2.2.6' -r requirements-docker.txt \
+    && python -m pip install --index-url "$PIP_INDEX_URL" 'numpy==2.2.6' -r requirements-docker.txt \
     && python -m pip check
 
 COPY server.py server_worker.py ./

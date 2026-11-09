@@ -44,6 +44,7 @@ cp .env.docker.example .env
 | `VOCAB_DIR` | `./owl` | `/vocab` | 只读；不覆盖容器内的 `owl` Python 代码 |
 | `OUTPUT_DIR` | `./output/server` | `/app/output/server` | 读写；任务、日志、结果和历史 |
 | `SERVER_PORT` | `18765` | `18765` | 宿主机发布端口 |
+| `BOXER_GPU_ID` | `0` | 仅该 GPU | x86 多卡主机固定注入的 GPU 序号（`nvidia-smi` 的 index） |
 
 例如复用相邻 x-nav 仓库的地图：
 

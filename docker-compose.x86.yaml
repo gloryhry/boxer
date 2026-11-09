@@ -15,6 +15,7 @@ services:
     ports:
       - "${SERVER_PORT:-18765}:18765"
     environment:
+      NVIDIA_VISIBLE_DEVICES: "${BOXER_GPU_ID:-0}"
       OMP_NUM_THREADS: "${OMP_NUM_THREADS:-4}"
       MKL_NUM_THREADS: "${MKL_NUM_THREADS:-4}"
       TORCHINDUCTOR_COMPILE_THREADS: "${TORCHINDUCTOR_COMPILE_THREADS:-1}"
@@ -28,7 +29,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              device_ids: ["${BOXER_GPU_ID:-0}"]
               capabilities: [gpu]
     volumes:
       - type: bind

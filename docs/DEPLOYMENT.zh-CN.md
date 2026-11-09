@@ -174,6 +174,7 @@ SERVER_PORT=18765
 | `VOCAB_DIR` | `/vocab` | 只读；至少包含 `indoor_classes.csv` |
 | `OUTPUT_DIR` | `/app/output/server` | 读写；保存任务记录、日志和结果 |
 | `SERVER_PORT` | 容器端口固定 `18765` | 改变宿主机发布端口 |
+| `BOXER_GPU_ID` | 仅该 GPU 可见 | x86 多卡主机固定注入的 GPU 序号，默认 `0` |
 
 相对路径以 Compose 文件所在目录为基准。绝对路径指向 **Docker daemon 所在宿主机**，
 并非浏览器或远程 Docker 客户端的本地路径。复用已有地图可设置
