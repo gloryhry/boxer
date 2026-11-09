@@ -28,7 +28,12 @@ from utils.tw.xnav_camera import PREPROCESS_VERSION
 from utils.xnav_dedup import ConservativeDeduplicator
 from utils.xnav_execution import InferredKeyframe, XNavExecution, XNavOutput
 from utils.xnav_export import MAP_VOCABULARY_PATH, save_map_vocabulary
-from utils.xnav_features import DinoFeatureCsvStore, image_feature_payload
+from utils.xnav_features import (
+    DinoFeatureCsvStore,
+    complete_image_features,
+    image_feature_payload,
+)
+from utils.xnav_inference import XNavDeviceInputs
 from utils.xnav_profile import XNavProfiler
 from utils.xnav_result_store import ResultFollower, ResultStore, read_result_file
 from utils.xnav_runtime import inference_dtype, select_device, semantic_embeddings
@@ -339,6 +344,7 @@ def _infer_keyframe(
     dtype,
     detector_state,
     device,
+    prepared=None,
 ):
     """Model-only work, independent of the ordered tracker and output owner."""
     key = processing_frame_id(frame)
@@ -359,7 +365,12 @@ def _infer_keyframe(
     for native in frame.get("native_images", []):
         from boxernet.dinov3_wrapper import batch_dino
 
-        image = native["img0"].to(device).float()
+        staged = prepared[id(native)].wait() if prepared is not None else None
+        image = (
+            staged.inputs["img0"]
+            if staged is not None
+            else native["img0"].to(device).float()
+        )
         autocast = (
             torch.autocast(device_type=device, dtype=dtype)
             if device == "cuda"
@@ -376,6 +387,7 @@ def _infer_keyframe(
             cls_token,
             boxer.dino.model_name,
             args.ckpt,
+            defer_cpu=prepared is not None,
         )
         frame["dino_features"].append(payload)
         sources[cid]["dino_feature_file"] = payload["path"]
@@ -393,16 +405,19 @@ def _infer_keyframe(
         for offset in range(0, len(frame["views"]), 2):
             group = frame["views"][offset : offset + 2]
             images = torch.cat([d["img0"] for d in group]) * 255
-            prepared = [d.get("_owl_pixels") for d in group]
-            prepared = (
-                torch.cat(prepared) if all(x is not None for x in prepared) else None
-            )
+            pixels = [
+                prepared[id(d)].wait().owl_pixels
+                if prepared is not None
+                else d.get("_owl_pixels")
+                for d in group
+            ]
+            pixels = torch.cat(pixels) if all(x is not None for x in pixels) else None
             values = None
             clear_failed_batch = False
             if detector_state["effective"] == 2:
                 try:
                     with profiler.stage("detector", cuda=True):
-                        values = owl.forward_batch(images, prepared=prepared)
+                        values = owl.forward_batch(images, prepared=pixels)
                 except torch.cuda.OutOfMemoryError:
                     detector_state["effective"] = 1
                     detector_state["oom_fallbacks"] += 1
@@ -442,7 +457,10 @@ def _infer_keyframe(
                 bb2, scores, ids, _ = detected[view_index]
             else:
                 keywords = {}
-                if "_owl_pixels" in datum:
+                if prepared is not None:
+                    keywords["prepared"] = prepared[id(datum)].wait().owl_pixels
+                    keywords["group_cpu_transfer"] = True
+                elif "_owl_pixels" in datum:
                     keywords["prepared"] = datum["_owl_pixels"]
                 with profiler.stage("detector", cuda=True):
                     bb2, scores, ids, _ = owl.forward(
@@ -477,11 +495,13 @@ def _infer_keyframe(
             )
             with profiler.stage("boxer", cuda=True), autocast:
                 features = native_features.pop(cid, None)
-                predictions = (
-                    boxer.forward(datum, dino_features=features)
-                    if features is not None
-                    else boxer.forward(datum)
-                )
+                keywords = {"dino_features": features} if features is not None else {}
+                if prepared is not None:
+                    keywords.update(
+                        prepared_inputs=prepared[id(datum)].wait().inputs,
+                        return_intermediates=False,
+                    )
+                predictions = boxer.forward(datum, **keywords)
             boxes = predictions["obbs_pr_w"].cpu()[0]
             keep = (boxes.prob >= args.thresh3d).reshape(-1)
             boxes = boxes[keep].clone()
@@ -509,6 +529,8 @@ def _infer_keyframe(
             observation["detections"] = box_records(boxes)
         raw.extend(list(boxes))
         frame_record["observations"].append(observation)
+    with profiler.stage("transfer.descriptors"):
+        complete_image_features(frame["dino_features"])
     return frame_record, raw, views
 
 
@@ -529,7 +551,14 @@ def run_xnav(args, *, runtime=None):
             start_n=args.start_n,
             skip_n=args.skip_n,
             max_n=args.max_n,
+            prepare_workers=getattr(args, "xnav_prepare_workers", 2),
+            profiler=profiler,
         )
+    with loader:
+        return _run_xnav(args, runtime=runtime, loader=loader, profiler=profiler)
+
+
+def _run_xnav(args, *, runtime, loader, profiler):
     with profiler.stage("init.validation"):
         validation = loader.validate()
     print(
@@ -547,7 +576,9 @@ def run_xnav(args, *, runtime=None):
         raise ValueError("x-nav maps contain no ground-truth object boxes; omit --gt2d")
     if runtime is not None:
         runtime.validate(args)
-    labels = list(runtime.labels) if runtime is not None else load_text_labels(args.labels)
+    labels = (
+        list(runtime.labels) if runtime is not None else load_text_labels(args.labels)
+    )
     if not labels:
         raise ValueError("At least one text label is required")
     output = loader.output_path(args.output_dir)
@@ -663,6 +694,10 @@ def run_xnav(args, *, runtime=None):
         tracker.merge_iou_threshold = 0.5
         tracker._embedding_cache.update(embeddings)
         tracker.xnav_accelerated = parallel
+        tracker.profiler = profiler
+        if tracker._dedup is not None:
+            tracker._dedup.profiler = profiler
+            tracker._dedup.scripted_history = parallel
     output.mkdir(parents=True, exist_ok=True)
     results = {
         "schema_version": 2,
@@ -682,6 +717,7 @@ def run_xnav(args, *, runtime=None):
             "detector_batch_size": detector_state["effective"],
             "boxer_batch_size": 1,
             "max_uncommitted_frames": 2 if parallel else 1,
+            "prepare_workers": loader.preparation.workers,
         },
         "tracking": {
             "enabled": args.track,
@@ -691,7 +727,8 @@ def run_xnav(args, *, runtime=None):
             # Tracking settings do not invalidate model-output caches.
             "dedup": (
                 ConservativeDeduplicator.metadata()
-                if dedup_mode == "conservative" else {"mode": "legacy"}
+                if dedup_mode == "conservative"
+                else {"mode": "legacy"}
             ),
         },
         "calibration": loader.calibration,
@@ -733,40 +770,56 @@ def run_xnav(args, *, runtime=None):
     tracking_stream = torch.cuda.Stream() if parallel else None
     if tracking_stream is not None:
         tracking_stream.wait_stream(torch.cuda.current_stream())
+    transfers = XNavDeviceInputs(profiler) if parallel else None
 
     def infer(frame):
-        return _infer_keyframe(
-            frame,
-            args,
-            labels,
-            sem_map,
-            owl,
-            boxer,
-            previous,
-            cached_frames,
-            profiler,
-            dtype,
-            detector_state,
-            device,
+        context = (
+            transfers.stage(frame, boxer) if transfers else contextlib.nullcontext()
         )
+        with context as prepared:
+            return _infer_keyframe(
+                frame,
+                args,
+                labels,
+                sem_map,
+                owl,
+                boxer,
+                previous,
+                cached_frames,
+                profiler,
+                dtype,
+                detector_state,
+                device,
+                prepared=prepared,
+            )
 
     def prepare(frame):
         if owl is not None:
-            for datum in frame["views"]:
+
+            def prepare_view(datum):
                 datum["_owl_pixels"] = owl.prepare_image(datum["img0"] * 255)
+
+            with profiler.stage("data.owl_preprocess"):
+                loader.preparation.map(prepare_view, frame["views"])
+        if transfers is not None:
+            transfers.pin(frame)
 
     def committed(ack):
         profile = profiles.pop(ack["index"])
         profiler.finish_frame(
-            profile, ack["stages"], ack["result_bytes"], execution.inflight
+            profile, ack["stages"], ack["result_bytes"], execution.inflight, ack=ack
         )
+
+    def durable(ack):
         execution.acknowledge()
 
     def serial_source():
         for index, frame in enumerate(
-            profiler.iterate(loader.iter_frames(
-                with_points=not args.no_sdp, include_native_images=True
-            ))
+            profiler.iterate(
+                loader.iter_frames(
+                    with_points=not args.no_sdp, include_native_images=True
+                )
+            )
         ):
             yield InferredKeyframe(index, frame, infer(frame), profiler.current)
 
@@ -785,6 +838,7 @@ def run_xnav(args, *, runtime=None):
                         "size": loader.size,
                     },
                     on_commit=committed,
+                    on_durable=durable,
                 )
                 execution = XNavExecution(
                     loader.iter_frames(
@@ -805,7 +859,9 @@ def run_xnav(args, *, runtime=None):
             from utils.xnav_live import start_live_viewer
 
             live_viewer = start_live_viewer(args, output)
-        for work in tqdm(source, total=len(loader), desc=f"x-nav {loader.frame_unit} frames"):
+        for work in tqdm(
+            source, total=len(loader), desc=f"x-nav {loader.frame_unit} frames"
+        ):
             with (
                 profiler.bind(work.profile),
                 (
@@ -846,6 +902,15 @@ def run_xnav(args, *, runtime=None):
                             # Final consolidation precedes every last-frame
                             # consumer: journal, CSV, preview and live replay.
                             tracker.finalize_multiview()
+                    if profiler.enabled and tracker._dedup is not None:
+                        dedup = tracker._dedup
+                        profiler.annotate(
+                            dedup_history_views=len(dedup.views),
+                            dedup_device_views=len(dedup._device_views),
+                            dedup_iou_entries=len(dedup._ious),
+                            dedup_projection_entries=len(dedup._projections),
+                            history_geometry_backends=dict(dedup.history_backends),
+                        )
                     if observations:
                         observed_index += 1
                     with profiler.stage("records"):
@@ -917,9 +982,10 @@ def run_xnav(args, *, runtime=None):
                     profiler.committed()
                 counts.update(
                     processed_frames=1,
-                    image_frames=int(loader.frame_unit == "image" or any(
-                        s["status"] == "saved" for s in frame["sources"]
-                    )),
+                    image_frames=int(
+                        loader.frame_unit == "image"
+                        or any(s["status"] == "saved" for s in frame["sources"])
+                    ),
                     source_images=sum(s["status"] == "saved" for s in frame["sources"]),
                     dino_feature_rows=len(frame["dino_features"]),
                     view_observations=len(frame_record["observations"]),
@@ -1033,6 +1099,15 @@ def run_xnav(args, *, runtime=None):
                         pending_error,
                         f"Could not close execution worker: {close_error}",
                     )
+        if transfers is not None:
+            try:
+                transfers.close()
+            except Exception as close_error:
+                if pending_error is None:
+                    raise
+                add_exception_note(
+                    pending_error, f"Could not close input transfers: {close_error}"
+                )
         if store is not None:
             try:
                 store.close()

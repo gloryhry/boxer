@@ -6,7 +6,8 @@ views, are the unit of evidence. No point clouds or inference models are owned
 here; saved detector observations suffice for cache-only replay.
 """
 
-from collections import OrderedDict, defaultdict
+import contextlib
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass
 from itertools import product
 
@@ -14,6 +15,8 @@ import numpy as np
 import torch
 
 from utils.tw.obb import iou_mc7
+from utils.tw.xnav_camera import fixed_camera_model
+from utils.xnav_profile import profiled
 
 
 def rectangle_iou(a, b):
@@ -35,6 +38,7 @@ class _EvidenceView:
     boxes: np.ndarray
     labels: tuple[str, ...]
     world_to_camera: np.ndarray
+    model: int | None = None
 
 
 class ConservativeDeduplicator:
@@ -42,6 +46,8 @@ class ConservativeDeduplicator:
 
     max_distance = 0.30
     distance_scale = 0.35
+    max_member_distance = 0.60
+    member_distance_scale = 0.70
     max_size_ratio = 1.5
     semantic_threshold = 0.7
     merge_iou = 0.30
@@ -49,6 +55,7 @@ class ConservativeDeduplicator:
     detection_iou = 0.50
     separate_iou = 0.20
     min_baseline = 0.30
+    min_track_support = 2
     cache_size = 512
 
     def __init__(self, semantic_similarity, device="cpu"):
@@ -59,22 +66,30 @@ class ConservativeDeduplicator:
         self._projections = OrderedDict()
         self._evidence_cache = OrderedDict()
         self._label_indices = {}
+        self._ious = OrderedDict()
+        self._device_views = {}
+        self._projection_device = None
+        self.scripted_history = False
+        self.history_backends = Counter()
 
     @classmethod
     def metadata(cls):
         return {
             "mode": "conservative",
-            "version": 1,
+            "version": 2,
             "merge_iou_threshold": cls.merge_iou,
             "semantic_threshold": cls.semantic_threshold,
             "max_center_distance": cls.max_distance,
             "center_distance_scale": cls.distance_scale,
+            "max_member_center_distance": cls.max_member_distance,
+            "member_center_distance_scale": cls.member_distance_scale,
             "max_size_ratio": cls.max_size_ratio,
             "projection_iou_threshold": cls.projection_iou,
             "detection_iou_threshold": cls.detection_iou,
             "separate_detection_iou": cls.separate_iou,
             "min_image_groups": 2,
-            "min_online_track_support": 2,
+            "min_online_track_support": cls.min_track_support,
+            "min_recovery_track_support": cls.min_track_support,
             "min_baseline": cls.min_baseline,
         }
 
@@ -84,9 +99,14 @@ class ConservativeDeduplicator:
         self._projections.clear()
         self._evidence_cache.clear()
         self._label_indices.clear()
+        self._ious.clear()
+        self._device_views.clear()
+        self._projection_device = None
+        self.history_backends.clear()
 
     def remember(self, observations, frame_idx):
-        """Copy small immutable detector/camera records, never dense map points."""
+        """Copy detector/camera records; return whether new evidence was added."""
+        previous_count = len(self.views)
         for observation in observations:
             if observation.boxes_2d is None or observation.labels_2d is None:
                 continue
@@ -118,27 +138,21 @@ class ConservativeDeduplicator:
                     boxes,
                     labels,
                     (pose @ cam.T_camera_rig.inverse()).inverse().matrix.numpy()[:3],
+                    int(cam._data[22]) if cam.is_xnav else None,
                 )
             )
+        return len(self.views) > previous_count
 
     @staticmethod
     def _key(box):
-        return (
-            torch.cat(
-                (box.bb3_object.reshape(-1), box.T_world_object._data.reshape(-1))
-            )
-            .detach()
-            .float()
-            .cpu()
-            .numpy()
-            .tobytes()
-        )
+        data = box._data.detach().float().cpu().numpy()
+        return data[..., :6].tobytes() + data[..., 18:30].tobytes()
 
     @staticmethod
     def _label(box):
         return box.reshape(1, -1).text_string()[0].lower()
 
-    def geometry_compatible(self, a, b):
+    def geometry_compatible(self, a, b, *, historical=False):
         sizes = torch.stack((a.bb3_diagonal.reshape(3), b.bb3_diagonal.reshape(3)))
         sizes = sizes.detach().float().cpu().numpy()
         centers = (
@@ -153,8 +167,9 @@ class ConservativeDeduplicator:
         if (sizes <= 0).any():
             return False
         radius = min(
-            self.max_distance,
-            self.distance_scale * np.linalg.norm(sizes[:, :2], axis=1).min(),
+            self.max_member_distance if historical else self.max_distance,
+            (self.member_distance_scale if historical else self.distance_scale)
+            * np.linalg.norm(sizes[:, :2], axis=1).min(),
         )
         if np.linalg.norm(centers[0] - centers[1]) > radius + 1e-6:
             return False
@@ -197,6 +212,7 @@ class ConservativeDeduplicator:
                             pairs.append((i, j))
         return sorted(pairs)
 
+    @profiled("tracking.history_projection")
     def _project(self, box):
         """Batch all new views; an unchanged box only projects appended history."""
         if not self.views:
@@ -229,17 +245,35 @@ class ConservativeDeduplicator:
                 continue
             groups[self.views[i].cam.shape[-1]].append(i)
         for indices in groups.values():
-            cameras = torch.stack([self.views[i].cam for i in indices]).to(self.device)
-            poses = torch.stack([self.views[i].pose for i in indices]).to(self.device)
-            projected, ok = (
-                box.detach()
-                .float()
-                .to(self.device)
-                .reshape(1, -1)
-                .get_pseudo_bb2(
-                    cameras, poses, num_samples_per_edge=32, valid_ratio=0.16667
-                )
+            # Keep exactly the original grouping, batch shape and view order.
+            # Only immutable per-observation camera/pose uploads are reused.
+            metadata = [self._device_view(i) for i in indices]
+            cameras = torch.stack([cam for cam, _ in metadata])
+            poses = torch.stack([pose for _, pose in metadata])
+            models = {self.views[i].model for i in indices}
+            context = (
+                fixed_camera_model(next(iter(models)), scripted=self.scripted_history)
+                if torch.device(self.device).type == "cuda"
+                and len(models) == 1
+                and None not in models
+                else contextlib.nullcontext()
             )
+            backend = (
+                "cuda_scripted" if self.scripted_history and models == {2}
+                and torch.device(self.device).type == "cuda"
+                else "cuda_eager" if torch.device(self.device).type == "cuda" else "cpu"
+            )
+            self.history_backends[backend] += 1
+            with context:
+                projected, ok = (
+                    box.detach()
+                    .float()
+                    .to(self.device)
+                    .reshape(1, -1)
+                    .get_pseudo_bb2(
+                        cameras, poses, num_samples_per_edge=32, valid_ratio=0.16667
+                    )
+                )
             rectangles[indices] = projected.reshape(-1, 4).cpu().numpy()
             valid[indices] = ok.reshape(-1).cpu().numpy()
         result = rectangles, valid
@@ -247,6 +281,16 @@ class ConservativeDeduplicator:
         if len(self._projections) > self.cache_size:
             self._projections.popitem(last=False)
         return result
+
+    def _device_view(self, index):
+        device = torch.device(self.device)
+        if device != self._projection_device:
+            self._device_views.clear()
+            self._projection_device = device
+        if index not in self._device_views:
+            view = self.views[index]
+            self._device_views[index] = view.cam.to(device), view.pose.to(device)
+        return self._device_views[index]
 
     def _compatible_indices(self, label):
         indices = self._label_indices.setdefault(label, [])
@@ -327,13 +371,23 @@ class ConservativeDeduplicator:
         if veto:
             return None
         if overlap is None:
-            overlap = float(
-                iou_mc7(
-                    a.detach().float().cpu().reshape(1, -1),
-                    b.detach().float().cpu().reshape(1, -1),
-                    samp_per_dim=8,
-                ).item()
-            )
+            # Monte Carlo IoU is directed. Cache only its raw value, never the
+            # semantic/evidence/threshold decision, and never by mutable IDs.
+            key = self._key(a), self._key(b)
+            if key in self._ious:
+                self._ious.move_to_end(key)
+                overlap = self._ious[key]
+            else:
+                overlap = float(
+                    iou_mc7(
+                        a.detach().float().cpu().reshape(1, -1),
+                        b.detach().float().cpu().reshape(1, -1),
+                        samp_per_dim=8,
+                    ).item()
+                )
+                self._ious[key] = overlap
+                while len(self._ious) > self.cache_size:
+                    self._ious.popitem(last=False)
         threshold = self.merge_iou if iou_threshold is None else iou_threshold
         if np.isfinite(overlap) and overlap >= threshold:
             return float(overlap)
@@ -344,6 +398,20 @@ class ConservativeDeduplicator:
     def conflicts(self, a, b):
         """Independent-object evidence also protects otherwise valid IoU matches."""
         return self._evidence(a, b)[0]
+
+    def member_compatible(self, a, b):
+        """Historical drift needs corroboration beyond the ordinary pair gate.
+
+        Representatives still pass score() with the strict distance limits.
+        Every cross-cluster member pair must pass this check, so an unsupported
+        chain or any independent-object veto continues to block consolidation.
+        """
+        if self.score(a, b) is not None:
+            return True
+        if not self.geometry_compatible(a, b, historical=True):
+            return False
+        veto, projection_score = self._evidence(a, b)
+        return bool(projection_score and not veto)
 
     def redundant_observation_score(self, a, b):
         """Only multi-group detector corroboration can absorb a same-frame extra."""

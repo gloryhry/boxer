@@ -115,6 +115,10 @@ def main():
         help="x-nav CUDA pipeline or original serial execution (default: auto)",
     )
     parser.add_argument(
+        "--xnav_prepare_workers", type=int, choices=[1, 2], default=2,
+        help="CPU camera preparation workers (default: 2; use 1 for comparison)",
+    )
+    parser.add_argument(
         "--xnav_detector_batch_size", type=int, choices=[1, 2], default=1,
         help="OWLv2 observations per call; BoxerNet remains batch=1",
     )

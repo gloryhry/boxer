@@ -2,8 +2,10 @@
 
 import csv
 import re
+import threading
 from collections import Counter, OrderedDict
 from decimal import Decimal, InvalidOperation
+from functools import partial
 from pathlib import Path
 
 import cv2
@@ -14,6 +16,7 @@ from loaders.base_loader import BaseLoader
 from loaders.xnav_camera import NativeView, XNavCamera, make_views
 from utils.tw.obb import ObbTW
 from utils.tw.pose import PoseTW, quat_to_rotmat
+from utils.xnav_preparation import XNavPreparation
 
 
 def is_xnav_map(path):
@@ -241,6 +244,8 @@ class XNavMapLoader:
         max_points=10000,
         fov=100.0,
         camera_mode="native",
+        prepare_workers=1,
+        profiler=None,
     ):
         if not isinstance(size, int) or size < 2:
             raise ValueError("Image size must be an integer >= 2")
@@ -284,9 +289,8 @@ class XNavMapLoader:
             self.lidar_count != len(self.lidar_poses)
             or self.lidar_count < 1
             or any(
-                a >= b for a, b in zip(
-                    self.lidar_pose_times_ns, self.lidar_pose_times_ns[1:]
-                )
+                a >= b
+                for a, b in zip(self.lidar_pose_times_ns, self.lidar_pose_times_ns[1:])
             )
         ):
             raise ValueError("Pose count/timeline does not match manifest")
@@ -302,7 +306,8 @@ class XNavMapLoader:
                 "status",
             ]
             if reader.fieldnames not in (
-                legacy_header, ["image_frame_id", *legacy_header]
+                legacy_header,
+                ["image_frame_id", *legacy_header],
             ):
                 raise ValueError("Invalid image index header")
             self.frame_unit = "lidar" if reader.fieldnames == legacy_header else "image"
@@ -317,8 +322,13 @@ class XNavMapLoader:
                     raise ValueError("Image pose LiDAR association is out of range")
             else:
                 if image_poses_path.exists():
-                    raise ValueError("Legacy image index has unexpected poses_image_base.txt")
-                self.poses, self.pose_times_ns = self.lidar_poses, self.lidar_pose_times_ns
+                    raise ValueError(
+                        "Legacy image index has unexpected poses_image_base.txt"
+                    )
+                self.poses, self.pose_times_ns = (
+                    self.lidar_poses,
+                    self.lidar_pose_times_ns,
+                )
                 self.lidar_keyframe_ids = list(range(self.lidar_count))
             self.count = len(self.poses)
             for row in reader:
@@ -326,9 +336,14 @@ class XNavMapLoader:
                     raise ValueError("Invalid image index row column count")
                 try:
                     anchor, cid, stamp = (
-                        int(row[k]) for k in ["keyframe_id", "camera_id", "image_stamp_ns"]
+                        int(row[k])
+                        for k in ["keyframe_id", "camera_id", "image_stamp_ns"]
                     )
-                    key = int(row["image_frame_id"]) if self.frame_unit == "image" else anchor
+                    key = (
+                        int(row["image_frame_id"])
+                        if self.frame_unit == "image"
+                        else anchor
+                    )
                 except ValueError as error:
                     raise ValueError("Invalid image index row numbers") from error
                 if (
@@ -338,7 +353,9 @@ class XNavMapLoader:
                     or (key, cid) in self.image_index
                     or anchor != self.lidar_keyframe_ids[key]
                 ):
-                    raise ValueError("Invalid or duplicate image index row / LiDAR association")
+                    raise ValueError(
+                        "Invalid or duplicate image index row / LiDAR association"
+                    )
                 if row["status"] == "saved":
                     if (
                         row["file"] != f"{key}_cam{cid}.jpg"
@@ -356,8 +373,10 @@ class XNavMapLoader:
                     raise ValueError("Invalid absent image metadata")
                 # Source keyframe_id retains the CSV's LiDAR meaning.
                 row.update(
-                    self.frame_metadata(key), keyframe_id=anchor,
-                    camera_id=cid, image_stamp_ns=stamp,
+                    self.frame_metadata(key),
+                    keyframe_id=anchor,
+                    camera_id=cid,
+                    image_stamp_ns=stamp,
                 )
                 self.image_index[key, cid] = row
         if set(self.image_index) != {
@@ -381,6 +400,17 @@ class XNavMapLoader:
         self._views = {}
         self._native_views = {}
         self._point_cache = OrderedDict()
+        self._transform_lock = threading.Lock()
+        self.preparation = XNavPreparation(prepare_workers, profiler)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        self.preparation.close()
 
     def __len__(self):
         return len(self.frame_ids)
@@ -413,10 +443,13 @@ class XNavMapLoader:
     def views(self, camera_id):
         key = (self.camera_mode, camera_id, self.size, self.fov)
         if key not in self._views:
+            unproject = partial(self.preparation.unproject, self.cameras[camera_id])
             self._views[key] = (
-                [NativeView(self.cameras[camera_id], self.size)]
+                [NativeView(self.cameras[camera_id], self.size, unproject=unproject)]
                 if self.camera_mode == "native"
-                else make_views(self.cameras[camera_id], self.size, self.fov)
+                else make_views(
+                    self.cameras[camera_id], self.size, self.fov, unproject=unproject
+                )
             )
             if not self._views[key]:
                 raise ValueError(f"Camera {camera_id} has no valid virtual view")
@@ -426,7 +459,8 @@ class XNavMapLoader:
         row = self.image_index[keyframe_id, camera_id]
         if row["status"] != "saved":
             return None
-        img = cv2.imread(str(self.root / "images" / row["file"]), cv2.IMREAD_COLOR)
+        with self.preparation.stage("data.decode"):
+            img = cv2.imread(str(self.root / "images" / row["file"]), cv2.IMREAD_COLOR)
         c = self.cameras[camera_id]
         if img is None or img.shape != (c.height, c.width, 3):
             raise ValueError(
@@ -436,7 +470,8 @@ class XNavMapLoader:
 
     def world_points(self, keyframe_id):
         """Map a processing frame to geometry at its LiDAR anchor pose."""
-        return self._lidar_world_points(self.lidar_keyframe_ids[keyframe_id])
+        with self.preparation.stage("data.cloud"):
+            return self._lidar_world_points(self.lidar_keyframe_ids[keyframe_id])
 
     def _lidar_world_points(self, keyframe_id, verify_fallback=False):
         if keyframe_id in self._point_cache and not verify_fallback:
@@ -493,9 +528,9 @@ class XNavMapLoader:
             "map_id": self.manifest["map_id"],
             "snapshot_id": self.manifest["snapshot_id"],
             "keyframes": self.lidar_count,
-            "selected_keyframes": len({
-                self.lidar_keyframe_ids[k] for k in self.frame_ids
-            }),
+            "selected_keyframes": len(
+                {self.lidar_keyframe_ids[k] for k in self.frame_ids}
+            ),
             "frame_unit": self.frame_unit,
             "frames": self.count,
             "selected_frames": len(self),
@@ -521,15 +556,21 @@ class XNavMapLoader:
             image = self.read_image(keyframe_id, camera_id)
         if image is None:
             return None
-        T = self.poses[keyframe_id] @ self.T_base_camera[camera_id]
-        T = T.copy()
-        T[:3, :3] = T[:3, :3] @ view.R_camera_view
+        # Concurrent skinny GEMMs can corrupt rows with some OpenBLAS builds
+        # (observed with 0.3.29). Serialize only coordinate matrix products;
+        # projection, inverse projection and image preparation stay parallel.
+        with self._transform_lock:
+            T = self.poses[keyframe_id] @ self.T_base_camera[camera_id]
+            T = T.copy()
+            T[:3, :3] = T[:3, :3] @ view.R_camera_view
         sdp = np.empty((0, 3), dtype=np.float32)
         if with_points:
             world, _ = self.world_points(keyframe_id)
-            local = (world - T[:3, 3]) @ T[:3, :3]
+            with self._transform_lock:
+                local = (world - T[:3, 3]) @ T[:3, :3]
             z = local[:, 2]
-            uv, valid = view.project(local)
+            with self.preparation.stage("data.project"):
+                uv, valid = view.project(local)
             valid &= ((uv >= 0) & (uv < self.size - 1)).all(axis=1)
             positive = np.flatnonzero(valid)
             uv = uv[positive]
@@ -543,10 +584,12 @@ class XNavMapLoader:
             if len(ids) > self.max_points:
                 ids = ids[np.linspace(0, len(ids) - 1, self.max_points, dtype=int)]
             sdp = world[ids]
-        rectified = view.remap(image)
-        rgb = cv2.cvtColor(rectified, cv2.COLOR_BGR2RGB)
+        with self.preparation.stage("data.image"):
+            rectified = view.remap(image)
+            rgb = cv2.cvtColor(rectified, cv2.COLOR_BGR2RGB)
+            image_tensor = BaseLoader.img_to_tensor(rgb)
         return {
-            "img0": BaseLoader.img_to_tensor(rgb),
+            "img0": image_tensor,
             "cam0": view.cam.clone(),
             "T_world_rig0": PoseTW.from_matrix(torch.from_numpy(T).float()),
             "sdp_w": torch.from_numpy(sdp.copy()),
@@ -562,33 +605,61 @@ class XNavMapLoader:
             "camera_mode": self.camera_mode,
         }
 
+    def _camera_frame(self, key, cid, with_points, include_native_images):
+        views, native_images = [], []
+        image = self.read_image(key, cid)
+        if image is not None:
+            for view in self.views(cid):
+                datum = self.load_view(key, cid, view.view_id, image, with_points)
+                views.append(datum)
+                if include_native_images and self.camera_mode == "native":
+                    native_images.append(datum)
+            if include_native_images and self.camera_mode != "native":
+                cache_key = (cid, self.size)
+                if cache_key not in self._native_views:
+                    self._native_views[cache_key] = NativeView(
+                        self.cameras[cid],
+                        self.size,
+                        unproject=partial(
+                            self.preparation.unproject, self.cameras[cid]
+                        ),
+                    )
+                native = self._native_views[cache_key]
+                rgb = cv2.cvtColor(native.remap(image), cv2.COLOR_BGR2RGB)
+                native_images.append(
+                    {
+                        "img0": BaseLoader.img_to_tensor(rgb),
+                        "camera_id": cid,
+                        "view_geometry": native,
+                    }
+                )
+        return views, native_images
+
     def iter_frames(self, with_points=True, *, include_native_images=False):
         for key in self.frame_ids:
-            views = []
-            native_images = []
-            for cid in self.camera_ids:
-                image = self.read_image(key, cid)
-                if image is not None:
-                    for view in self.views(cid):
-                        datum = self.load_view(
-                            key, cid, view.view_id, image, with_points
-                        )
-                        views.append(datum)
-                        if include_native_images and self.camera_mode == "native":
-                            native_images.append(datum)
-                    if include_native_images and self.camera_mode != "native":
-                        cache_key = (cid, self.size)
-                        if cache_key not in self._native_views:
-                            self._native_views[cache_key] = NativeView(
-                                self.cameras[cid], self.size
-                            )
-                        native = self._native_views[cache_key]
-                        rgb = cv2.cvtColor(native.remap(image), cv2.COLOR_BGR2RGB)
-                        native_images.append({
-                            "img0": BaseLoader.img_to_tensor(rgb),
-                            "camera_id": cid,
-                            "view_geometry": native,
-                        })
+            available = [
+                cid
+                for cid in self.camera_ids
+                if self.image_index[key, cid]["status"] == "saved"
+            ]
+            # Populate shared geometry and the anchor cache before the camera
+            # jobs start. Workers read the same immutable point arrays.
+            if self.preparation.workers > 1:
+                for cid in available:
+                    self.views(cid)
+                if with_points and available:
+                    self.world_points(key)
+            groups = self.preparation.map(
+                partial(
+                    self._camera_frame,
+                    key,
+                    with_points=with_points,
+                    include_native_images=include_native_images,
+                ),
+                available,
+            )
+            views = [view for group, _ in groups for view in group]
+            native_images = [image for _, group in groups for image in group]
             frame = {
                 **self.frame_metadata(key),
                 "time_ns": self.pose_times_ns[key],

@@ -69,14 +69,14 @@ def tensor2string(tensor, unpad=False):
             return ""  # Skip on error
 
     if tensor.ndim == 1:
-        out = "".join([safe_chr(s) for s in tensor])
+        out = "".join(safe_chr(s) for s in tensor.tolist())
         if unpad:
             out = unpad_string(out)
         return out
     elif tensor.ndim == 2:
         out = []
-        for ex in tensor:
-            ex2 = "".join([safe_chr(s) for s in ex])
+        for ex in tensor.tolist():
+            ex2 = "".join(safe_chr(s) for s in ex)
             if unpad:
                 ex2 = unpad_string(ex2)
             out.append(ex2)

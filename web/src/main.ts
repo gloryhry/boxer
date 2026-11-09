@@ -31,6 +31,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <div class="fields three"><div><label for="start_n">起始帧（从 1 起）</label><input id="start_n" type="number" min="1" value="1"></div><div><label for="skip_n">帧步长</label><input id="skip_n" type="number" min="1" value="1"></div><div><label for="max_n">最多帧数</label><input id="max_n" type="number" min="1" value="99999"></div></div>
           <div class="fields"><div><label for="detector_hw">检测尺寸</label><input id="detector_hw" type="number" min="2" value="960"></div><div><label for="force_precision">推理精度</label><select id="force_precision"><option value="">自动</option><option value="float32">float32</option><option value="bfloat16">bfloat16</option></select></div></div>
           <div class="fields"><div><label for="xnav_execution">执行模式</label><select id="xnav_execution"><option value="auto">自动流水线</option><option value="serial">串行</option></select></div><div><label for="xnav_detector_batch_size">检测批大小</label><select id="xnav_detector_batch_size"><option value="1">1</option><option value="2">2</option></select></div></div>
+          <div><label for="xnav_prepare_workers">数据准备并发</label><select id="xnav_prepare_workers"><option value="2">2</option><option value="1">1</option></select></div>
           <label for="xnav_dedup">静态地图去重</label><select id="xnav_dedup"><option value="conservative">保守去重（推荐）</option><option value="legacy">旧版策略（用于对比）</option></select>
           <div class="fields"><div><label for="track_min_hits">跟踪确认帧数</label><input id="track_min_hits" type="number" min="1" placeholder="自动"></div><div><label for="ckpt">模型检查点</label><input id="ckpt" placeholder="使用默认模型"></div></div>
           <div class="checks"><label class="check"><input id="force_cpu" type="checkbox">强制 CPU</label><label class="check"><input id="profile" type="checkbox">性能记录</label><label class="check"><input id="no_sdp" type="checkbox">关闭 SDP</label><label class="check"><input id="no_csv" type="checkbox">不写 CSV</label></div>
@@ -180,6 +181,7 @@ function options() {
   };
   for (const key of ['thresh2d', 'thresh3d', 'start_n', 'skip_n', 'max_n', 'detector_hw']) result[key] = input(key).valueAsNumber;
   result.xnav_detector_batch_size = Number(input('xnav_detector_batch_size').value);
+  result.xnav_prepare_workers = Number(input('xnav_prepare_workers').value);
   for (const key of ['track', 'force_cpu', 'no_sdp', 'no_csv', 'profile']) result[key] = checked(key);
   return result;
 }

@@ -313,6 +313,7 @@ curl --fail-with-body -sS -X PUT "$API_BASE/api/inference" \
 | `detector_hw` | 整数 `>=2` | `960` | 保留的 2D 检测尺寸参数，当前实现的实际行为见下文 |
 | `force_precision` | `"float32"` / `"bfloat16"` / `null` | `null` | `null` 自动选精度；受设备和模型实现约束 |
 | `xnav_execution` | `"auto"` / `"serial"` | `"auto"` | CUDA 自动使用流水线，或强制串行 |
+| `xnav_prepare_workers` | 整数 `1` / `2` | `2` | 相机反投影的 CPU 准备线程数；`1` 用于低资源运行和对照 |
 | `xnav_detector_batch_size` | 整数 `1` / `2` | `1` | OWLv2 请求批大小；BoxerNet 仍逐观测执行 |
 | `xnav_dedup` | `"conservative"` / `"legacy"` | `"conservative"` | 静态多视图跟踪的去重策略 |
 | `force_cpu` | 布尔值 | `false` | 强制使用 CPU；否则优先 CUDA，再按环境选择 MPS/CPU |

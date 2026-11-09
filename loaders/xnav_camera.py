@@ -355,7 +355,7 @@ class RectifiedView:
 class NativeView(RectifiedView):
     """An original distorted image, resized/padded without lens remapping."""
 
-    def __init__(self, camera, size):
+    def __init__(self, camera, size, *, unproject=None):
         from utils.tw.camera import CameraTW
 
         ratio = size / max(camera.width, camera.height)
@@ -368,6 +368,7 @@ class NativeView(RectifiedView):
             (size - self.resized_size[1]) // 2,
         )
         self.source = camera
+        self._unproject = unproject or camera.unproject
         sx, sy = (
             self.resized_size[0] / camera.width,
             self.resized_size[1] / camera.height,
@@ -382,7 +383,7 @@ class NativeView(RectifiedView):
         )
         yy, xx = np.mgrid[:size, :size]
         pixels = (np.stack((xx, yy), -1) - self.affine[2:]) / self.affine[:2]
-        bearings, valid = camera.unproject(pixels)
+        bearings, valid = self._unproject(pixels)
         valid &= (bearings[..., 2] > 0) & (
             (pixels >= 0) & (pixels <= [camera.width - 1, camera.height - 1])
         ).all(-1)
@@ -407,7 +408,7 @@ class NativeView(RectifiedView):
         pixels, valid = self.source.project(points)
         valid &= points[:, 2] > 1e-3
         indices = np.flatnonzero(valid)
-        bearings, invertible = self.source.unproject(pixels[indices])
+        bearings, invertible = self._unproject(pixels[indices])
         valid[indices] &= invertible & (
             np.linalg.norm(bearings - _unit(points[indices]), axis=-1) < 1e-5
         )
@@ -428,7 +429,7 @@ class NativeView(RectifiedView):
         )
 
 
-def make_views(camera, size=960, fov=100.0):
+def make_views(camera, size=960, fov=100.0, *, unproject=None):
     from loaders.base_loader import BaseLoader
 
     if size < 2 or not 0 < fov < 180:
@@ -438,11 +439,12 @@ def make_views(camera, size=960, fov=100.0):
     yy, xx = np.mgrid[:size, :size]
     rays = np.stack([(xx - K[0, 2]) / f, (yy - K[1, 2]) / f, np.ones_like(xx)], -1)
     views = []
+    unproject = unproject or camera.unproject
     for name, rotation in VIEW_ROTATIONS.items():
         source_rays = rays @ rotation.T
         pixels, valid = camera.project(source_rays)
         # Reject projections on another branch (e.g. EUCM's rear fold).
-        bearings, invertible = camera.unproject(np.nan_to_num(pixels))
+        bearings, invertible = unproject(np.nan_to_num(pixels))
         valid &= invertible & (
             np.sum(bearings * _unit(source_rays), axis=-1) > 1 - 1e-7
         )

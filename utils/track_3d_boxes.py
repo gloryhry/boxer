@@ -25,6 +25,7 @@ Algorithm per frame:
 7. Age and remove stale tracks (unmatched visible + all invisible)
 """
 
+import contextlib
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -44,6 +45,7 @@ from utils.tw.tensor_utils import (
     pad_string,
     string2tensor,
 )
+from utils.xnav_profile import profiled
 
 
 class TrackState(Enum):
@@ -154,6 +156,10 @@ class BoundingBox3DTracker:
         self.xnav_accelerated = False
         self.xnav_geometry_cuda = True
         self._xnav_geometry = None
+        self.profiler = None
+        # The polynomial-only 64-track policy passed full-map differential
+        # and composed-model throughput checks. Other groups retain 256.
+        self.xnav_polynomial_gpu_threshold = 64
         self.merge_iou_threshold = merge_iou_threshold
         self.merge_semantic_threshold = merge_semantic_threshold
         self.merge_iou_2d_threshold = merge_iou_2d_threshold
@@ -394,26 +400,59 @@ class BoundingBox3DTracker:
 
         return mask_visible_boxes_cpu(bounds, visible, mask, self._mask_integrals)
 
+    def _profile_stage(self, name):
+        return (
+            self.profiler.stage(name)
+            if self.profiler is not None
+            else contextlib.nullcontext()
+        )
+
+    @profiled("tracking.visibility")
     def _multiview_visibility(self, observations):
         from utils.xnav_geometry import XNavGeometry, visibility_cpu
 
         count = len(self.tracks)
         if not count:
+            if self.profiler is not None:
+                self.profiler.annotate(geometry_backend="none", geometry_tracks=0)
             return torch.zeros(0, dtype=torch.bool), torch.zeros(0, dtype=torch.bool)
         obbs = torch.stack([track.obb for track in self.tracks])
-        # Below one point-support chunk, CPU geometry is cheaper and overlaps
-        # the next model call without launching many small CUDA kernels.
+        # Polynomial inverse projection costs more than the analytic cameras.
+        # Read only canonical CPU camera metadata, never a CUDA scalar.
+        polynomial = bool(observations) and all(
+            view.cam.is_xnav and bool((view.cam._data[..., 22] == 2).all())
+            for view in observations
+        )
+        threshold = self.xnav_polynomial_gpu_threshold if polynomial else 256
         if (
             self.xnav_accelerated
-            and count >= 256
+            and count >= threshold
             and self.xnav_geometry_cuda
             and not self.force_cpu
             and torch.cuda.is_available()
         ):
             if self._xnav_geometry is None:
                 self._xnav_geometry = XNavGeometry()
-            return self._xnav_geometry.visibility(
+            repaired = self._xnav_geometry.repaired_boxes
+            result = self._xnav_geometry.visibility(
                 obbs, observations, self.min_obs_points
+            )
+            if self.profiler is not None:
+                self.profiler.annotate(
+                    geometry_backend=(
+                        "cuda+cpu_repair"
+                        if self._xnav_geometry.repaired_boxes > repaired
+                        else "cuda"
+                    ),
+                    geometry_tracks=count,
+                    geometry_gpu_threshold=threshold,
+                )
+            return result
+        if self.profiler is not None:
+            self.profiler.annotate(
+                geometry_backend="cpu",
+                geometry_tracks=count,
+                geometry_gpu_threshold=threshold,
             )
         return visibility_cpu(
             obbs, observations, self.min_obs_points, self._mask_integrals
@@ -422,109 +461,145 @@ class BoundingBox3DTracker:
     def _update_multiview(self, detections, frame_idx, observations):
         """One association/aging pass per keyframe, using fresh view visibility.
 
-        Projection gates matching; point support gates missed-count aging. A
-        sparse cloud therefore cannot prevent reacquisition of an existing ID.
+        Projection gates ordinary matching; corroborated recovery also checks
+        nearby old tracks at the image boundary. Point support gates aging, so
+        a sparse cloud cannot prevent reacquisition of an existing ID.
         """
         if not observations:
             if len(detections):
                 raise ValueError("Detections require at least one view observation")
             return self._get_active_tracks()
         detections = detections[(detections.prob >= self.conf_threshold).reshape(-1)]
-        if self._dedup is not None:
-            self._dedup.remember(observations, frame_idx)
+        new_evidence = self._dedup is not None and self._dedup.remember(
+            observations, frame_idx
+        )
         projected, supported = self._multiview_visibility(observations)
         for i, track in enumerate(self.tracks):
             track.last_visible = bool(supported[i])
         candidates = [i for i, visible in enumerate(projected) if visible]
         matched_tracks, matched_detections = set(), set()
-        changed_ids = set()
+        # A new view can establish corroboration without a 3D measurement.
+        # Revisit visible identities and their spatial neighbours in that case.
+        changed_ids = (
+            {self.tracks[i].track_id for i in candidates} if new_evidence else set()
+        )
         self.last_iou_matrix_size = (len(candidates), len(detections))
-        if candidates and len(detections):
-            from utils.fuse_3d_boxes import linear_sum_assignment
+        with self._profile_stage("tracking.association"):
+            if candidates and len(detections):
+                from utils.fuse_3d_boxes import linear_sum_assignment
 
-            boxes = torch.stack([self.tracks[i].obb for i in candidates])
-            device = (
-                "cuda" if torch.cuda.is_available() and not self.force_cpu else "cpu"
-            )
-            overlap = iou_mc7(
-                boxes.to(device), detections.to(device), samp_per_dim=self.samp_per_dim
-            ).cpu()
-            cost = 1 - overlap.numpy()
-            labels = detections.text_string()
-            for r, i in enumerate(candidates):
-                for c, label in enumerate(labels):
-                    if self._dedup is not None:
-                        # Preserve reliable legacy IoU associations. The tight
-                        # center/size gate is for merging identities and low-IoU
-                        # recovery, not for rejecting an existing identity's
-                        # ordinary measurement jitter.
+                boxes = torch.stack([self.tracks[i].obb for i in candidates])
+                device = (
+                    "cuda"
+                    if torch.cuda.is_available() and not self.force_cpu
+                    else "cpu"
+                )
+                overlap = iou_mc7(
+                    boxes.to(device),
+                    detections.to(device),
+                    samp_per_dim=self.samp_per_dim,
+                ).cpu()
+                cost = 1 - overlap.numpy()
+                labels = detections.text_string()
+                for r, i in enumerate(candidates):
+                    for c, label in enumerate(labels):
+                        if self._dedup is not None:
+                            # Preserve reliable legacy IoU associations. The tight
+                            # center/size gate is for merging identities and low-IoU
+                            # recovery, not for rejecting an existing identity's
+                            # ordinary measurement jitter.
+                            if (
+                                overlap[r, c] < self.iou_threshold
+                                or self.semantic_similarity(
+                                    self.tracks[i].cached_text, label
+                                )
+                                < self.merge_semantic_threshold
+                                or self._dedup.conflicts(
+                                    self.tracks[i].obb, detections[c]
+                                )
+                            ):
+                                cost[r, c] = 1e6
+                            continue
                         if (
                             overlap[r, c] < self.iou_threshold
                             or self.semantic_similarity(
                                 self.tracks[i].cached_text, label
                             )
                             < self.merge_semantic_threshold
-                            or self._dedup.conflicts(self.tracks[i].obb, detections[c])
                         ):
                             cost[r, c] = 1e6
+                rows, cols = linear_sum_assignment(cost)
+                for r, c in zip(rows, cols):
+                    if cost[r, c] >= 1:
                         continue
-                    if (
-                        overlap[r, c] < self.iou_threshold
-                        or self.semantic_similarity(self.tracks[i].cached_text, label)
-                        < self.merge_semantic_threshold
-                    ):
-                        cost[r, c] = 1e6
-            rows, cols = linear_sum_assignment(cost)
-            for r, c in zip(rows, cols):
-                if cost[r, c] >= 1:
-                    continue
-                i = candidates[r]
+                    i = candidates[r]
+                    track = self.tracks[i]
+                    frames = self._support_frames.setdefault(
+                        track.track_id, {track.last_seen_frame}
+                    )
+                    if frame_idx not in frames:
+                        self._update_track(track, detections[c], frame_idx)
+                        frames.add(frame_idx)
+                        track.support_count = len(frames)
+                    matched_tracks.add(i)
+                    matched_detections.add(c)
+                    changed_ids.add(track.track_id)
+                # Reacquire low-overlap thin objects before allocating new IDs.
+                # Primary IoU matches retain priority and each pass is one-to-one.
+                with self._profile_stage("tracking.recovery.low_iou"):
+                    if self._dedup is not None:
+                        remaining_tracks = [
+                            i for i in candidates if i not in matched_tracks
+                        ]
+                        remaining_detections = [
+                            c
+                            for c in range(len(detections))
+                            if c not in matched_detections
+                        ]
+                        fallback = np.full(
+                            (len(remaining_tracks), len(remaining_detections)), 1e6
+                        )
+                        for r, i in enumerate(remaining_tracks):
+                            for c, j in enumerate(remaining_detections):
+                                score = self._dedup.score(
+                                    self.tracks[i].obb,
+                                    detections[j],
+                                    iou_threshold=self.iou_threshold,
+                                )
+                                if score is not None:
+                                    fallback[r, c] = 1 - score
+                        if fallback.size:
+                            rows, cols = linear_sum_assignment(fallback)
+                            for r, c in zip(rows, cols):
+                                if fallback[r, c] >= 1:
+                                    continue
+                                i, j = remaining_tracks[r], remaining_detections[c]
+                                track = self.tracks[i]
+                                frames = self._support_frames.setdefault(
+                                    track.track_id, {track.last_seen_frame}
+                                )
+                                if frame_idx not in frames:
+                                    self._update_track(track, detections[j], frame_idx)
+                                    frames.add(frame_idx)
+                                    track.support_count = len(frames)
+                                matched_tracks.add(i)
+                                matched_detections.add(j)
+                                changed_ids.add(track.track_id)
+        if self._dedup is not None and len(detections):
+            for i, j in self._multiview_recovery_matches(
+                detections, matched_tracks, matched_detections
+            ):
                 track = self.tracks[i]
                 frames = self._support_frames.setdefault(
                     track.track_id, {track.last_seen_frame}
                 )
                 if frame_idx not in frames:
-                    self._update_track(track, detections[c], frame_idx)
+                    self._update_track(track, detections[j], frame_idx)
                     frames.add(frame_idx)
                     track.support_count = len(frames)
                 matched_tracks.add(i)
-                matched_detections.add(c)
+                matched_detections.add(j)
                 changed_ids.add(track.track_id)
-            # Reacquire low-overlap thin objects before allocating new IDs.
-            # Primary IoU matches retain priority and each pass is one-to-one.
-            if self._dedup is not None:
-                remaining_tracks = [i for i in candidates if i not in matched_tracks]
-                remaining_detections = [
-                    c for c in range(len(detections)) if c not in matched_detections
-                ]
-                fallback = np.full(
-                    (len(remaining_tracks), len(remaining_detections)), 1e6
-                )
-                for r, i in enumerate(remaining_tracks):
-                    for c, j in enumerate(remaining_detections):
-                        score = self._dedup.score(
-                            self.tracks[i].obb, detections[j],
-                            iou_threshold=self.iou_threshold,
-                        )
-                        if score is not None:
-                            fallback[r, c] = 1 - score
-                if fallback.size:
-                    rows, cols = linear_sum_assignment(fallback)
-                    for r, c in zip(rows, cols):
-                        if fallback[r, c] >= 1:
-                            continue
-                        i, j = remaining_tracks[r], remaining_detections[c]
-                        track = self.tracks[i]
-                        frames = self._support_frames.setdefault(
-                            track.track_id, {track.last_seen_frame}
-                        )
-                        if frame_idx not in frames:
-                            self._update_track(track, detections[j], frame_idx)
-                            frames.add(frame_idx)
-                            track.support_count = len(frames)
-                        matched_tracks.add(i)
-                        matched_detections.add(j)
-                        changed_ids.add(track.track_id)
         for i, track in enumerate(self.tracks):
             if i in matched_tracks:
                 continue
@@ -538,7 +613,8 @@ class BoundingBox3DTracker:
                     self.tracks[i].support_count >= 2
                     and self._dedup.redundant_observation_score(
                         self.tracks[i].obb, detections[j]
-                    ) is not None
+                    )
+                    is not None
                     for i in sorted(matched_tracks)
                 ):
                     # Both views saw the same static object. Its chosen match
@@ -571,6 +647,57 @@ class BoundingBox3DTracker:
         ):
             self._merge_multiview_tracks()
         return self._get_active_tracks()
+
+    @profiled("tracking.recovery.offscreen")
+    def _multiview_recovery_matches(
+        self, detections, matched_tracks, matched_detections
+    ):
+        """Recover established nearby IDs using detector evidence, even offscreen.
+
+        This last assignment runs after ordinary matches and before new IDs.
+        The spatial grid limits both projection work and the assignment matrix
+        to neighbours within the strict representative distance gate.
+        """
+        from utils.fuse_3d_boxes import linear_sum_assignment
+
+        tracks = [
+            i
+            for i, track in enumerate(self.tracks)
+            if i not in matched_tracks
+            and track.support_count >= self._dedup.min_track_support
+        ]
+        remaining = [j for j in range(len(detections)) if j not in matched_detections]
+        if not tracks or not remaining:
+            return []
+        boxes = [self.tracks[i].obb for i in tracks]
+        boxes.extend(detections[j] for j in remaining)
+        count = len(tracks)
+        neighbours = [
+            (i, j - count)
+            for i, j in self._dedup.candidate_pairs(
+                boxes, changed=set(range(count, len(boxes)))
+            )
+            if i < count <= j
+        ]
+        rows = sorted({i for i, _ in neighbours})
+        cols = sorted({j for _, j in neighbours})
+        if not rows or not cols:
+            return []
+        row_index = {i: r for r, i in enumerate(rows)}
+        col_index = {j: c for c, j in enumerate(cols)}
+        cost = np.full((len(rows), len(cols)), 1e6)
+        for i, j in neighbours:
+            score = self._dedup.redundant_observation_score(
+                self.tracks[tracks[i]].obb, detections[remaining[j]]
+            )
+            if score is not None:
+                cost[row_index[i], col_index[j]] = 1 - score
+        assigned_rows, assigned_cols = linear_sum_assignment(cost)
+        return [
+            (tracks[rows[r]], remaining[cols[c]])
+            for r, c in zip(assigned_rows, assigned_cols)
+            if cost[r, c] < 1
+        ]
 
     def _merge_multiview_tracks(self):
         """Keep the earliest ID; overlapping support frames count only once."""
@@ -622,15 +749,18 @@ class BoundingBox3DTracker:
             absorbed.add(second.track_id)
         self.tracks = [t for t in self.tracks if t.track_id not in absorbed]
 
+    @profiled("tracking.merge")
     def _merge_conservative_tracks(self, changed_ids=None, final=False):
         ordered = sorted(
             (t for t in self.tracks if not final or t.state != TrackState.TENTATIVE),
             key=lambda t: t.track_id,
         )
         boxes = [t.obb for t in ordered]
-        changed = None if changed_ids is None else {
-            i for i, t in enumerate(ordered) if t.track_id in changed_ids
-        }
+        changed = (
+            None
+            if changed_ids is None
+            else {i for i, t in enumerate(ordered) if t.track_id in changed_ids}
+        )
         pairs = []
         for i, j in self._dedup.candidate_pairs(boxes, changed):
             # Give the two-group independent-detection veto time to form.
@@ -638,7 +768,8 @@ class BoundingBox3DTracker:
             # collapse two real objects before any temporal evidence exists.
             if (
                 not final
-                and min(ordered[i].support_count, ordered[j].support_count) < 2
+                and min(ordered[i].support_count, ordered[j].support_count)
+                < self._dedup.min_track_support
             ):
                 continue
             score = self._dedup.score(boxes[i], boxes[j])
@@ -649,11 +780,16 @@ class BoundingBox3DTracker:
             first, second = ordered[i], ordered[j]
             if first.track_id in absorbed or second.track_id in absorbed:
                 continue
+            # Earlier merges can change a representative after pairs were
+            # ranked. Historical relaxation never applies to representatives.
+            if self._dedup.score(first.obb, second.obb) is None:
+                continue
             members_a = [first.obb, *self._dedup_members.get(first.track_id, ())]
             members_b = [second.obb, *self._dedup_members.get(second.track_id, ())]
             if any(
-                self._dedup.score(a, b) is None
-                for a in members_a for b in members_b
+                not self._dedup.member_compatible(a, b)
+                for a in members_a
+                for b in members_b
             ):
                 continue
             frames = (
@@ -687,7 +823,11 @@ class BoundingBox3DTracker:
     def finalize_multiview(self):
         """Consolidate the confirmed map before publishing its final snapshot."""
         if self._dedup is not None:
-            self._merge_conservative_tracks(final=True)
+            while True:
+                previous_count = len(self.tracks)
+                self._merge_conservative_tracks(final=True)
+                if len(self.tracks) == previous_count:
+                    break
         return self._get_active_tracks()
 
     def _visible_merge_pairs(self, boxes, visible):
@@ -944,15 +1084,12 @@ class BoundingBox3DTracker:
         # noisy early measurements permanently at their old world positions.
         members = self._dedup_members.get(track.track_id, ())
         if members:
-            translation = (
-                track.obb.T_world_object.t.reshape(3)
-                - old_obb.T_world_object.t.reshape(3)
-            )
+            translation = track.obb.T_world_object.t.reshape(
+                3
+            ) - old_obb.T_world_object.t.reshape(3)
             for member in members:
                 pose = member.T_world_object
-                member.set_T_world_object(
-                    PoseTW.from_Rt(pose.R, pose.t + translation)
-                )
+                member.set_T_world_object(PoseTW.from_Rt(pose.R, pose.t + translation))
 
     def _merge_track_pair(
         self, absorber: TrackedInstance, absorbed: TrackedInstance

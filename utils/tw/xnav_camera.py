@@ -16,14 +16,17 @@ _dispatch = threading.local()
 
 
 @contextlib.contextmanager
-def fixed_camera_model(model):
+def fixed_camera_model(model, *, scripted=False):
     """Use a validated CPU camera tag while projecting its immutable CUDA copy."""
     previous = getattr(_dispatch, "model", None)
+    previous_scripted = getattr(_dispatch, "scripted", False)
     _dispatch.model = model
+    _dispatch.scripted = scripted
     try:
         yield
     finally:
         _dispatch.model = previous
+        _dispatch.scripted = previous_scripted
 
 
 MODEL_NAMES = (
@@ -111,6 +114,11 @@ def _distort(x, y, k, model, jacobian=False):
 
 
 def _project(points, data, model):
+    if (model == 2 and getattr(_dispatch, "scripted", False)
+            and points.is_cuda and points.dtype == torch.float32):
+        from utils.xnav_polynomial import project_polynomial
+
+        return project_polynomial(points, data)
     x, y, z = points.unbind(-1)
     p = data.unsqueeze(-2)
     k = p[..., 29:35]
@@ -163,6 +171,11 @@ def _project(points, data, model):
 
 
 def _unproject(pixels, data, model):
+    if (model == 2 and getattr(_dispatch, "scripted", False)
+            and pixels.is_cuda and pixels.dtype == torch.float32):
+        from utils.xnav_polynomial import unproject_polynomial
+
+        return unproject_polynomial(pixels, data)
     p = data.unsqueeze(-2)
     k = p[..., 29:35]
     du, dv = pixels[..., 0] - p[..., 4], pixels[..., 1] - p[..., 5]

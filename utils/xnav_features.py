@@ -15,6 +15,7 @@ import torch
 from loaders.xnav_loader import XNavMapLoader, frame_identity
 from utils.tw.pose import rotmat_to_quat
 from utils.tw.xnav_camera import PREPROCESS_VERSION
+from utils.xnav_inference import CpuReadback
 from utils.xnav_result_store import _atomic_file, _sync_directory
 
 FEATURE_CSV_PATH = "3dbbox/dino_features.csv"
@@ -110,15 +111,28 @@ def cleanup_legacy_features(map_root):
 
 
 def image_feature_payload(
-    frame, source, native, patches, cls_token, model_name, checkpoint
+    frame,
+    source,
+    native,
+    patches,
+    cls_token,
+    model_name,
+    checkpoint,
+    *,
+    defer_cpu=False,
 ):
     """Reduce on the model device; only small CPU arrays cross the output queue."""
     path = FEATURE_CSV_PATH
     view = native["view_geometry"]
     patch_mean = patches.detach().float().mean(dim=(-2, -1))
+    readback = (
+        CpuReadback((cls_token.detach().float(), patch_mean)) if defer_cpu else None
+    )
     data = {
-        "cls_token": cls_token.detach().float().cpu().numpy().copy(),
-        "patch_mean_pooling": patch_mean.cpu().numpy().copy(),
+        "cls_token": None
+        if defer_cpu
+        else cls_token.detach().float().cpu().numpy().copy(),
+        "patch_mean_pooling": None if defer_cpu else patch_mean.cpu().numpy().copy(),
         "source_image": f"images/{source['file']}",
         **frame_identity(frame),
         "camera_id": source["camera_id"],
@@ -136,7 +150,19 @@ def image_feature_payload(
             "l2_normalized": False,
         },
     }
-    return {"path": path, "data": data}
+    payload = {"path": path, "data": data}
+    if readback is not None:
+        payload["_readback"] = readback
+    return payload
+
+
+def complete_image_features(payloads):
+    """Finish descriptor transfers before a CPU record or output process sees them."""
+    for payload in payloads:
+        readback = payload.pop("_readback", None)
+        if readback is not None:
+            for name, tensor in zip(FEATURE_VECTOR_FIELDS, readback.wait()):
+                payload["data"][name] = tensor.numpy().copy()
 
 
 class DinoFeatureCsvStore:

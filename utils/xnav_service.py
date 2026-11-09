@@ -55,6 +55,7 @@ class InferenceOptions(RequestModel):
     detector_hw: int = Field(default=960, ge=2)
     force_precision: Literal["float32", "bfloat16"] | None = None
     xnav_execution: Literal["auto", "serial"] = "auto"
+    xnav_prepare_workers: Literal[1, 2] = 2
     xnav_detector_batch_size: Literal[1, 2] = 1
     xnav_dedup: Literal["conservative", "legacy"] = "conservative"
     force_cpu: bool = False

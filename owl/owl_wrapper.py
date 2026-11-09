@@ -19,6 +19,7 @@ from owl.owlv2_model import (
     Owlv2ClassPredictionHead,
 )
 from utils.taxonomy import load_text_labels
+from utils.xnav_inference import CpuReadback
 
 DEFAULT_TEXT_LABELS = load_text_labels("lvisplus")
 
@@ -402,7 +403,10 @@ class OwlWrapper(nn.Module):
         return outputs
 
     @torch.no_grad()
-    def forward(self, image_torch, resize_to_HW=(906, 906), *, prepared=None):
+    def forward(
+        self, image_torch, resize_to_HW=(906, 906), *, prepared=None,
+        group_cpu_transfer=False,
+    ):
         _debug = os.environ.get("DEBUG", "0") == "1"
         assert len(image_torch.shape) == 4, "input image should be 4D tensor"
         assert image_torch.shape[0] == 1, "only batch size 1 is supported"
@@ -438,6 +442,11 @@ class OwlWrapper(nn.Module):
         # Postprocess: sigmoid, threshold, convert boxes
         scores_all, labels_all = torch.max(logits[0], dim=-1)  # [num_patches]
         scores_all = torch.sigmoid(scores_all)
+
+        if group_cpu_transfer:
+            return self._grouped_postprocess(
+                pred_boxes[0], scores_all, labels_all, HH, WW
+            )
 
         keep = scores_all > self.min_confidence
         scores = scores_all[keep].cpu()
@@ -492,3 +501,27 @@ class OwlWrapper(nn.Module):
             )
 
         return boxes, scores, labels, None
+
+    def _grouped_postprocess(self, predicted, scores, labels, height, width):
+        # Preserve the original eager pointwise operations on the GPU. Moving
+        # complete small arrays avoids dynamic CUDA indexing and four separate
+        # host waits; filtering and greedy NMS retain their original CPU order.
+        cx, cy, w, h = predicted.unbind(-1)
+        x1 = (cx - w / 2) * width
+        y1 = (cy - h / 2) * height
+        x2 = (cx + w / 2) * width
+        y2 = (cy + h / 2) * height
+        boxes = torch.stack((x1, y1, x2, y2), -1)
+        too_big = (x2 - x1 > 0.9 * width) | (y2 - y1 > 0.9 * height)
+        too_small = (x2 - x1 < 0.05 * width) | (y2 - y1 < 0.05 * height)
+        boxes, scores, labels, size_ok = CpuReadback(
+            (boxes, scores, labels, ~(too_big | too_small))
+        ).wait()
+        keep = (scores > self.min_confidence) & size_ok
+        boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+        if not len(boxes):
+            return torch.zeros((0, 4)), torch.zeros(0), torch.zeros(0), None
+        if self.nms_iou_threshold < 1.0:
+            keep = _per_class_nms(boxes, scores, labels, self.nms_iou_threshold)
+            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+        return boxes[:, [0, 2, 1, 3]], scores, labels, None

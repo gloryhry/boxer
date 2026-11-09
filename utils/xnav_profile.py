@@ -1,14 +1,33 @@
 """Opt-in per-frame host timings and asynchronous CUDA event timings."""
 
 import contextlib
+import functools
 import json
 import resource
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import torch
+
+
+def profiled(name, *, cuda=False):
+    """Time an internal method only when its owning job enables profiling."""
+
+    def decorate(method):
+        @functools.wraps(method)
+        def measured(self, *args, **kwargs):
+            profiler = getattr(self, "profiler", None)
+            if profiler is None or not profiler.enabled:
+                return method(self, *args, **kwargs)
+            with profiler.stage(name, cuda=cuda):
+                return method(self, *args, **kwargs)
+
+        return measured
+
+    return decorate
 
 
 def _summary(rows):
@@ -98,7 +117,9 @@ class XNavProfiler:
                 if events is not None:
                     self._events.append((frame, name, events))
 
-    def finish_frame(self, frame, stages=None, result_bytes=None, commit_lag=None):
+    def finish_frame(
+        self, frame, stages=None, result_bytes=None, commit_lag=None, *, ack=None
+    ):
         if not self.enabled or frame is None:
             return
         with self._lock:
@@ -109,6 +130,17 @@ class XNavProfiler:
             now = time.perf_counter()
             frame["wall_ms"] = (now - frame.pop("_started")) * 1000
             frame.setdefault("committed_seconds", now - self.started)
+            if ack is not None:
+                received = ack["ack_received_ns"] / 1e9
+                durable = ack["durable_ns"] / 1e9
+                frame["durable_seconds"] = durable - self.started
+                frame["ack_received_seconds"] = received - self.started
+                frame["ack_receive_delay_ms"] = (received - durable) * 1000
+                frame["ack_dispatch_delay_ms"] = (now - received) * 1000
+                if "_computed_at" in frame:
+                    frame["durable_commit_latency_ms"] = (
+                        durable - frame["_computed_at"]
+                    ) * 1000
             if "_computed_at" in frame:
                 frame["commit_latency_ms"] = (now - frame.pop("_computed_at")) * 1000
             if result_bytes is not None:
@@ -126,10 +158,14 @@ class XNavProfiler:
         if self.enabled and self.current is not None:
             now = time.perf_counter()
             self.current["committed_seconds"] = now - self.started
+            self.current["durable_seconds"] = now - self.started
             if "_computed_at" in self.current:
                 self.current["commit_latency_ms"] = (
                     now - self.current.pop("_computed_at")
                 ) * 1000
+                self.current["durable_commit_latency_ms"] = self.current[
+                    "commit_latency_ms"
+                ]
 
     def iterate(self, source):
         if not self.enabled:
@@ -153,6 +189,10 @@ class XNavProfiler:
     def record_frame(self, tracks, result_bytes):
         if self.enabled and self.current is not None:
             self.current.update(track_count=tracks, result_bytes=result_bytes)
+
+    def annotate(self, **fields):
+        if self.enabled and self.current is not None:
+            self.current.update(fields)
 
     def _resolve_events(self):
         # Called after the execution workers stop, never at a hot-path boundary.
@@ -182,10 +222,39 @@ class XNavProfiler:
             if len(frames) > 2
             else 0
         )
+        durable_span = (
+            frames[-1]["durable_seconds"] - frames[1]["durable_seconds"]
+            if len(frames) > 2 and all("durable_seconds" in row for row in frames)
+            else 0
+        )
         return {
+            "kernel_stages_ms": None,
+            "timing_semantics": {
+                "stages_ms": "host wall span, including waits",
+                "cuda_stages_ms": (
+                    "CUDA stream event span, including host gaps and waits; "
+                    "not kernel time"
+                ),
+                "kernel_time": (
+                    "separate diagnostic trace; excluded from throughput acceptance"
+                ),
+            },
             "status": status,
             "wall_seconds": time.perf_counter() - self.started,
             "warmup_frames": 2,
+            "cold_start": {
+                "first_frame_committed_seconds": (
+                    frames[0]["committed_seconds"] if frames else None
+                ),
+                "first_frame_durable_seconds": (
+                    frames[0].get("durable_seconds") if frames else None
+                ),
+                "initialization_ms": sum(
+                    sum(values)
+                    for name, values in self.other_stages.items()
+                    if name.startswith("init.")
+                ),
+            },
             "frames": frames,
             "steady_stages": _summary(groups),
             "steady_cuda_stages": _summary(gpu_groups),
@@ -199,8 +268,36 @@ class XNavProfiler:
                     ]
                 }
             ),
+            "steady_ack_delays": _summary(
+                {
+                    name: [row[field] for row in steady if field in row]
+                    for name, field in (
+                        ("receive", "ack_receive_delay_ms"),
+                        ("main_dispatch", "ack_dispatch_delay_ms"),
+                    )
+                }
+            ),
+            "steady_durable_commit_latency": _summary(
+                {
+                    "commit": [
+                        row["durable_commit_latency_ms"]
+                        for row in steady
+                        if "durable_commit_latency_ms" in row
+                    ]
+                }
+            ),
+            "geometry_backends": dict(
+                Counter(
+                    row["geometry_backend"]
+                    for row in frames
+                    if "geometry_backend" in row
+                )
+            ),
             "steady_throughput_fps": len(steady) / committed_span
             if committed_span > 0
+            else None,
+            "steady_durable_throughput_fps": len(steady) / durable_span
+            if durable_span > 0
             else None,
             "segments": segments,
             "other_stages": self.other_stages and _summary(self.other_stages),

@@ -86,6 +86,7 @@ class XNavExecution:
 
     def _predict(self):
         import contextlib
+
         import torch
 
         try:
@@ -317,11 +318,13 @@ def _output_worker(config, incoming, outgoing):
                     value["id_aliases"],
                     value["elapsed_seconds"],
                 )
+                durable_ns = time.perf_counter_ns()
                 outgoing.put(
                     (
                         "committed",
                         {
                             "index": value["index"],
+                            "durable_ns": durable_ns,
                             "result_bytes": store.result_bytes,
                             "stages": {
                                 "features": features_ms,
@@ -387,9 +390,16 @@ def _output_worker(config, incoming, outgoing):
 
 
 class XNavOutput:
-    """Ordered output process; polling also detects unexpected worker death."""
+    """Receive durable ACKs independently; dispatch public callbacks on the caller.
 
-    def __init__(self, config, *, on_commit=None, target=_output_worker):
+    Only the receiver reads the process channel. Its internal ``on_durable``
+    callback may release inference credits, but must not touch main-thread state.
+    The bounded local channel preserves commit/terminal order and backpressure.
+    """
+
+    def __init__(
+        self, config, *, on_commit=None, on_durable=None, target=_output_worker
+    ):
         context = mp.get_context("spawn")
         self._incoming = context.Queue(maxsize=2)
         self._outgoing = context.Queue(maxsize=4)
@@ -400,23 +410,78 @@ class XNavOutput:
             daemon=True,
         )
         self.on_commit = on_commit
+        self.on_durable = on_durable
+        self._messages = queue.Queue(maxsize=4)
+        self._receiver_stop = threading.Event()
+        self._pending = set()
+        self._pending_lock = threading.Lock()
+        self._last_durable = -1
         self._terminal = False
+        self._closed = False
         self.final_stages = {}
         self._process.start()
+        self._receiver = threading.Thread(
+            target=self._receive_messages, name="xnav-output-ack", daemon=True
+        )
+        self._receiver.start()
         try:
             self._wait_for("ready", 60)
         except BaseException:
             self.close()
             raise
 
+    def _post(self, message):
+        while not self._receiver_stop.is_set():
+            try:
+                self._messages.put(message, timeout=0.05)
+                return
+            except queue.Full:
+                pass
+
+    def _receive_messages(self):
+        try:
+            while not self._receiver_stop.is_set():
+                try:
+                    kind, value = self._outgoing.get(timeout=0.05)
+                except queue.Empty:
+                    if self._process.exitcode is not None:
+                        raise RuntimeError(
+                            "x-nav output worker exited unexpectedly "
+                            f"({self._process.exitcode})"
+                        )
+                    continue
+                if kind == "committed":
+                    value["ack_received_ns"] = time.perf_counter_ns()
+                    index = value["index"]
+                    with self._pending_lock:
+                        if index <= self._last_durable:
+                            # Replayed ACKs must never return another credit.
+                            continue
+                        if (
+                            index != self._last_durable + 1
+                            or index not in self._pending
+                        ):
+                            raise RuntimeError(f"Unexpected x-nav durable ACK: {index}")
+                        self._pending.remove(index)
+                        self._last_durable = index
+                    if self.on_durable is not None:
+                        self.on_durable(value)
+                if kind in ("finished", "failed"):
+                    with self._pending_lock:
+                        if self._pending:
+                            raise RuntimeError(
+                                "x-nav output closed with unacknowledged frames"
+                            )
+                self._post((kind, value))
+                if kind in ("finished", "failed", "error"):
+                    return
+        except BaseException as error:
+            self._post(("error", (error, traceback.format_exc())))
+
     def _receive(self, timeout=0):
         try:
-            kind, value = self._outgoing.get(timeout=timeout)
+            kind, value = self._messages.get(timeout=timeout)
         except queue.Empty:
-            if self._process.exitcode is not None and not self._terminal:
-                raise RuntimeError(
-                    f"x-nav output worker exited unexpectedly ({self._process.exitcode})"
-                )
             return None
         if kind == "error":
             self._terminal = True
@@ -424,6 +489,7 @@ class XNavOutput:
             add_exception_note(error, "x-nav output worker traceback:\n" + detail)
             raise error
         if kind == "committed" and self.on_commit is not None:
+            value["ack_processed_ns"] = time.perf_counter_ns()
             self.on_commit(value)
         if kind in ("finished", "failed"):
             self._terminal = True
@@ -440,6 +506,8 @@ class XNavOutput:
         while True:
             if self._receive(timeout=0.05) == wanted:
                 return
+            if self._terminal:
+                raise RuntimeError(f"x-nav output worker closed before {wanted}")
             if timeout is not None and time.monotonic() - started > timeout:
                 raise TimeoutError(f"x-nav output worker did not send {wanted}")
 
@@ -448,6 +516,8 @@ class XNavOutput:
             raise RuntimeError("x-nav output worker is closed")
         while True:
             self.poll()
+            if self._terminal or self._closed:
+                raise RuntimeError("x-nav output worker is closed")
             try:
                 self._incoming.put((kind, value), timeout=0.05)
                 return
@@ -455,7 +525,18 @@ class XNavOutput:
                 continue
 
     def submit(self, snapshot):
-        self._send("frame", copy.deepcopy(snapshot))
+        snapshot = copy.deepcopy(snapshot)
+        index = snapshot["index"]
+        with self._pending_lock:
+            if index in self._pending or index <= self._last_durable:
+                raise ValueError(f"Duplicate x-nav output index: {index}")
+            self._pending.add(index)
+        try:
+            self._send("frame", snapshot)
+        except BaseException:
+            with self._pending_lock:
+                self._pending.discard(index)
+            raise
 
     def finish(self, metadata):
         self._send("finish", copy.deepcopy(metadata))
@@ -467,11 +548,19 @@ class XNavOutput:
             self._wait_for("failed", 30)
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._receiver_stop.set()
         self._process.join(timeout=2)
         if self._process.is_alive():
             self._process.terminate()
             self._process.join(timeout=5)
+        self._receiver.join(timeout=5)
+        if self._receiver.is_alive():
+            raise RuntimeError("x-nav output ACK receiver did not stop")
         self.on_commit = None
+        self.on_durable = None
         # An unread feeder pipe must never block interpreter shutdown.
         for channel in (self._incoming, self._outgoing):
             channel.cancel_join_thread()

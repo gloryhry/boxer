@@ -6,6 +6,7 @@
 
 import contextlib
 import os
+from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ from utils.gravity import gravity_align_T_world_cam
 from utils.tw.camera import CameraTW
 from utils.tw.obb import ObbTW
 from utils.tw.pose import PoseTW, rotation_from_euler
+from utils.tw.xnav_camera import fixed_camera_model
 
 # ---------------------------------------------------------------------------
 # Attention modules
@@ -30,6 +32,11 @@ def geometry_context(cam):
     if cam is not None and cam.is_xnav and cam.device.type in ("cpu", "cuda"):
         return torch.autocast(device_type=cam.device.type, enabled=False)
     return contextlib.nullcontext()
+
+
+def _profile_stage(batch, name):
+    profiler = batch.get("_profiler")
+    return profiler.stage(name, cuda=True) if profiler else contextlib.nullcontext()
 
 
 class FeedForward(nn.Module):
@@ -389,7 +396,7 @@ def generate_patch_centers(B, fH, fW, patch_size, device):
     return uv
 
 
-def generate_plucker_encoding(B, fH, fW, patch_size, cam, T_vc):
+def generate_plucker_encoding(B, fH, fW, patch_size, cam, T_vc, *, rays=None):
     """
     Generate Plücker line encodings (d, m) for rays in a batch of posed images.
 
@@ -412,10 +419,10 @@ def generate_plucker_encoding(B, fH, fW, patch_size, cam, T_vc):
     device = cam.device
 
     # (B, fH*fW, 2)
-    uv = generate_patch_centers(B, fH, fW, patch_size, device)
-
-    # Unproject rays to get direction vectors in camera frame
-    dirs_cam, valid = cam.unproject(uv)  # (B, fH*fW, 3)
+    if rays is None:
+        uv = generate_patch_centers(B, fH, fW, patch_size, device)
+        rays = cam.unproject(uv)
+    dirs_cam, valid = rays
 
     # Ray origin in camera frame (typically [0, 0, 0])
     origins_cam = torch.zeros_like(dirs_cam)
@@ -632,7 +639,7 @@ class BoxerNet(nn.Module):
         out["T_world_rig0"] = PoseTW(T_wr_data)
         return out
 
-    def prepare_inputs(self, datum):
+    def prepare_inputs(self, datum, *, non_blocking=False, include_boxes=True):
         inputs = {}
         inputs.update(self.process_camera(datum))
 
@@ -642,18 +649,37 @@ class BoxerNet(nn.Module):
             sdp_w = sdp_w.unsqueeze(0)
         inputs["sdp_w_padded"] = sdp_w
 
-        bb2d = datum["bb2d"]
-        assert bb2d.shape[-1] == 4
-        if bb2d.ndim == 2:
-            bb2d = bb2d.unsqueeze(0)
-        inputs["bb2d"] = bb2d
+        if include_boxes:
+            bb2d = datum["bb2d"]
+            assert bb2d.shape[-1] == 4
+            if bb2d.ndim == 2:
+                bb2d = bb2d.unsqueeze(0)
+            inputs["bb2d"] = bb2d
 
         for key in inputs:
-            inputs[key] = inputs[key].to(self.device).float()
+            inputs[key] = inputs[key].to(self.device, non_blocking=non_blocking).float()
+
+        # Metadata is read from the CPU original, before any asynchronous copy.
+        # Its key includes the complete camera, so changing intrinsics or crop
+        # cannot reuse rays from another view.
+        if non_blocking and datum["cam0"].device.type == "cpu":
+            camera = datum["cam0"]
+            inputs["_camera_key"] = camera._data.contiguous().numpy().tobytes()
+            inputs["_camera_size"] = tuple(
+                camera.size.reshape(-1, 2)[0].round().int().tolist()
+            )
+            models = (
+                camera._data.reshape(-1, camera.shape[-1])[:, 22].unique()
+                if camera.is_xnav
+                else None
+            )
+            inputs["_camera_model"] = (
+                int(models[0]) if models is not None and len(models) == 1 else None
+            )
 
         return inputs
 
-    def encode(self, batch, *, dino_features=None):
+    def encode(self, batch, *, dino_features=None, return_intermediates=True):
         out = {}
 
         torch_img = batch["img0"]
@@ -680,7 +706,10 @@ class BoxerNet(nn.Module):
             )
             if dino_features is not None:
                 expected_shape = (
-                    B, self.dino.feat_dim, H // self.patch_size, W // self.patch_size
+                    B,
+                    self.dino.feat_dim,
+                    H // self.patch_size,
+                    W // self.patch_size,
                 )
                 if (
                     dino_feat.shape != expected_shape
@@ -689,23 +718,25 @@ class BoxerNet(nn.Module):
                     raise ValueError(
                         "DINO features must match the input image grid and device"
                     )
-            out["dino0"] = dino_feat.clone()
+            if return_intermediates:
+                out["dino0"] = dino_feat.clone()
             _, _, fH, fW = dino_feat.shape
             dino_feat = dino_feat.reshape(B, -1, fH * fW).permute(0, 2, 1)
 
             # Render semi-dense points as patches.
             sdp_w = batch["sdp_w_padded"]
-            with geometry_context(cam):
+            with geometry_context(cam), _profile_stage(batch, "boxer.depth"):
                 sdp_median = sdp_to_patches(
                     sdp_w, cam, T_wr, H, W, self.dino.patch_size
                 )
-            out["sdp_patch0"] = sdp_median.clone()
+            if return_intermediates:
+                out["sdp_patch0"] = sdp_median.clone()
             sdp_input = sdp_median.reshape(B, -1, fH * fW).permute(0, 2, 1)
             x = torch.cat([dino_feat, sdp_input], dim=-1)
 
             # Get ray directions in voxel frame.
             if self.with_ray:
-                with geometry_context(cam):
+                with geometry_context(cam), _profile_stage(batch, "boxer.rays"):
                     T_vc = T_wv.inverse() @ T_wc
                     # The gravity-aligned origin should be the camera center.
                     if not torch.allclose(T_vc.t, torch.zeros_like(T_vc.t), atol=1e-2):
@@ -713,16 +744,40 @@ class BoxerNet(nn.Module):
                             f"WARNING: T_vc.t is not close to zero: {T_vc.t}. "
                             "This is not expected."
                         )
+                    rays = None
+                    if "_camera_key" in batch:
+                        if not hasattr(self, "_ray_cache"):
+                            self._ray_cache = OrderedDict()
+                        key = (
+                            batch["_camera_key"],
+                            B,
+                            fH,
+                            fW,
+                            self.dino.patch_size,
+                            str(cam.device),
+                            cam.dtype,
+                        )
+                        if key not in self._ray_cache:
+                            uv = generate_patch_centers(
+                                B, fH, fW, self.dino.patch_size, cam.device
+                            )
+                            self._ray_cache[key] = cam.unproject(uv)
+                            if len(self._ray_cache) > 16:
+                                self._ray_cache.popitem(last=False)
+                        self._ray_cache.move_to_end(key)
+                        rays = self._ray_cache[key]
                     ray_enc = generate_plucker_encoding(
-                        B, fH, fW, self.dino.patch_size, cam, T_vc
+                        B, fH, fW, self.dino.patch_size, cam, T_vc, rays=rays
                     )
-                out["ray_enc0"] = ray_enc.clone()
+                if return_intermediates:
+                    out["ray_enc0"] = ray_enc.clone()
                 x = torch.cat([x, ray_enc], dim=-1)
 
         input_enc = self.input2emb(x)
 
         if self.in_depth > 0:
-            input_enc = self.self_attn(input_enc)
+            with _profile_stage(batch, "boxer.transformer"):
+                input_enc = self.self_attn(input_enc)
 
         out["input_enc"] = input_enc
 
@@ -742,8 +797,11 @@ class BoxerNet(nn.Module):
         if "obbs_valid" not in batch:
             batch["obbs_valid"] = torch.ones((B, M, 1), dtype=torch.bool, device=device)
 
-        cH = int(cam[0].size[0].round().int())
-        cW = int(cam[0].size[1].round().int())
+        if "_camera_size" in batch:
+            cH, cW = batch["_camera_size"]
+        else:
+            cH = int(cam[0].size[0].round().int())
+            cW = int(cam[0].size[1].round().int())
         assert cW == W and cH == H
 
         with torch.no_grad():
@@ -763,8 +821,32 @@ class BoxerNet(nn.Module):
         return output
 
     @torch.no_grad()
-    def forward(self, datum, *, dino_features=None):
-        inputs = self.prepare_inputs(datum)
-        out = self.encode(inputs, dino_features=dino_features)
-        out = self.query(inputs, out)
+    def forward(
+        self,
+        datum,
+        *,
+        dino_features=None,
+        prepared_inputs=None,
+        return_intermediates=True,
+    ):
+        inputs = (
+            self.prepare_inputs(datum)
+            if prepared_inputs is None
+            else dict(prepared_inputs)
+        )
+        if prepared_inputs is not None:
+            boxes = datum["bb2d"]
+            assert boxes.shape[-1] == 4
+            inputs["bb2d"] = boxes.to(self.device).float()
+            if boxes.ndim == 2:
+                inputs["bb2d"] = inputs["bb2d"].unsqueeze(0)
+        with fixed_camera_model(inputs.get("_camera_model")):
+            with _profile_stage(inputs, "boxer.encode"):
+                out = self.encode(
+                    inputs,
+                    dino_features=dino_features,
+                    return_intermediates=return_intermediates,
+                )
+            with _profile_stage(inputs, "boxer.query"):
+                out = self.query(inputs, out)
         return out
