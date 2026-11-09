@@ -1,11 +1,15 @@
 """Exercise the room-segmentation job lifecycle without model dependencies."""
 
 import json
+import os
+import struct
 import sys
 import tempfile
 import time
 import unittest
+from importlib.util import find_spec
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
@@ -64,8 +68,8 @@ class TestPotentialFieldJobs(unittest.TestCase):
         self.addCleanup(jobs.close)
         return jobs
 
-    def wait_for_terminal(self, jobs, job_id):
-        deadline = time.monotonic() + 8
+    def wait_for_terminal(self, jobs, job_id, timeout=8):
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             jobs.poll()
             job = jobs.info(job_id)
@@ -122,6 +126,51 @@ class TestPotentialFieldJobs(unittest.TestCase):
         with self.assertRaises(HTTPException) as raised:
             jobs.artifact(failed["id"], "rooms.json")
         self.assertEqual(raised.exception.status_code, 404)
+
+    @unittest.skipUnless(
+        all(
+            find_spec(name) for name in ("numpy", "scipy", "sklearn", "plyfile", "yaml")
+        ),
+        "Install requirements-potential-field.txt to exercise the bundled worker",
+    )
+    def test_bundled_worker_segments_registered_room_without_external_checkout(self):
+        from plyfile import PlyData
+
+        # Six surfaces of a 4 × 3 × 2.6 metre room at 0.1 metre spacing.
+        points = [
+            (x / 10, y / 10, z / 10)
+            for x in range(41)
+            for y in range(31)
+            for z in range(27)
+            if x in (0, 40) or y in (0, 30) or z in (0, 26)
+        ]
+        count = len(points)
+        header = (
+            "VERSION .7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n"
+            f"WIDTH {count}\nHEIGHT 1\nPOINTS {count}\nDATA binary\n"
+        ).encode("ascii")
+        coordinates = (coordinate for point in points for coordinate in point)
+        payload = struct.pack(f"<{3 * count}f", *coordinates)
+        self.point_cloud.write_bytes(header + payload)
+
+        jobs = PotentialFieldJobs(self.output)
+        self.addCleanup(jobs.close)
+        with patch.dict(os.environ):
+            for variable in (
+                "BOXER_PF_PROJECT",
+                "BOXER_PF_PYTHON",
+                "BOXER_PF_CONFIG",
+                "ROOMSEG_PF_CONFIG",
+            ):
+                os.environ.pop(variable, None)
+            job = jobs.start(PotentialFieldJobRequest(map_id="room"), self.map_root)
+        identity = job["id"]
+        finished = self.wait_for_terminal(jobs, identity, timeout=30)
+        self.assertEqual(finished["status"], "complete", jobs.log(identity))
+        rooms = json.loads(jobs.artifact(identity, "rooms.json").read_text())
+        self.assertEqual(len(rooms), 1)
+        vertices = PlyData.read(jobs.artifact(identity, "result_colored.ply"))["vertex"]
+        self.assertEqual(len(vertices), count)
 
     def test_active_job_blocks_second_job_and_can_be_stopped(self):
         jobs = self.jobs("wait")

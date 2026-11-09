@@ -1,8 +1,8 @@
-"""Run the existing Room Atlas potential-field implementation in a worker."""
+"""Run the potential-field implementation bundled with Boxer in a worker."""
 
 import argparse
+import json
 import os
-import sys
 import tempfile
 import threading
 import time
@@ -10,16 +10,6 @@ from pathlib import Path
 
 
 ARTIFACTS = ("result_colored.ply", "rooms.json", "summary.json")
-
-
-def project_path():
-    location = os.environ.get("BOXER_PF_PROJECT")
-    if not location:
-        raise ValueError("Set BOXER_PF_PROJECT to the room_instance_seg checkout")
-    project = Path(location).expanduser().resolve()
-    if not (project / "backend" / "segmentation.py").is_file():
-        raise ValueError(f"BOXER_PF_PROJECT is not a room_instance_seg checkout: {project}")
-    return project
 
 
 def _watch_owner():
@@ -39,40 +29,42 @@ def _watch_owner():
 
 
 def run(input_path, output_dir, options):
+    from utils.potential_field_runtime.config import (
+        PotentialFieldConfig,
+        load_potential_field_config,
+    )
+    from utils.potential_field_runtime.engine import segment
+    from utils.potential_field_runtime.pointcloud import read_cloud, save_colored_ply
+
     source = Path(input_path).resolve(strict=True)
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
     if any((destination / name).exists() for name in ARTIFACTS):
         raise ValueError("Output directory already contains potential-field results")
 
-    sys.path.insert(0, str(project_path()))
-    try:
-        from backend.pointcloud import import_scene
-        from backend.segmentation import create_run, execute_run
-    finally:
-        sys.path.pop(0)
+    config = load_potential_field_config()
+    params = PotentialFieldConfig.model_validate({**config, **options}).model_dump()
+    xyz, normals = read_cloud(source)
+    print(f"输入 {source.name}：{len(xyz):,} 个有效点；Z-up，单位米", flush=True)
+    print("参数 " + json.dumps(params, ensure_ascii=False), flush=True)
+    labels, rooms, summary, normals = segment(xyz, normals, params)
+    summary["parameters"] = params
 
-    with tempfile.TemporaryDirectory(prefix=".roomseg-", dir=destination) as scratch:
-        root = Path(scratch)
-        scene = import_scene(
-            root, source, up="z", scale=1.0, preview_points=100, copy_source=False
-        )
-        job = create_run(root, scene["id"], options, algorithm="potential_field")
-        result = execute_run(root, job["id"])
-        if result["status"] != "succeeded":
-            raise RuntimeError(result.get("error") or f"Potential field {result['status']}")
-
-        artifacts = root / "runs" / job["id"]
-        for name in ARTIFACTS:
-            if not (artifacts / name).is_file():
-                raise RuntimeError(f"Potential field did not produce {name}")
+    with tempfile.TemporaryDirectory(prefix=".potential-field-", dir=destination) as scratch:
+        artifacts = Path(scratch)
+        save_colored_ply(artifacts / "result_colored.ply", xyz, labels, normals)
+        for name, value in (("rooms.json", rooms), ("summary.json", summary)):
+            (artifacts / name).write_text(
+                json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
         for name in ARTIFACTS:
             os.replace(artifacts / name, destination / name)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Run room_instance_seg on a +Z, metre-scale point cloud."
+        description="Segment a +Z, metre-scale point cloud with the bundled potential field."
     )
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -87,7 +79,9 @@ def main(argv=None):
     try:
         _watch_owner()
         run(source, destination, args)
-    except (ImportError, OSError, RuntimeError, ValueError) as error:
+    except ImportError as error:
+        parser.exit(1, f"Potential field: {error}. Install requirements-potential-field.txt.\n")
+    except (OSError, RuntimeError, ValueError) as error:
         parser.exit(1, f"Potential field: {error}\n")
 
 

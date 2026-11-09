@@ -114,21 +114,15 @@ class PotentialFieldJobs:
     def _worker_command(self):
         if self.command is not None:
             return self.command
-        try:
-            from potential_field import project_path
-
-            project_path()
-            python = Path(os.environ.get("BOXER_PF_PYTHON") or sys.executable)
-            if (
-                not python.is_absolute()
-                or not python.is_file()
-                or not os.access(python, os.X_OK)
-            ):
-                raise ValueError("BOXER_PF_PYTHON must be an absolute executable path")
-        except (ImportError, OSError, RuntimeError, ValueError) as error:
+        python = Path(os.environ.get("BOXER_PF_PYTHON") or sys.executable)
+        if (
+            not python.is_absolute()
+            or not python.is_file()
+            or not os.access(python, os.X_OK)
+        ):
             raise HTTPException(
-                503, f"Potential-field worker unavailable: {error}"
-            ) from error
+                503, "BOXER_PF_PYTHON must be an absolute executable path"
+            )
         return (str(python), "-u", "-m", "potential_field")
 
     def _save(self, job):

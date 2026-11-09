@@ -1296,33 +1296,33 @@ OpenAPI 为各业务路由统一声明了上述错误模型，不表示每个路
 ## 13. 势场法房间分割
 
 势场法使用已注册地图目录里的完整 `global_map.pcd`，坐标为米制、Z 轴向上。
-任务在独立 CPU 进程运行，调用 `room_instance_seg` 的现有势场法入口。
+算法源码、启动入口和默认 YAML 随本仓库部署。每个任务在独立 CPU 进程运行。
+源码位于 [`utils/potential_field_runtime/`](../utils/potential_field_runtime/)，
+启动入口为 [`potential_field.py`](../potential_field.py)。
 
 ### Ubuntu 配置
 
-在启动 Boxer 服务前设置下面两个环境变量。路径按实际部署调整。
+在 Boxer 仓库根目录，用已有 Boxer Python 环境安装势场法依赖。以下以 `.venv` 为例。
 
 ```bash
-export BOXER_PF_PROJECT=/home/wck/project/room_instance_seg
-export BOXER_PF_PYTHON=/home/wck/miniconda3/envs/3dseg/bin/python
+.venv/bin/python -m pip install -r requirements-potential-field.txt
 ```
 
-`BOXER_PF_PROJECT` 指向已有的房间分割源码目录。`BOXER_PF_PYTHON` 指向安装了
-该项目依赖的 Python，省略时使用 Boxer 的 Python。可用下面的命令先验证算法入口。
+先用一份实际点云验证算法入口，将 `--input` 换成服务器上的点云文件。
 
 ```bash
-"$BOXER_PF_PYTHON" -m potential_field \
+.venv/bin/python -m potential_field \
   --input /path/to/map/global_map.pcd \
   --output-dir "$(mktemp -d)"
 ```
 
-容器部署时，使用容器内可见的源码路径与 Python。Python 环境需要 NumPy、SciPy、
-scikit-learn、Pillow、plyfile 和 PyYAML 等 `room_instance_seg` 依赖。
+服务默认用自身的 Python 启动势场工作进程。已有专用 Python 环境时，可将
+`BOXER_PF_PYTHON` 设为对应的解释器绝对路径。Docker 镜像构建时安装运行依赖。
 
-使用已支持 YAML 配置的 `room_instance_seg` 时，Boxer 与原网页共用
-`$BOXER_PF_PROJECT/config/potential_field.yaml`。如果设置了 `ROOMSEG_PF_CONFIG`，
-两者读取指定的 YAML。调整 `max_grid_voxels`、`max_stacks` 或其他默认值后，
-新势场任务会读取最新配置。容器内的配置路径需要对推理进程可读。
+默认配置是 Boxer 仓库中的 [`config/potential_field.yaml`](../config/potential_field.yaml)。
+修改 `max_grid_voxels`、`max_stacks` 或其他默认值后，新任务会读取最新内容。
+Compose 将仓库的 `config/` 挂载到容器内，保存 YAML 后即可提交新任务。需要部署在其他位置时，
+可将 `BOXER_PF_CONFIG` 指向自定义 YAML。
 
 ### 提交任务和获取结果
 
@@ -1347,13 +1347,14 @@ curl --fail-with-body -sS -X POST http://127.0.0.1:18765/api/potential-field/job
 | `GET` | `/api/potential-field/jobs/{id}/log` | 读取日志尾部 |
 | `GET` | `/api/potential-field/jobs/{id}/artifacts/{filename}` | 获取已完成任务的结果文件 |
 
-同一时刻可运行一个势场任务。重复提交会返回 `409`。运行环境未配置时返回 `503`。
+同一时刻可运行一个势场任务。任务运行期间再次提交会返回 `409`。
+指定的 `BOXER_PF_PYTHON` 路径无效时返回 `503`。
 轮询任务状态，`complete` 时按 `artifacts` 中的地址获取文件。遇到 `failed` 或
 `interrupted` 时，通过日志接口查看原因。
 
 - `result_colored.ply` 包含完整有效点的坐标、颜色和整数 `label`。`-1` 表示未分配。
 - `rooms.json` 包含房间 `id`、颜色、点数及包围盒。`id` 对应 PLY 的 `label`。
-- `summary.json` 包含房间数、点数、标签覆盖率和各阶段耗时。
+- `summary.json` 包含房间数、点数、标签覆盖率、各阶段耗时和实际参数 `parameters`。
 
 PLY 保留有效输入点的顺序。前端可以直接加载它来着色和选择房间。
 

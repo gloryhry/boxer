@@ -31,7 +31,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
     TMPDIR=/cache/tmp
 
 WORKDIR /app
-COPY requirements-server.txt requirements-docker.txt ./
+COPY requirements-server.txt requirements-docker.txt requirements-potential-field.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --index-url https://download.pytorch.org/whl/cu128 \
         'torch==2.10.0+cu128' \
@@ -39,6 +39,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && python -m pip check
 
 COPY server.py server_worker.py potential_field.py ./
+COPY config/potential_field.yaml ./config/
 COPY boxernet/ ./boxernet/
 COPY loaders/ ./loaders/
 COPY owl/ ./owl/

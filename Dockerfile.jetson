@@ -46,13 +46,14 @@ ENV PATH="/opt/venv/bin:$PATH" \
     TMPDIR=/cache/tmp
 
 WORKDIR /app
-COPY requirements-server.txt requirements-docker.txt ./
+COPY requirements-server.txt requirements-docker.txt requirements-potential-field.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install 'numpy==1.26.4' -r requirements-docker.txt \
         'torch @ https://pypi.jetson-ai-lab.io/jp6/cu126/+f/37d/7e156cfb4a646/torch-2.10.0-cp310-cp310-linux_aarch64.whl#sha256=37d7e156cfb4a646c4d7347597727db1529d184108f703324dfff1842cec094e' \
     && python -m pip check
 
 COPY server.py server_worker.py potential_field.py ./
+COPY config/potential_field.yaml ./config/
 COPY boxernet/ ./boxernet/
 COPY loaders/ ./loaders/
 COPY owl/ ./owl/
