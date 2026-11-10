@@ -38,8 +38,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && python -m pip install 'numpy==2.2.6' -r requirements-docker.txt \
     && python -m pip check
 
-COPY server.py server_worker.py potential_field.py ./
-COPY config/potential_field.yaml ./config/
+COPY server.py server_worker.py potential_field.py voxel_connectivity.py ./
+COPY config/potential_field.yaml config/voxel_connectivity.yaml ./config/
 COPY boxernet/ ./boxernet/
 COPY loaders/ ./loaders/
 COPY owl/ ./owl/

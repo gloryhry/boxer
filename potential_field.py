@@ -28,13 +28,26 @@ def _watch_owner():
     threading.Thread(target=watch, name="potential-field-owner", daemon=True).start()
 
 
+def _publish_artifacts(scratch, destination, xyz, labels, normals, rooms, summary):
+    from utils.potential_field_runtime.pointcloud import save_colored_ply
+
+    save_colored_ply(scratch / "result_colored.ply", xyz, labels, normals)
+    for name, value in (("rooms.json", rooms), ("summary.json", summary)):
+        (scratch / name).write_text(
+            json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+    for name in ARTIFACTS:
+        os.replace(scratch / name, destination / name)
+
+
 def run(input_path, output_dir, options):
     from utils.potential_field_runtime.config import (
         PotentialFieldConfig,
         load_potential_field_config,
     )
     from utils.potential_field_runtime.engine import segment
-    from utils.potential_field_runtime.pointcloud import read_cloud, save_colored_ply
+    from utils.potential_field_runtime.pointcloud import read_cloud
 
     source = Path(input_path).resolve(strict=True)
     destination = Path(output_dir).resolve()
@@ -51,15 +64,7 @@ def run(input_path, output_dir, options):
     summary["parameters"] = params
 
     with tempfile.TemporaryDirectory(prefix=".potential-field-", dir=destination) as scratch:
-        artifacts = Path(scratch)
-        save_colored_ply(artifacts / "result_colored.ply", xyz, labels, normals)
-        for name, value in (("rooms.json", rooms), ("summary.json", summary)):
-            (artifacts / name).write_text(
-                json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-                encoding="utf-8",
-            )
-        for name in ARTIFACTS:
-            os.replace(artifacts / name, destination / name)
+        _publish_artifacts(Path(scratch), destination, xyz, labels, normals, rooms, summary)
 
 
 def main(argv=None):

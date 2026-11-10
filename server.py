@@ -20,11 +20,10 @@ from starlette.requests import ClientDisconnect
 
 from loaders.xnav_loader import processing_frame_id
 from utils.potential_field_service import (
-    API_PATH as POTENTIAL_FIELD_JOBS_PATH,
-    ARTIFACTS as POTENTIAL_FIELD_ARTIFACTS,
-    PotentialFieldJobInfo,
-    PotentialFieldJobRequest,
+    LogInfo,
     PotentialFieldJobs,
+    VoxelConnectivityJobs,
+    install_room_segmentation_routes,
 )
 from utils.xnav_service import (
     REPO,
@@ -68,10 +67,6 @@ class HealthInfo(BaseModel):
     inference_error: str | None = None
 
 
-class LogInfo(BaseModel):
-    text: str
-
-
 ERRORS = {
     code: {"model": ErrorResponse}
     for code in (400, 404, 409, 413, 415, 422, 500, 503, 507)
@@ -86,11 +81,15 @@ def create_app(
     map_root="/nav_map",
     upload_limits=None,
     potential_field_jobs=None,
+    voxel_connectivity_jobs=None,
 ):
     manager = manager or JobManager(output_dir)
     uploads = UploadManager(map_root, manager, limits=upload_limits)
+    room_output = getattr(manager, "root", output_dir)
     if potential_field_jobs is None:
-        potential_field_jobs = PotentialFieldJobs(getattr(manager, "root", output_dir))
+        potential_field_jobs = PotentialFieldJobs(room_output)
+    if voxel_connectivity_jobs is None:
+        voxel_connectivity_jobs = VoxelConnectivityJobs(room_output)
     web_dir = Path(web_dir) if web_dir is not None else REPO / "web" / "dist"
 
     @asynccontextmanager
@@ -109,6 +108,7 @@ def create_app(
             while True:
                 await asyncio.to_thread(manager.poll)
                 await asyncio.to_thread(potential_field_jobs.poll)
+                await asyncio.to_thread(voxel_connectivity_jobs.poll)
                 await asyncio.sleep(0.3)
 
         task = asyncio.create_task(monitor())
@@ -123,8 +123,11 @@ def create_app(
                 try:
                     await asyncio.to_thread(potential_field_jobs.close)
                 finally:
-                    await asyncio.to_thread(uploads.close)
-                    await asyncio.to_thread(manager.close)
+                    try:
+                        await asyncio.to_thread(voxel_connectivity_jobs.close)
+                    finally:
+                        await asyncio.to_thread(uploads.close)
+                        await asyncio.to_thread(manager.close)
 
     app = FastAPI(
         title="Boxer x-nav API",
@@ -141,6 +144,7 @@ def create_app(
     app.state.manager = manager
     app.state.uploads = uploads
     app.state.potential_field_jobs = potential_field_jobs
+    app.state.voxel_connectivity_jobs = voxel_connectivity_jobs
     app.state.stopping = False
 
     @app.exception_handler(Interrupted)
@@ -315,62 +319,10 @@ def create_app(
         scene.scene()
         return binary(scene.cloud, request, "application/octet-stream")
 
-    @app.get(
-        POTENTIAL_FIELD_JOBS_PATH,
-        response_model=list[PotentialFieldJobInfo],
-        responses=ERRORS,
+    install_room_segmentation_routes(
+        app, manager, potential_field_jobs, voxel_connectivity_jobs,
+        errors=ERRORS, artifact_response=cloud_response,
     )
-    def list_potential_field_jobs():
-        return potential_field_jobs.list()
-
-    @app.post(
-        POTENTIAL_FIELD_JOBS_PATH,
-        response_model=PotentialFieldJobInfo,
-        status_code=202,
-        responses=ERRORS,
-    )
-    def start_potential_field_job(body: PotentialFieldJobRequest):
-        if app.state.stopping:
-            raise HTTPException(503, "Potential-field service is shutting down")
-        scene = manager.get_map(body.map_id)
-        scene.check_source()
-        return potential_field_jobs.start(body, scene.loader.root)
-
-    @app.get(
-        POTENTIAL_FIELD_JOBS_PATH + "/{job_id}",
-        response_model=PotentialFieldJobInfo,
-        responses=ERRORS,
-    )
-    def potential_field_job_info(job_id: str):
-        return potential_field_jobs.info(job_id)
-
-    @app.post(
-        POTENTIAL_FIELD_JOBS_PATH + "/{job_id}/stop",
-        response_model=PotentialFieldJobInfo,
-        status_code=202,
-        responses=ERRORS,
-    )
-    def stop_potential_field_job(job_id: str):
-        return potential_field_jobs.stop(job_id)
-
-    @app.get(
-        POTENTIAL_FIELD_JOBS_PATH + "/{job_id}/log",
-        response_model=LogInfo,
-        responses=ERRORS,
-    )
-    def potential_field_job_log(job_id: str):
-        return {"text": potential_field_jobs.log(job_id)}
-
-    @app.get(
-        POTENTIAL_FIELD_JOBS_PATH + "/{job_id}/artifacts/{filename}",
-        response_class=FileResponse,
-        responses={**ERRORS, **cloud_response},
-    )
-    def potential_field_job_artifact(job_id: str, filename: str):
-        path = potential_field_jobs.artifact(job_id, filename)
-        return FileResponse(
-            path, filename=filename, media_type=POTENTIAL_FIELD_ARTIFACTS[filename]
-        )
 
     @app.get("/api/jobs", response_model=list[JobInfo], responses=ERRORS)
     def list_jobs():
