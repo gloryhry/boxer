@@ -19,6 +19,12 @@ from pydantic import BaseModel
 from starlette.requests import ClientDisconnect
 
 from loaders.xnav_loader import processing_frame_id
+from utils.potential_field_service import (
+    LogInfo,
+    PotentialFieldJobs,
+    VoxelConnectivityJobs,
+    install_room_segmentation_routes,
+)
 from utils.xnav_service import (
     REPO,
     Box2DPage,
@@ -61,10 +67,6 @@ class HealthInfo(BaseModel):
     inference_error: str | None = None
 
 
-class LogInfo(BaseModel):
-    text: str
-
-
 ERRORS = {
     code: {"model": ErrorResponse}
     for code in (400, 404, 409, 413, 415, 422, 500, 503, 507)
@@ -78,9 +80,16 @@ def create_app(
     web_dir=None,
     map_root="/nav_map",
     upload_limits=None,
+    potential_field_jobs=None,
+    voxel_connectivity_jobs=None,
 ):
     manager = manager or JobManager(output_dir)
     uploads = UploadManager(map_root, manager, limits=upload_limits)
+    room_output = getattr(manager, "root", output_dir)
+    if potential_field_jobs is None:
+        potential_field_jobs = PotentialFieldJobs(room_output)
+    if voxel_connectivity_jobs is None:
+        voxel_connectivity_jobs = VoxelConnectivityJobs(room_output)
     web_dir = Path(web_dir) if web_dir is not None else REPO / "web" / "dist"
 
     @asynccontextmanager
@@ -98,6 +107,8 @@ def create_app(
         async def monitor():
             while True:
                 await asyncio.to_thread(manager.poll)
+                await asyncio.to_thread(potential_field_jobs.poll)
+                await asyncio.to_thread(voxel_connectivity_jobs.poll)
                 await asyncio.sleep(0.3)
 
         task = asyncio.create_task(monitor())
@@ -105,10 +116,18 @@ def create_app(
             yield
         finally:
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-            await asyncio.to_thread(uploads.close)
-            await asyncio.to_thread(manager.close)
+            try:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            finally:
+                try:
+                    await asyncio.to_thread(potential_field_jobs.close)
+                finally:
+                    try:
+                        await asyncio.to_thread(voxel_connectivity_jobs.close)
+                    finally:
+                        await asyncio.to_thread(uploads.close)
+                        await asyncio.to_thread(manager.close)
 
     app = FastAPI(
         title="Boxer x-nav API",
@@ -124,6 +143,8 @@ def create_app(
     )
     app.state.manager = manager
     app.state.uploads = uploads
+    app.state.potential_field_jobs = potential_field_jobs
+    app.state.voxel_connectivity_jobs = voxel_connectivity_jobs
     app.state.stopping = False
 
     @app.exception_handler(Interrupted)
@@ -297,6 +318,11 @@ def create_app(
         scene = manager.get_map(map_id)
         scene.scene()
         return binary(scene.cloud, request, "application/octet-stream")
+
+    install_room_segmentation_routes(
+        app, manager, potential_field_jobs, voxel_connectivity_jobs,
+        errors=ERRORS, artifact_response=cloud_response,
+    )
 
     @app.get("/api/jobs", response_model=list[JobInfo], responses=ERRORS)
     def list_jobs():

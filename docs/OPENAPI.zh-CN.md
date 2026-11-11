@@ -1,8 +1,15 @@
 # Boxer x-nav OpenAPI 详细使用文档
 
-本文介绍项目 `server.py` 提供的 HTTP API，适用于第三方程序接入、批量推理控制和结果回放。接口支持服务器本地地图注册和 ZIP 地图包分块上传，调用常驻 OWLv2 / BoxerNet 模型，并提供任务进度、逐帧检测、跟踪、图像和点云。
+本文覆盖 `server.py` 的地图注册与上传、Boxer 物体检测与回放、房间分割和任务输出文件。
 
-文档核对日期：2026-11-04；API 版本：`1.1.0`；OpenAPI 版本：`3.1.0`。内容依据当前工作树中的路由、请求模型和服务实现整理。部署版本的字段与约束可通过该服务的 `/openapi.json` 核对。
+核对日期为 2026-11-10，服务 API 版本为 `1.1.0`。部署版本的字段与约束可通过 `/openapi.json` 核对。
+
+| 用途 | 提交入口 | 结果入口 |
+| --- | --- | --- |
+| 注册或上传 x-nav 地图 | `POST /api/maps` 或 `POST /api/maps/uploads` | 地图 `id`、场景元数据、预览点云 |
+| Boxer 物体检测与跟踪 | `POST /api/jobs` | 逐帧回放、检测框 JSON、`3dbbox.zip` |
+| 势场法房间分割 | `POST /api/potential-field/jobs` | 带房间标签的 PLY、房间列表和统计 JSON |
+| 体素连通复核 | `POST /api/voxel-connectivity/jobs` | 带房间标签的 PLY、房间列表和统计 JSON |
 
 ## 目录
 
@@ -18,7 +25,9 @@
 - [10. 客户端接入示例](#10-客户端接入示例)
 - [11. 文件输出与历史恢复](#11-文件输出与历史恢复)
 - [12. 错误处理与排查](#12-错误处理与排查)
-- [13. 实现位置与维护](#13-实现位置与维护)
+- [13. 势场法房间分割](#13-势场法房间分割)
+- [14. 体素连通复核](#14-体素连通复核)
+- [15. 实现位置与维护](#15-实现位置与维护)
 
 ## 1. 服务入口与部署
 
@@ -37,11 +46,9 @@
 
 ### 1.2 本地启动
 
-在实际 Git 仓库根目录执行；当前工作区的仓库位于 `/home/glory/Code/boxer/boxer`。
+在 Boxer Git 仓库根目录执行。
 
 ```bash
-cd /home/glory/Code/boxer/boxer
-
 # 在已有 Boxer 环境中补充 HTTP 服务依赖。
 uv pip install --python .venv/bin/python -r requirements-server.txt
 
@@ -73,7 +80,7 @@ npm --prefix web run build
   --output_dir /path/to/server-output
 ```
 
-HTTP 启动时会异步预加载默认模型及 `indoor` 词表。HTTP 可访问和模型加载完成是两个状态；创建推理任务前应查询 `/api/inference`，等待 `status` 为 `ready`。
+HTTP 启动时会异步预加载默认 Boxer 模型及 `indoor` 词表。提交物体检测任务前，应查询 `/api/inference` 并等待 `status` 为 `ready`。势场法通过[独立任务接口](#13-势场法房间分割)运行，任务状态以该接口为准。
 
 ### 1.3 Docker 部署与路径映射
 
@@ -88,7 +95,7 @@ API 中的 `path`、`results_path`、`ckpt` 都是**服务进程可见的文件�
 | `/vocab` | 自定义词表挂载点，容器设置 `BOXER_LABELS_DIR=/vocab` |
 | `/app/output/server` | 默认服务输出目录 |
 
-`GET /api/maps/directories` 默认查找 `/nav_map`，`POST /api/maps` 也接受其他服务可读的完整路径。命令行没有 `--map_root` 选项；嵌入 Python 应用时可通过 `create_app(map_root=...)` 自定义发现根目录。
+`GET /api/maps/directories` 默认查找 `/nav_map`。原生部署可用 `server.py --map_root /path/to/maps` 指定发现根目录，嵌入 Python 应用时可用 `create_app(map_root=...)`。`POST /api/maps` 也接受其他服务可读的完整路径。
 
 ## 2. 通用约定
 
@@ -121,7 +128,7 @@ API 中的 `path`、`results_path`、`ckpt` 都是**服务进程可见的文件�
 
 ### 2.3 并发和异步行为
 
-同一服务只接受一个活动推理任务，没有任务排队机制。模型与已应用参数由所有客户端共享，历史回放可以同时读取。
+Boxer 物体检测最多运行一个活动任务。势场法和体素连通复核共享一个独立的 CPU 分割任务槽。分割任务运行或停止期间，两个分割入口均拒绝新的分割提交。物体检测的模型与已应用参数由所有客户端共享，历史回放可以同时读取。
 
 `PUT /api/inference`、`POST /api/jobs`、停止任务接口的正常响应码为 `202`，表示请求已受理；最终状态需要继续查询。地图注册和结果导入正常返回 `200`。
 
@@ -197,7 +204,7 @@ curl --fail-with-body -sS \
 
 ## 4. 接口总览
 
-下表列出全部 30 个业务 API 操作。成功状态码指正常受理或读取时的状态。
+下表列出全部 36 个业务 API 操作，包含 30 个原有操作和 6 个势场操作。成功状态码指正常受理或读取时的状态。
 
 | 方法 | 路径 | 成功码 | 用途 |
 | --- | --- | --- | --- |
@@ -231,6 +238,18 @@ curl --fail-with-body -sS \
 | `GET` | `/api/jobs/{job_id}/3dbbox_tracks` | `200` | 分页获取各已提交帧的确认跟踪框 |
 | `GET` | `/api/jobs/{job_id}/3dbbox` | `200` | 分页获取各已提交帧融合后的 3D 检测 |
 | `GET` | `/api/jobs/{job_id}/owl_2dbbox` | `200` | 分页获取各已提交帧、相机和视图的 OWL 2D 检测 |
+| `GET` | `/api/potential-field/jobs` | `200` | 查询势场任务列表 |
+| `POST` | `/api/potential-field/jobs` | `202` | 对注册地图提交势场任务 |
+| `GET` | `/api/potential-field/jobs/{job_id}` | `200` | 查询势场任务状态及下载地址 |
+| `POST` | `/api/potential-field/jobs/{job_id}/stop` | `202` | 请求停止势场任务 |
+| `GET` | `/api/potential-field/jobs/{job_id}/log` | `200` | 读取势场任务日志尾部 |
+| `GET` | `/api/potential-field/jobs/{job_id}/artifacts/{filename}` | `200` | 下载势场任务的 PLY 或 JSON 文件 |
+| `GET` | `/api/voxel-connectivity/jobs` | `200` | 查询体素连通复核任务列表 |
+| `POST` | `/api/voxel-connectivity/jobs` | `202` | 对注册地图提交体素连通复核任务 |
+| `GET` | `/api/voxel-connectivity/jobs/{job_id}` | `200` | 查询体素连通复核任务状态和下载地址 |
+| `POST` | `/api/voxel-connectivity/jobs/{job_id}/stop` | `202` | 请求停止体素连通复核任务 |
+| `GET` | `/api/voxel-connectivity/jobs/{job_id}/log` | `200` | 读取体素连通复核任务日志尾部 |
+| `GET` | `/api/voxel-connectivity/jobs/{job_id}/artifacts/{filename}` | `200` | 下载体素连通复核的 PLY 或 JSON 文件 |
 
 `/docs`、`/openapi.json`、`/` 和静态资源地址不计入业务操作数。
 
@@ -1142,31 +1161,50 @@ async function readCloud(url) {
 
 ### 11.1 输出目录
 
-默认服务根目录为仓库 `output/server/`，结构如下：
+默认服务根目录为仓库 `output/server/`。原生部署可通过 `--output_dir` 修改。Docker 下该目录对应容器的 `/app/output/server`，宿主机位置由 Compose 的 `OUTPUT_DIR` 决定。
 
 ```text
 output/server/
 ├── worker.log
 ├── maps/
 │   └── <服务地图ID>.json
-└── jobs/
-    └── <任务ID>/
-        ├── job.json
-        ├── inference.log
-        ├── 3dbbox.zip
-        └── output/
-            └── <地图清单map_id>/
-                └── <snapshot_id>/
-                    └── <native或virtual_pinhole>/
-                        ├── results.json
-                        ├── owl_2dbbs.csv
-                        ├── boxer_3dbbs.csv
-                        ├── boxer_3dbbs_tracks.csv
-                        ├── boxer_3dbbs_tracked.csv
-                        └── performance.json
+├── jobs/
+│   └── <Boxer任务ID>/
+│       ├── job.json
+│       ├── inference.log
+│       ├── 3dbbox.zip
+│       └── output/<地图清单map_id>/<snapshot_id>/<相机模式>/
+│           ├── results.json
+│           ├── results.<运行标识>.metadata.json
+│           ├── results.<运行标识>.frames.jsonl
+│           ├── owl_2dbbs.csv
+│           ├── boxer_3dbbs.csv
+│           ├── boxer_3dbbs_tracks.csv
+│           ├── boxer_3dbbs_tracked.csv
+│           └── performance.json
+└── potential_field/jobs/<势场任务ID>/
+    ├── job.json
+    ├── inference.log
+    └── output/
+        ├── result_colored.ply
+        ├── rooms.json
+        └── summary.json
 ```
 
-CSV 和新任务的 `3dbbox.zip` 取决于 `no_csv`；ZIP 仅在成功收尾时发布，历史任务不补生成。`performance.json` 取决于 `profile`。始终以任务返回的 `results_path` 为实际结果位置，不要仅凭服务 ID 拼接源地图清单 ID。
+Boxer 任务的实际结果路径以 `JobInfo.results_path` 为准。`map_id` 在路径树中指源地图清单的业务 ID。势场任务使用独立的目录与下载接口，见[第 13 节](#13-势场法房间分割)。
+
+| Boxer 文件 | 内容与生成条件 |
+| --- | --- |
+| `worker.log` | 常驻物体检测进程的模型加载、配置和预热日志 |
+| `maps/<地图ID>.json` | 已注册地图的服务端记录 |
+| `job.json`、`inference.log` | 单个任务的状态记录、参数和运行日志。HTTP 客户端通过任务详情和日志接口读取 |
+| `results.json` | 任务元数据、逐帧观测、融合检测、跟踪与最终物体。运行期间使用 schema 3，成功收尾后使用独立的 schema 2 文件 |
+| `results.<运行标识>.metadata.json`、`results.<运行标识>.frames.jsonl` | schema 3 描述文件引用的静态元数据和逐帧提交日志。复制未完成的结果时一并保留 |
+| 四份检测和跟踪 CSV | `no_csv=false` 时生成。字段见[第 8.7 节](#87-检测框-json-查询)，发布到源地图的条件见[第 11.3 节](#113-写入源地图-3dbbox) |
+| `performance.json` | 启用 `profile` 后生成的性能统计 |
+| `3dbbox.zip` | 成功收尾时保存的源地图 `3dbbox/` 快照，条件和下载方式见[第 7.8 节](#78-get-apijobsjob_id3dbboxzip) |
+
+JPEG 叠加图和可视化点云由服务按请求生成，客户端按[第 8 节](#8-帧数据检测框图像与点云接口)读取。
 
 成功推理还会在地图包内原子保存 `3dbbox/labels.csv`，表头为 `sem_id,label`，UTF-8 编码。
 完整词表取自实际解析/加载的 `parameters.labels`，按原始顺序从 0 编号，包含未检测出的类别，
@@ -1215,11 +1253,15 @@ DINOv3 特征默认合并到地图包的 `3dbbox/dino_features.csv`，每张有�
 | `boxer_3dbbs.csv` | 各处理帧融合后的 3D 检测 |
 | `owl_2dbbs.csv` | 各相机/视图的 2D 检测 |
 
+3D CSV 的平移和边长为米，四元数按 `wxyz` 保存。最终全局物体的 `time_ns` 固定为 `0`，逐帧 3D 记录使用处理帧位姿时间。2D CSV 使用原始图像时间，框坐标对应预处理视图的像素。表头与检测框查询字段对应，CSV 的数值和类别文本可能经过格式化。
+
 服务先暂存四份文件，再逐个原子替换，任务目录保留原件。这是逐文件发布，不是四个文件整体的事务；同步读取多个文件时，应在任务 `complete` 后读取。
 
 地图 CSV 导出后，服务保存该任务的 `3dbbox.zip` 快照，ZIP 原子发布后才标记任务 `complete`。缺少所需 CSV、地图目录不可写或 ZIP 归档失败时，任务显示 `failed`，即使推理结果自身已经完整。此时可继续从任务目录或帧接口读取已提交结果，并查看 `error` 中的导出或归档失败原因。
 
 `no_csv=true`、推理失败、中断或导入历史结果时不执行 CSV 地图导出；已逐帧保存的 DINOv3 特征会保留。无检测或关闭跟踪时，相关 CSV 仍可只有表头。新增的 `3dbbox/` 不计入地图来源签名。
+
+同一地图反复处理时，`no_csv=true` 会保留以前的检测 CSV，而词表和 DINOv3 特征仍可能更新。需要交付某次成功任务的地图产物时，使用该任务的 `3dbbox.zip`。
 
 ### 11.4 重启与恢复
 
@@ -1293,7 +1335,150 @@ OpenAPI 为各业务路由统一声明了上述错误模型，不表示每个路
 | 任务完成后 SSE 仍保持连接 | 收到结束状态后调用 `EventSource.close()` 或关闭流式请求 |
 | 重启后任务未继续或参数变回默认 | 这是当前恢复行为；重新应用配置并创建新任务 |
 
-## 13. 实现位置与维护
+## 13. 势场法房间分割
+
+势场法使用已注册地图目录里的完整 `global_map.pcd`，坐标为米制、Z 轴向上。
+算法源码、启动入口和默认 YAML 随本仓库部署。每个任务在独立 CPU 进程运行。
+源码位于 [`utils/potential_field_runtime/`](../utils/potential_field_runtime/)，
+启动入口为 [`potential_field.py`](../potential_field.py)。
+
+### Ubuntu 配置
+
+在 Boxer 仓库根目录，用已有 Boxer Python 环境安装势场法依赖。以下以 `.venv` 为例。
+
+```bash
+.venv/bin/python -m pip install -r requirements-potential-field.txt
+```
+
+先用一份实际点云验证算法入口，将 `--input` 换成服务器上的点云文件。
+
+```bash
+.venv/bin/python -m potential_field \
+  --input /path/to/map/global_map.pcd \
+  --output-dir "$(mktemp -d)"
+```
+
+服务默认用自身的 Python 启动势场工作进程。已有专用 Python 环境时，可将
+`BOXER_PF_PYTHON` 设为对应的解释器绝对路径。Docker 镜像构建时安装运行依赖。
+
+Docker 服务已运行时，也可直接在容器内试跑已挂载的点云。
+
+```bash
+docker compose -f docker-compose.x86.yaml exec -T server python -m potential_field \
+  --input /nav_map/demo/global_map.pcd \
+  --output-dir "/app/output/server/pf-smoke-$(date +%s)"
+```
+
+默认配置是 Boxer 仓库中的 [`config/potential_field.yaml`](../config/potential_field.yaml)。
+修改 `max_grid_voxels`、`max_stacks` 或其他默认值后，新任务会读取最新内容。
+Compose 将仓库的 `config/` 挂载到容器内，保存 YAML 后即可提交新任务。需要部署在其他位置时，
+可将 `BOXER_PF_CONFIG` 指向自定义 YAML。
+
+### 提交任务和获取结果
+
+先用 [地图注册接口](#62-post-apimaps) 注册完整的 x-nav 地图包，将返回的 `id` 作为 `map_id`。Docker 下地图路径使用 `/nav_map/…`。地图包需要包含 `global_map.pcd`。手头只有 PCD 或 PLY 时，可用本节的命令行入口直接读取点云文件。
+
+```bash
+API_BASE=http://127.0.0.1:18765
+MAP_ID=替换成地图注册返回的id
+
+curl --fail-with-body -sS -X POST "$API_BASE/api/potential-field/jobs" \
+  -H 'Content-Type: application/json' \
+  -d "{\"map_id\":\"$MAP_ID\",\"options\":{\"voxel\":0.2}}"
+```
+
+`options` 可省略。请求中显式提供的字段覆盖 YAML 默认值。表中的默认值对应仓库自带配置。
+
+| `options` 字段 | 单位与范围 | 默认值 | 含义 |
+| --- | --- | --- | --- |
+| `voxel` | 米，`0.02–5` | `0.2` | 体素边长 |
+| `min_room_points` | 整数点数，`0–100000000` | `0` | 回投后少于此点数的房间，其点标签记为 `-1`。`0` 关闭筛选 |
+| `min_room_area` | 平方米，`0–1000000` | `2.0` | 最小平面面积。`0` 关闭面积筛选 |
+| `merge_opening` | 米，`0–10` | `1.6` | 宽开口合并所需的最小有效宽度。`0` 关闭宽开口合并 |
+| `max_projection_distance` | 米，`0–10` | `0.8` | 补点标签的最大三维体素距离。`0` 取消距离上限 |
+
+`vis_targets`、`ceiling_aware`、`max_grid_voxels` 和 `max_stacks` 通过 YAML 设置。任务执行时的有效参数写入 `summary.json` 的 `parameters`。
+
+| 方法 | 路径 | 成功码 | 返回内容 |
+| --- | --- | --- | --- |
+| `POST` | `/api/potential-field/jobs` | `202` | 已受理任务的详情和 `id` |
+| `GET` | `/api/potential-field/jobs` | `200` | 任务数组，按创建时间倒序，暂无任务时为 `[]` |
+| `GET` | `/api/potential-field/jobs/{job_id}` | `200` | 单个任务的最新状态 |
+| `POST` | `/api/potential-field/jobs/{job_id}/stop` | `202` | 请求停止后的任务状态。任务停止后为 `interrupted` |
+| `GET` | `/api/potential-field/jobs/{job_id}/log` | `200` | `{"text":"…"}`，包含最近最多 64 KiB 的日志 |
+| `GET` | `/api/potential-field/jobs/{job_id}/artifacts/{filename}` | `200` | 已完成任务的文件下载。PLY 为 `application/octet-stream`，两个 JSON 文件为 `application/json` |
+
+任务详情包含 `id`、`map_id`、`status`、`options`、`created_at`、`finished_at`、`error` 和 `artifacts`。`options` 只记录该次请求覆盖的字段。时间使用 UTC ISO 8601 字符串。`finished_at`、`error` 可为 `null`。
+
+`running` 和 `stopping` 是中间状态。`complete`、`failed` 和 `interrupted` 是终态。服务重启后，之前的活动任务会标记为 `interrupted`。任务 `complete` 后，`artifacts` 给出按文件名索引的服务相对 URL。房间数和标签覆盖率通过 `summary.json` 读取，任务完成时房间数可以为 `0`。
+
+地图或任务不存在、注册地图缺少 `global_map.pcd`、产物尚未发布或文件名不支持时返回 `404`。已有活动房间分割任务时提交返回 `409`。参数校验失败返回 `422`，指定的 `BOXER_PF_PYTHON` 路径无效时返回 `503`。进程启动后的推理失败记录在任务的 `error` 和日志里。
+
+```bash
+PF_JOB_ID=替换成势场提交返回的id
+PF_JOB_URL="$API_BASE/api/potential-field/jobs/$PF_JOB_ID"
+
+curl --fail-with-body -sS "$PF_JOB_URL" | python3 -m json.tool
+# status 为 complete 后下载
+curl --fail-with-body -sS "$PF_JOB_URL/artifacts/result_colored.ply" -o result_colored.ply
+curl --fail-with-body -sS "$PF_JOB_URL/artifacts/rooms.json" -o rooms.json
+curl --fail-with-body -sS "$PF_JOB_URL/artifacts/summary.json" -o summary.json
+# 任务失败时查看日志
+curl --fail-with-body -sS "$PF_JOB_URL/log" | python3 -m json.tool
+```
+
+### 势场输出文件与字段
+
+| 文件 | 格式和用途 |
+| --- | --- |
+| `result_colored.ply` | 二进制 PLY。每个 `vertex` 包含 float32 `x,y,z,nx,ny,nz`、uint8 `red,green,blue` 和 int32 `label`。坐标为米制、`+Z` 向上，颜色按房间 ID 生成。`label=-1` 表示未分配 |
+| `rooms.json` | 房间对象数组。`id` 对应 PLY 的 `label`，`name` 为显示名称，`point_count` 为房间内点数，`color` 为三通道 RGB。`bounds` 是 `[[xmin,ymin,zmin],[xmax,ymax,zmax]]`，`center` 是房间点质心，坐标均为米。`confidence` 和 `area_m2` 当前为 `null` |
+| `summary.json` | 任务统计对象。`room_count` 是保留房间数，`raw_room_count` 是按点数筛选前的房间数，`point_count` 是有效输入点数。`unassigned_count` 是未分配点数，`assigned_ratio` 为 `0–1` 的比例。`filtered_room_count`、`point_count_filtered_count` 记录点数筛选影响，`parameters` 保存实际参数。另含分阶段耗时、峰值内存及势场诊断 |
+| `job.json`、`inference.log` | 服务端的任务详情和运行日志，通过任务详情和日志接口读取 |
+
+前端可直接解析 PLY 的 `label` 属性并按 `rooms.json` 的 `id` 查找房间信息。房间 ID 在单次任务内使用，筛选后可能不连续。PLY 保留有效输入点的顺序，跳过 XYZ 非有限值。`/api/maps/{map_id}/cloud` 使用独立抽样的地图预览，点序应从各自文件读取。
+
+服务将三个结果文件发布到 `<output_dir>/potential_field/jobs/<job_id>/output/`。`job.json` 和 `inference.log` 位于该任务目录。命令行直接运行时，三个结果文件写入 `--output-dir`。
+
+`summary.json` 的 `inference_seconds`、`total_seconds` 和 `stages[].seconds` 以秒计，`peak_memory_mb` 和 `stages[].peak_memory_mb` 是进程峰值内存，单位 MiB。`inference_seconds` 统计分割核心，`total_seconds` 另含法向量准备和房间汇总。`refinement`、`vertical_sampling` 和 `distance_computation` 提供空间清理、高度采样和聚类距离计算的诊断。
+
+## 14. 体素连通复核
+
+体素连通复核读取注册地图中的全量 `global_map.pcd`，坐标为米制、`+Z` 向上。它先做二维初分割，再复核门洞与边界，最后将房间标签回投到原始点云。Boxer 内置 Room Atlas 的 `voxel-connectivity-v8`。 [运行时来源](../utils/voxel_connectivity_runtime/README.md)
+
+| `options` 字段 | 单位与范围 | 默认值 | 含义 |
+| --- | --- | --- | --- |
+| `resolution` | 米/像素，`0.03–0.50` | `0.10` | 俯视二维地图的栅格边长。数值越小，网格越细，可能保留更多局部碎片 |
+| `min_room_points` | 整数点数，`0–100000000` | `0` | 回投后少于此点数的房间，其点标签设为 `-1`。`0` 关闭筛选 |
+
+请求中的参数覆盖 YAML 默认值。可以省略 `options`。保存 YAML 后，新任务会读取更新值。Compose 已挂载 `config/`，调整默认值时直接编辑宿主机文件。自定义配置路径可通过 `BOXER_VC_CONFIG` 指定，相对路径按 Boxer 仓库根目录解析。 [默认配置](../config/voxel_connectivity.yaml)
+
+```bash
+API_BASE=http://127.0.0.1:18765
+MAP_ID=替换成地图注册返回的id
+
+curl --fail-with-body -sS -X POST "$API_BASE/api/voxel-connectivity/jobs" \
+  -H 'Content-Type: application/json' \
+  -d "{\"map_id\":\"$MAP_ID\",\"options\":{\"resolution\":0.10,\"min_room_points\":20000}}"
+```
+
+查询、停止、读取日志和下载沿用第 13 节的任务状态和输出结构，入口前缀为 `/api/voxel-connectivity/jobs`。两种算法的历史和下载地址各自独立。体素连通复核的产物存放在 `<output_dir>/voxel_connectivity/jobs/<job_id>/output/`。
+
+- `result_colored.ply` 保留全部有效 XYZ 点的输入顺序。`label` 为 int32，`-1` 表示未分配。输入包含法向量时输出也保留对应字段。
+- `rooms.json` 按 `id` 对应 PLY 标签，包含 `point_count`、`bounds`、`center`、`color`，以及二维区域的 `area_m2` 和 `cell_count`。
+- `summary.json` 记录实际参数 `parameters`、`algorithm`、`method_version`、区域与点数统计、覆盖率和原生分割诊断 `diagnostics`。
+
+直接运行 PCD 或 PLY 文件时，使用 Boxer Python 环境安装 CPU 分割依赖。容器镜像包含这些依赖。服务选用解释器的顺序为 `BOXER_VC_PYTHON`、`BOXER_PF_PYTHON`、服务自身的 Python。
+
+```bash
+.venv/bin/python -m pip install -r requirements-potential-field.txt
+.venv/bin/python -m voxel_connectivity \
+  --input /path/to/map/global_map.pcd \
+  --output-dir "$(mktemp -d)" \
+  --resolution 0.10 --min-room-points 20000
+```
+
+## 15. 实现位置与维护
 
 文档主要依据以下项目文件；扩展接口或调整参数后，应同步更新本文并核对部署服务的 schema：
 
@@ -1308,6 +1493,9 @@ OpenAPI 为各业务路由统一声明了上述错误模型，不表示每个路
 | [utils/xnav_pipeline.py](../utils/xnav_pipeline.py) | 检测、融合、跟踪、结果读取和记录格式 |
 | [utils/xnav_result_store.py](../utils/xnav_result_store.py) | 结果提交日志及完整结果文件 |
 | [utils/xnav_export.py](../utils/xnav_export.py) | 完成后向源地图发布 CSV |
+| [utils/potential_field_service.py](../utils/potential_field_service.py) | CPU 分割任务、状态恢复、日志与产物发布 |
+| [potential_field.py](../potential_field.py) | 势场工作进程、命令行和产物写入 |
+| [voxel_connectivity.py](../voxel_connectivity.py) | 体素连通复核工作进程、配置与命令行 |
 | [utils/taxonomy.py](../utils/taxonomy.py) | 词表文件和文本提示解析 |
 | [owl/owl_wrapper.py](../owl/owl_wrapper.py) | 当前 OWLv2 输入预处理、精度和框输出约定 |
 
@@ -1318,4 +1506,4 @@ curl --fail-with-body -sS http://127.0.0.1:18765/openapi.json \
   -o boxer-openapi.json
 ```
 
-接口契约相关的现有回归位于 [tests/test_xnav_server.py](../tests/test_xnav_server.py) 和 [tests/test_xnav_map_directories.py](../tests/test_xnav_map_directories.py)。
+CPU 分割任务与产物的回归测试覆盖势场法和体素连通复核。 [势场法测试](../tests/test_potential_field_service.py) · [体素连通复核测试](../tests/test_voxel_connectivity_service.py)

@@ -31,7 +31,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
     TMPDIR=/cache/tmp
 
 WORKDIR /app
-COPY requirements-server.txt requirements-docker.txt ./
+COPY requirements-server.txt requirements-docker.txt requirements-potential-field.txt ./
 # 默认使用官方源；国内部署可 --build-arg 覆盖为镜像站，不改变镜像内容。
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 ARG PIP_INDEX_URL=https://pypi.org/simple
@@ -41,7 +41,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && python -m pip install --index-url "$PIP_INDEX_URL" 'numpy==2.2.6' -r requirements-docker.txt \
     && python -m pip check
 
-COPY server.py server_worker.py ./
+COPY server.py server_worker.py potential_field.py voxel_connectivity.py ./
+COPY config/potential_field.yaml config/voxel_connectivity.yaml ./config/
 COPY boxernet/ ./boxernet/
 COPY loaders/ ./loaders/
 COPY owl/ ./owl/

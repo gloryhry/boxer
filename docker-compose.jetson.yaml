@@ -44,6 +44,12 @@ services:
         bind:
           create_host_path: false
       - type: bind
+        source: ./config
+        target: /app/config
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
         source: ${OUTPUT_DIR:-./output/server}
         target: /app/output/server
       - cache:/cache

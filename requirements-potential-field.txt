@@ -1,0 +1,8 @@
+# CPU room segmentation dependencies, also included in both Docker images.
+numpy>=1.26,<3
+scipy>=1.11,<2
+scikit-learn>=1.3,<2
+plyfile>=1.1,<2
+Pillow>=10,<13
+PyYAML>=6.0.2,<7
+pydantic>=2.9,<3
