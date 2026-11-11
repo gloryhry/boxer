@@ -6,3 +6,4 @@ plyfile>=1.1,<2
 Pillow>=10,<13
 PyYAML>=6.0.2,<7
 pydantic>=2.9,<3
+shapely>=2,<3

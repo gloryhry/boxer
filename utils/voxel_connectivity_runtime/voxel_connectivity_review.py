@@ -101,10 +101,12 @@ def _height_rasters(working, normals, origin, resolution, shape):
     return horizontal.reshape(shape), vertical.reshape(shape), z_step
 
 
-def _floor_level(horizontal, vertical, axial, lateral, room_side):
+def _floor_level(horizontal, vertical, axial, lateral, room_side, z_step):
     """Find a locally repeated low horizontal level, with returns above it."""
-    flat = horizontal[axial, lateral][room_side]
-    upright = vertical[axial, lateral][room_side]
+    coordinates = np.broadcast_arrays(axial, lateral)
+    indices = np.unique(np.ravel_multi_index(tuple(coordinates), horizontal.shape)[room_side])
+    flat = horizontal.flat[indices]
+    upright = vertical.flat[indices]
     if len(flat) < 3:
         return None
     hits = ((flat[:, None] >> _HEIGHT_BINS) & 1) != 0
@@ -113,8 +115,18 @@ def _floor_level(horizontal, vertical, axial, lateral, room_side):
     top = int(totals).bit_length() - 1
     # Demand horizontal samples on several distinct room-side columns. A
     # neighboring-bin pair tolerates noise or a slightly uneven floor.
-    pairs = (hits[:, :-1] | hits[:, 1:]).sum(axis=0)
-    enough = np.flatnonzero(pairs >= max(3, math.ceil(.12 * len(flat)), .25 * pairs.max()))
+    repeated = hits[:, :-1] | hits[:, 1:]
+    levels = np.arange(63) + (counts[1:] > counts[:-1])
+    plausible = (top - levels) * z_step >= 1.60 - 1e-9
+    if not plausible.any():
+        return None
+    # Dense ceiling returns must not set the support required of a sparse
+    # floor. Count columns with a horizontal return below usable headroom.
+    repeated[:, ~plausible] = False
+    pairs = repeated.sum(axis=0)
+    supporting_columns = int(repeated.any(axis=1).sum())
+    minimum_support = max(3, math.ceil(.12 * supporting_columns), .25 * pairs.max())
+    enough = np.flatnonzero(plausible & (pairs >= minimum_support))
     if not len(enough):
         return None
     level = int(enough[0])
@@ -193,8 +205,8 @@ def _score_axis(rays, labels, observed, wall, doors, horizontal, vertical, step,
         columns = t[:, None]
         left_side = (labels[left, columns] == labels[a, t, None]) & (left == a[:, None] - offset)
         right_side = (labels[right, columns] == labels[b, t, None]) & (right == b[:, None] + offset)
-        floor_a = _floor_level(horizontal, vertical, left, columns, left_side)
-        floor_b = _floor_level(horizontal, vertical, right, columns, right_side)
+        floor_a = _floor_level(horizontal, vertical, left, columns, left_side, step)
+        floor_b = _floor_level(horizontal, vertical, right, columns, right_side, step)
         if floor_a is None or floor_b is None:
             continue
         level_a, top_a = floor_a
@@ -219,6 +231,13 @@ def _score_axis(rays, labels, observed, wall, doors, horizontal, vertical, step,
         observed_path = observed[path, columns].mean(axis=1) >= .75
         supported[take] = observed_path
         structural[take] = (hits.sum(axis=2) >= 4).any(axis=1) | (bands.sum(axis=1) >= 5)
+        # A raised horizontal surface can resemble a floor when ground
+        # returns are missing. Preserve measured upright structure below it.
+        below = occupied & np.uint64((1 << max(0, floor - math.ceil(.25 / step))) - 1)
+        continuous = below.copy()
+        for shift in range(1, math.ceil(.60 / step)):
+            continuous &= below >> np.uint64(shift)
+        structural[take] |= (continuous != 0).any(axis=1)
         barriers = wall[path, columns] | doors[path, columns]
         blocked[take] = barriers.any(axis=1)
         floors[take] = floor
@@ -277,6 +296,63 @@ def _score_axis(rays, labels, observed, wall, doors, horizontal, vertical, step,
         return report
     report["reason"] = "broad_local_connection"
     return report
+
+
+def _pooled_evidence(masks, resolution):
+    """Aggregate fine observations at the default 0.10 m review scale."""
+    factor = math.floor(.10 / resolution + 1e-9)
+    blocks = []
+    for index, raster in enumerate(masks):
+        padding = tuple((0, (-size) % factor) for size in raster.shape)
+        padded = np.pad(raster, padding, constant_values=-1 if index == 0 else 0)
+        blocks.append(np.stack([padded[x::factor, y::factor]
+                                for x in range(factor) for y in range(factor)]))
+    owners = blocks[0]
+    counts = np.stack([((owners == owner) & (owner >= 0)).sum(axis=0) for owner in owners])
+    strongest = counts.max(axis=0)
+    best = (counts == strongest) & (owners >= 0)
+    sentinel = int(masks[0].max()) + 1
+    low = np.where(best, owners, sentinel).min(axis=0)
+    high = np.where(best, owners, -1).max(axis=0)
+    # A tie between distinct rooms supplies no owner at the review scale.
+    labels = np.where(low == high, low, -1).astype(masks[0].dtype)
+    observed, walls, doors = [block.any(axis=0) for block in blocks[1:4]]
+    horizontal, vertical = [np.bitwise_or.reduce(block, axis=0) for block in blocks[4:]]
+    labels[walls | doors] = -1
+    return owners, (labels, observed, walls, doors, horizontal, vertical), factor * resolution
+
+
+def _score_pooled_pair(pair, pooled, step):
+    owners, masks, resolution = pooled
+    labels, observed, walls, doors, horizontal, vertical = masks
+    labels = labels.copy()
+    third_room = ((owners >= 0) & (owners != pair[0]) & (owners != pair[1])).any(axis=0)
+    # Keep a positive blocking owner so contacts and floor samples cannot
+    # cross a thin third room that disappeared in the majority projection.
+    labels[third_room] = int(owners.max()) + 1
+    pairs, _, thick_walls = _contacts(labels, walls, resolution)
+    if pair not in pairs or pair in thick_walls:
+        return None
+    rays = pairs[pair]
+    scores = []
+    for axis in (0, 1):
+        active = rays[rays[:, 0] == axis, 1:]
+        if not len(active):
+            continue
+        score = _score_axis(active, *(np.moveaxis(mask, axis, 0) for mask in
+                                     (labels, observed, walls, doors, horizontal, vertical)),
+                            step, resolution, staggered=True)
+        scores.append(score | dict(axis=axis, evidence_resolution_m=resolution))
+    return max(scores, key=lambda row: (row["reason"] == "framed_portal",
+                                       row["reason"] == "broad_local_connection",
+                                       row["clear_width_m"], row["contact_width_m"]))
+
+
+def _measured_separator(report, resolution):
+    return (report["reason"] == "framed_portal"
+            or (report["supported_samples"] and not report["open_samples"]
+                and report["blocked_samples"] * resolution >= .30 - 1e-9
+                and report["blocked_samples"] >= .80 * report["supported_samples"]))
 
 
 def _apply_merges(labels, pairs, accepted):
@@ -356,6 +432,7 @@ def _review_pass(working, labels, initial, walls, origin, resolution, height_ras
     audit["vertical_resolution_m"] = step
     masks = (labels, initial["observed_footprint"], walls, initial["door_columns"], horizontal, vertical)
     accepted = []
+    pooled = None
     for pair in broad_pairs:
         if pair in protected_pairs:
             reason = "preserved_boundary" if staggered else "recovered_door_guard"
@@ -376,14 +453,23 @@ def _review_pass(working, labels, initial, walls, origin, resolution, height_ras
         strongest = max(axes, key=lambda row: (row["reason"] == "framed_portal",
                                               row["reason"] == "broad_local_connection",
                                               row["clear_width_m"], row["contact_width_m"]))
-        report = dict(rooms=list(pair), accepted=False, **strongest)
+        report = dict(rooms=list(pair), accepted=False, evidence_resolution_m=resolution, **strongest)
         audit["evaluated_pairs"].append(report)
+        if _measured_separator(report, resolution):
+            barriers.add(pair)
+            continue
+        if staggered and resolution <= .05 + 1e-9 and report["reason"] != "broad_local_connection":
+            if pooled is None:
+                pooled = _pooled_evidence(masks, resolution)
+            score = _score_pooled_pair(pair, pooled, step)
+            if score is not None:
+                report["scale_review"] = score
+                if (score["reason"] == "broad_local_connection"
+                        or _measured_separator(score, score["evidence_resolution_m"])):
+                    report.update(score)
         if report["reason"] == "broad_local_connection":
             accepted.append((pair, report))
-        elif (report["reason"] == "framed_portal"
-              or (report["supported_samples"] and not report["open_samples"]
-                  and report["blocked_samples"] * resolution >= .30 - 1e-9
-                  and report["blocked_samples"] >= .80 * report["supported_samples"])):
+        elif _measured_separator(report, report["evidence_resolution_m"]):
             barriers.add(pair)
 
     accepted.sort(key=lambda row: (-row[1]["clear_width_m"], row[0]))

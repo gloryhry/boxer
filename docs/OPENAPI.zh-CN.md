@@ -1443,7 +1443,7 @@ curl --fail-with-body -sS "$PF_JOB_URL/log" | python3 -m json.tool
 
 ## 14. 体素连通复核
 
-体素连通复核读取注册地图中的全量 `global_map.pcd`，坐标为米制、`+Z` 向上。它先做二维初分割，再复核门洞与边界，最后将房间标签回投到原始点云。Boxer 内置 Room Atlas 的 `voxel-connectivity-v8`。 [运行时来源](../utils/voxel_connectivity_runtime/README.md)
+体素连通复核读取注册地图中的全量 `global_map.pcd`，坐标为米制、`+Z` 向上。它先做二维初分割，再复核门洞与边界，最后将房间标签回投到原始点云。Boxer 内置 Room Atlas 的 `voxel-connectivity-v10`。 [运行时来源](../utils/voxel_connectivity_runtime/README.md)
 
 | `options` 字段 | 单位与范围 | 默认值 | 含义 |
 | --- | --- | --- | --- |
@@ -1461,11 +1461,14 @@ curl --fail-with-body -sS -X POST "$API_BASE/api/voxel-connectivity/jobs" \
   -d "{\"map_id\":\"$MAP_ID\",\"options\":{\"resolution\":0.10,\"min_room_points\":20000}}"
 ```
 
-查询、停止、读取日志和下载沿用第 13 节的任务状态和输出结构，入口前缀为 `/api/voxel-connectivity/jobs`。两种算法的历史和下载地址各自独立。体素连通复核的产物存放在 `<output_dir>/voxel_connectivity/jobs/<job_id>/output/`。
+查询、停止、读取日志和下载沿用第 13 节的任务状态与响应字段，入口前缀为 `/api/voxel-connectivity/jobs`。两种算法的历史和下载地址各自独立。体素连通复核的产物存放在 `<output_dir>/voxel_connectivity/jobs/<job_id>/output/`。
 
-- `result_colored.ply` 保留全部有效 XYZ 点的输入顺序。`label` 为 int32，`-1` 表示未分配。输入包含法向量时输出也保留对应字段。
-- `rooms.json` 按 `id` 对应 PLY 标签，包含 `point_count`、`bounds`、`center`、`color`，以及二维区域的 `area_m2` 和 `cell_count`。
+- `labels.npy` 为一维 int32 数组，按有效 XYZ 点的输入顺序保存房间 ID，`-1` 表示未分配。有效点指三个坐标均为有限值的点。
+- `rooms.json` 按 `id` 对应点标签，包含 `point_count`、`bounds`、`center`、`color`，以及二维区域的 `area_m2` 和 `cell_count`。
 - `summary.json` 记录实际参数 `parameters`、`algorithm`、`method_version`、区域与点数统计、覆盖率和原生分割诊断 `diagnostics`。
+- `room_polygons.json` 记录保留房间的 `id`、`area_m2`、XY 轮廓 `geometry` 和米制 `z_bounds_m`。轮廓支持 `Polygon` 和 `MultiPolygon`，环闭合并保留孔洞。判断物体归属时，使用与地图同坐标系的 XYZ 检查二维轮廓和 Z 范围。Z 上下界取各房间已标注点的最低和最高 Z。
+
+新版体素连通复核将点标签保存为 `labels.npy`。历史任务记录中已有的 PLY 仍可通过原下载地址读取。
 
 直接运行 PCD 或 PLY 文件时，使用 Boxer Python 环境安装 CPU 分割依赖。容器镜像包含这些依赖。服务选用解释器的顺序为 `BOXER_VC_PYTHON`、`BOXER_PF_PYTHON`、服务自身的 Python。
 

@@ -10,8 +10,9 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from potential_field import ARTIFACTS, _publish_artifacts, _watch_owner
+from potential_field import _watch_owner
 from utils.potential_field_runtime.config import _ConfigLoader
+from utils.voxel_connectivity_runtime import ARTIFACT_TYPES
 
 
 PROJECT = Path(__file__).resolve().parent
@@ -43,18 +44,19 @@ def run(input_path, output_dir, options):
     import numpy as np
 
     from utils.potential_field_runtime.pointcloud import read_cloud, room_color
+    from utils.voxel_connectivity_runtime.room_polygons import room_polygons
     from utils.voxel_connectivity_runtime.voxel_connectivity import run_voxel_connectivity
 
     started = time.perf_counter()
     source = Path(input_path).resolve(strict=True)
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
-    if any((destination / name).exists() for name in ARTIFACTS):
+    if any((destination / name).exists() for name in (*ARTIFACT_TYPES, "result_colored.ply")):
         raise ValueError("Output directory already contains room segmentation results")
 
     config = load_voxel_connectivity_config()
     params = VoxelConnectivityConfig.model_validate({**config, **options}).model_dump()
-    xyz, normals = read_cloud(source)
+    xyz, _ = read_cloud(source)
 
     def log(message):
         print(message, flush=True)
@@ -63,8 +65,9 @@ def run(input_path, output_dir, options):
     log("参数 " + json.dumps(params, ensure_ascii=False))
     with tempfile.TemporaryDirectory(prefix=".voxel-connectivity-", dir=destination) as scratch:
         scratch = Path(scratch)
+        native = scratch / "native"
         raw_labels, artifacts = run_voxel_connectivity(
-            xyz, {"sa_resolution": params["resolution"]}, scratch / "native",
+            xyz, {"sa_resolution": params["resolution"]}, native,
             log=log, stage=lambda name: log(f"开始 {name}"),
         )
         raw_labels = np.asarray(raw_labels)
@@ -93,6 +96,13 @@ def run(input_path, output_dir, options):
                               center=points.mean(0).tolist(), confidence=None,
                               area_m2=native_room["area_m2"], cell_count=native_room["cell_count"]))
 
+        label_map = np.load(native / "label_map.npy", mmap_mode="r", allow_pickle=False)
+        polygons = room_polygons(label_map, artifacts["transform"], room_ids[~filtered])
+        polygons.update(volume_type="vertical_prism", z_bounds_source="labeled_point_extents")
+        z_bounds = {room["id"]: [corner[2] for corner in room["bounds"]] for room in rooms}
+        for footprint in polygons["rooms"]:
+            footprint["z_bounds_m"] = z_bounds[footprint["id"]]
+
         diagnostics = artifacts["statistics"]
         assigned = int(np.count_nonzero(labels >= 0))
         summary = dict(
@@ -103,7 +113,13 @@ def run(input_path, output_dir, options):
             assigned_ratio=assigned / len(xyz), inference_seconds=diagnostics["inference_seconds"],
             total_seconds=time.perf_counter() - started, diagnostics=diagnostics,
         )
-        _publish_artifacts(scratch, destination, xyz, labels, normals, rooms, summary)
+        np.save(scratch / "labels.npy", labels.astype("<i4", copy=False), allow_pickle=False)
+        for name, payload in (("rooms.json", rooms), ("summary.json", summary), ("room_polygons.json", polygons)):
+            (scratch / name).write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8",
+            )
+        for name in ARTIFACT_TYPES:
+            os.replace(scratch / name, destination / name)
     log(f"完成：原始 {len(room_ids)} 个实例 → 保留 {len(rooms)} 个房间；标注覆盖率 {summary['assigned_ratio']:.1%}")
 
 
