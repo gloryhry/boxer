@@ -16,6 +16,7 @@ CSV_FILES = (
     "boxer_3dbbs_tracks.csv",
     "boxer_3dbbs.csv",
     "owl_2dbbs.csv",
+    "boxer_3dbbs_observations.csv",
 )
 
 

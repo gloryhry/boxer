@@ -240,7 +240,7 @@ class MapWorkflows:
                 if replay.results.get("status") != "complete":
                     raise ValueError("Boxer result is not a final committed snapshot")
                 objects = [
-                    _box3d_row(item, 0)
+                    _box3d_row(item)
                     for item in replay.results.get("objects", [])
                     if item.get("state") != "TENTATIVE"
                 ]

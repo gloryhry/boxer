@@ -352,12 +352,68 @@ RTX 5060 Laptop 的三组完整地图对照：`img2` 中位数减少 10.27%，`i
 | --- | --- |
 | `results.json` | 完整帧索引、相机/视图、各视图 2D/3D 观测、逐帧跟踪状态、参数、别名及最终物体 |
 | `owl_2dbbs.csv` | 带 `frame_id`、原图时间戳及 `cam<id>/<view>` 标识的 2D 框 |
-| `boxer_3dbbs.csv` | 每个处理帧融合后的 3D 检测，时间戳来自对应位姿 |
+| `boxer_3dbbs.csv` | 每个处理帧融合后的 3D 检测，时间戳来自最早来源原图 |
 | `boxer_3dbbs_tracks.csv` | 各处理帧的已确认跟踪框，`instance` 为持久 ID |
-| `boxer_3dbbs_tracked.csv` | 最终已确认全局物体，兼容 Boxer OBB CSV |
+| `boxer_3dbbs_tracked.csv` | 每个最终物体一行，包含全部关联 2D 检测和原图路径 |
+| `boxer_3dbbs_observations.csv` | 每条 2D→融合 3D→轨迹关联一行，未确认物体的 `object_id` 为空 |
 | `preview_frames/`、`boxer_viz_final.mp4` | 检测/跟踪预览；视频按每秒 5 个处理帧编码 |
 
 `--write_name` 会替换 3D CSV 和视频的 `boxer` 前缀。
+
+### 物体、2D 检测和原图关联
+
+新结果的 `provenance_version` 为 `1`。原有 CSV 列顺序保持不变，新字段追加在末尾。
+`owl_2dbbs.csv` 的 `detection_id` 唯一标识本次结果内的检测，格式为
+`f<frame_id>:c<camera_id>:v<view_id>:d<index>`；融合框以 `f<frame_id>:b<index>`
+形式的 `bbox3d_id` 标识。所有 CSV 通过 `object_id` 对应最终物体的 `instance`。
+历史逐帧 `instance` 保留当时的轨迹 ID，完成时新增的 `object_id` 统一解析合并别名。
+未归属最终确认物体的检测，其 `object_id` 为空。
+
+最终物体 CSV 每行的 `observations_2d` 是 JSON 数组，包含该物体的全部可靠关联检测，
+包括确认前观测和被合并轨迹的观测。每个元素包含对应 OWL CSV 行的完整字段，另附
+`bbox3d_id`；其中 `image_file` 是相对地图根目录的原图路径，例如
+`images/12_cam0.jpg`。按原图时间、帧、相机、视图和检测序号排序，按 `detection_id`
+去重；同一原图的不同检测和视图分别保留。坐标、概率分别与 OWL CSV 的两位、六位
+小数精度一致。`boxer_3dbbs_observations.csv` 提供展开明细，另保留实际匹配的 `track_id`。
+
+| CSV | `time_ns` |
+| --- | --- |
+| OWL 2D | 当前原图时间 |
+| 融合 3D | 该框全部来源中最早的原图时间 |
+| 逐帧轨迹 | 本次匹配观测组中最早的原图时间；未匹配时保留上次实际观测时间 |
+| 最终物体 | 全部关联检测中最早的原图时间 |
+
+三个 3D CSV 的 `source_detection_id`、`image_file` 指向该行时间对应的检测与原图。
+新增 `pose_time_ns` 保留位姿时间；逐帧 `frame_id` 表示当前处理帧/轨迹快照，最终物体的
+`frame_id` 和 `pose_time_ns` 来自最早观测。JSON 帧级 `time_ns` 的位姿语义不变。
+纳秒字段在关联 JSON 数组和 API 中使用十进制字符串。
+
+读取完整物体历史示例（图片仍使用原地图包；ZIP 不复制 `images/`）：
+
+```python
+import csv
+import json
+import sys
+from pathlib import Path
+
+map_root = Path("/path/to/map")
+csv.field_size_limit(sys.maxsize)  # 单个物体可能有大量观测
+with (map_root / "3dbbox/boxer_3dbbs_tracked.csv").open(newline="") as stream:
+    for obj in csv.DictReader(stream):
+        observations = json.loads(obj["observations_2d"])
+        assert int(obj["time_ns"]) == min(int(o["time_ns"]) for o in observations)
+        for detection in observations:
+            original_image = map_root / detection["image_file"]
+            print(obj["instance"], detection["detection_id"], original_image,
+                  detection["x1"], detection["y1"], detection["x2"], detection["y2"])
+```
+
+2D 坐标仍对应预处理视图，需结合 `camera_id`、`view_id` 和结果中的相机变换解释，
+不能直接作为原图像素坐标。旧结果继续按旧语义读取，没有关联版本时不补造来源；
+旧 2D 缓存可通过 `--cache2d` 重建关联，缺少来源索引的旧 `--cache3d` 会明确报错。
+
+### 词表与图像特征
+
 成功推理会将实际使用的完整词汇表保存到地图包的 `3dbbox/labels.csv`，
 UTF-8 编码，表头为 `sem_id,label`。语义 ID 从 0 开始，对应解析后的 `parameters.labels`
 顺序，保留未检测出的类别、原始大小写和文本提示；内置词表与自定义标签均适用。
@@ -433,7 +489,7 @@ CSV 还可能包含先前其他处理范围的行。
 新流程不再写 PT，初始化保存时清理地图包 `3dbbox/dino_features/` 下的旧 PT，
 不将旧 PT 转换到 CSV；目录清空后移除目录。历史 JSON 不改写，检测与跟踪回放继续可用。
 
-通过 Web/API server 推理时，任务输出仍按任务隔离保存；成功完成后，另外将上述四个
+通过 Web/API server 推理时，任务输出仍按任务隔离保存；成功完成后，另外将上述五个
 检测/跟踪 CSV 覆盖保存到源地图包的 `3dbbox/`。勾选“不写 CSV”、失败、中断或导入
 历史结果时不执行此导出。命令行入口的输出路径保持不变，详见 [Web 服务说明](WEB_SERVER.zh-CN.md)。
 新版 JSON 使用 schema_version 2，包含模式、原始相机参数、图像变换、有效域策略和预处理版本。

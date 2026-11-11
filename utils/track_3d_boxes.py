@@ -234,6 +234,9 @@ class BoundingBox3DTracker:
         Returns:
             List of active tracked instances
         """
+        # Indices refer to the caller's unfiltered fused detections. Ownership
+        # records are metadata only and never participate in association costs.
+        self.last_associations = {}
         if observations is not None:
             return self._update_multiview(detections, frame_idx, observations)
 
@@ -469,7 +472,9 @@ class BoundingBox3DTracker:
             if len(detections):
                 raise ValueError("Detections require at least one view observation")
             return self._get_active_tracks()
-        detections = detections[(detections.prob >= self.conf_threshold).reshape(-1)]
+        keep = (detections.prob >= self.conf_threshold).reshape(-1)
+        detection_indices = torch.nonzero(keep).reshape(-1).tolist()
+        detections = detections[keep]
         new_evidence = self._dedup is not None and self._dedup.remember(
             observations, frame_idx
         )
@@ -543,6 +548,7 @@ class BoundingBox3DTracker:
                         track.support_count = len(frames)
                     matched_tracks.add(i)
                     matched_detections.add(c)
+                    self.last_associations[detection_indices[c]] = track.track_id
                     changed_ids.add(track.track_id)
                 # Reacquire low-overlap thin objects before allocating new IDs.
                 # Primary IoU matches retain priority and each pass is one-to-one.
@@ -584,6 +590,9 @@ class BoundingBox3DTracker:
                                     track.support_count = len(frames)
                                 matched_tracks.add(i)
                                 matched_detections.add(j)
+                                self.last_associations[detection_indices[j]] = (
+                                    track.track_id
+                                )
                                 changed_ids.add(track.track_id)
         if self._dedup is not None and len(detections):
             for i, j in self._multiview_recovery_matches(
@@ -599,6 +608,7 @@ class BoundingBox3DTracker:
                     track.support_count = len(frames)
                 matched_tracks.add(i)
                 matched_detections.add(j)
+                self.last_associations[detection_indices[j]] = track.track_id
                 changed_ids.add(track.track_id)
         for i, track in enumerate(self.tracks):
             if i in matched_tracks:
@@ -609,21 +619,32 @@ class BoundingBox3DTracker:
                 track.missed_count += 1
         for j in range(len(detections)):
             if j not in matched_detections:
-                if self._dedup is not None and any(
-                    self.tracks[i].support_count >= 2
-                    and self._dedup.redundant_observation_score(
-                        self.tracks[i].obb, detections[j]
+                redundant = None
+                if self._dedup is not None:
+                    redundant = next(
+                        (
+                            i
+                            for i in sorted(matched_tracks)
+                            if self.tracks[i].support_count >= 2
+                            and self._dedup.redundant_observation_score(
+                                self.tracks[i].obb, detections[j]
+                            )
+                            is not None
+                        ),
+                        None,
                     )
-                    is not None
-                    for i in sorted(matched_tracks)
-                ):
+                if redundant is not None:
                     # Both views saw the same static object. Its chosen match
                     # already contributed this group's geometry and support;
                     # do not create another identity or count the group twice.
                     matched_detections.add(j)
+                    self.last_associations[detection_indices[j]] = self.tracks[
+                        redundant
+                    ].track_id
                     continue
                 self._create_track(detections[j], frame_idx)
                 track = self.tracks[-1]
+                self.last_associations[detection_indices[j]] = track.track_id
                 changed_ids.add(track.track_id)
                 self._support_frames[track.track_id] = {frame_idx}
                 if self.min_hits <= 1:

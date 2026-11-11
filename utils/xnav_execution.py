@@ -217,17 +217,16 @@ def _output_worker(config, incoming, outgoing):
     """Spawn target: one owner for every result/CSV handle, CPU operations only."""
     from pathlib import Path
 
-    import numpy as np
     import torch
 
-    from loaders.xnav_loader import frame_identity, processing_frame_id
-    from utils.file_io import ObbCsvWriter2, save_bb2d_csv
+    from loaders.xnav_loader import frame_identity
     from utils.tw.camera import CameraTW
     from utils.tw.obb import ObbTW
     from utils.tw.pose import PoseTW
     from utils.xnav_export import save_map_vocabulary
     from utils.xnav_features import DinoFeatureCsvStore
-    from utils.xnav_pipeline import _preview, records_to_obbs
+    from utils.xnav_pipeline import _preview
+    from utils.xnav_provenance import ProvenanceCsvWriter
     from utils.xnav_result_store import ResultStore
 
     torch.set_num_threads(1)
@@ -239,14 +238,8 @@ def _output_worker(config, incoming, outgoing):
     store = None
     try:
         if not config["no_csv"]:
-            for kind, suffix in (
-                ("detections", "3dbbs"),
-                ("snapshots", "3dbbs_tracks"),
-                ("final", "3dbbs_tracked"),
-            ):
-                writers[kind] = ObbCsvWriter2(str(output / f"{prefix}_{suffix}.csv"))
-            save_bb2d_csv(
-                str(output / "owl_2dbbs.csv"), 0, np.empty((0, 4)), [], [], append=False
+            writers["provenance"] = ProvenanceCsvWriter(
+                output, prefix, config["size"], config["sem_map"]
             )
         if not config["skip_viz"]:
             preview = output / "preview_frames"
@@ -265,29 +258,7 @@ def _output_worker(config, incoming, outgoing):
                 features_ms = (time.perf_counter() - started) * 1000
                 started = time.perf_counter()
                 if writers:
-                    for observation in record["observations"]:
-                        boxes = np.asarray(
-                            observation["boxes_2d"], dtype=np.float32
-                        ).reshape(-1, 4)
-                        save_bb2d_csv(
-                            str(output / "owl_2dbbs.csv"),
-                            processing_frame_id(record),
-                            boxes[:, [0, 2, 1, 3]],
-                            np.asarray(observation["scores_2d"], dtype=np.float32),
-                            observation["labels_2d"],
-                            sem_name_to_id=config["sem_map"],
-                            time_ns=observation["image_stamp_ns"],
-                            img_width=config["size"],
-                            img_height=config["size"],
-                            sensor=f"cam{observation['camera_id']}/{observation['view_id']}",
-                            device="x-nav",
-                        )
-                    writers["detections"].write(
-                        ObbTW(torch.from_numpy(value["fused"])), record["time_ns"]
-                    )
-                    writers["snapshots"].write(
-                        ObbTW(torch.from_numpy(value["tracks"])), record["time_ns"]
-                    )
+                    writers["provenance"].append(record, value["id_aliases"])
                 csv_ms = (time.perf_counter() - started) * 1000
                 started = time.perf_counter()
                 if not config["skip_viz"]:
@@ -338,8 +309,8 @@ def _output_worker(config, incoming, outgoing):
             elif kind == "finish":
                 started = time.perf_counter()
                 if writers:
-                    writers["final"].write(
-                        records_to_obbs(value["objects"]), timestamps_ns=0
+                    writers["provenance"].finish(
+                        value["objects"], value["id_aliases"], map_root
                     )
                 for writer in writers.values():
                     writer.close()

@@ -514,7 +514,10 @@ def create_app(
         description=(
             "Current confirmed global objects from the latest committed frame; "
             "uses final objects after inference completes. CSV column names, "
-            "time_ns is the string 0. Paginated by boxes; live pages may change."
+            "time_ns is the earliest associated image time for new results. "
+            "observations_2d contains every associated 2D detection "
+            "and source image path. "
+            "Paginated by boxes; live pages may change."
         ),
     )
     def tracked_boxes(
@@ -571,8 +574,13 @@ def create_app(
         job_id: str,
         offset: int = Query(0, ge=0),
         limit: int = Query(200, ge=1, le=1000),
+        object_id: int | None = Query(
+            None, ge=0, description="Filter by canonical object ID."
+        ),
     ):
-        return manager.box_page(job_id, "owl_2dbbox", offset, limit)
+        return manager.box_page(
+            job_id, "owl_2dbbox", offset, limit, object_id=object_id
+        )
 
     def frame_context(job_id, index):
         with manager.lock:

@@ -1209,6 +1209,10 @@ def read_obb_csv(csv_path, force_anything=False):
     with open(csv_path, "r") as f:
         lines = f.readlines()
 
+    # A final object's JSON observation history can exceed csv's 128 KiB
+    # default field limit. The file has already been read into memory here.
+    csv.field_size_limit(max(csv.field_size_limit(), os.path.getsize(csv_path)))
+
     if len(lines) <= 1:
         return {}
 
@@ -1220,8 +1224,7 @@ def read_obb_csv(csv_path, force_anything=False):
     inst_list, sem_list, prob_list = [], [], []
     names = []
 
-    for line in lines[1:]:
-        elts = line.split(",")
+    for elts in csv.reader(lines[1:]):
         ts_list.append(int(elts[0]))
         tx_list.append(float(elts[1]))
         ty_list.append(float(elts[2]))

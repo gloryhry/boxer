@@ -16,7 +16,6 @@ from tqdm import tqdm
 
 from loaders.xnav_loader import XNavMapLoader, frame_identity, processing_frame_id
 from utils.exception_compat import add_exception_note
-from utils.file_io import ObbCsvWriter2, save_bb2d_csv
 from utils.fuse_3d_boxes import BoundingBox3DFuser
 from utils.image import draw_bb3s, put_text
 from utils.taxonomy import load_text_labels
@@ -35,6 +34,13 @@ from utils.xnav_features import (
 )
 from utils.xnav_inference import XNavDeviceInputs
 from utils.xnav_profile import XNavProfiler
+from utils.xnav_provenance import (
+    PROVENANCE_VERSION,
+    ProvenanceCsvWriter,
+    ProvenanceIndex,
+    detection_id,
+    image_file,
+)
 from utils.xnav_result_store import ResultFollower, ResultStore, read_result_file
 from utils.xnav_runtime import inference_dtype, select_device, semantic_embeddings
 
@@ -178,9 +184,10 @@ def source_signature(loader):
     return digest.hexdigest()
 
 
-def fuse_keyframe(detections, embeddings=None, force_cpu=False):
+def fuse_keyframe(detections, embeddings=None, force_cpu=False, *, return_groups=False):
     if len(detections) < 2:
-        return detections.clone()
+        boxes = detections.clone()
+        return (boxes, [[i] for i in range(len(boxes))]) if return_groups else boxes
     fuser = BoundingBox3DFuser(
         iou_threshold=0.3,
         min_detections=1,
@@ -215,19 +222,23 @@ def fuse_keyframe(detections, embeddings=None, force_cpu=False):
     boxes = _stack(fused)
     if len(boxes):
         boxes.set_inst_id(torch.full((len(boxes),), -1, dtype=torch.int32))
-    return boxes
+    return (
+        (boxes, [inst.detection_indices for inst in instances])
+        if return_groups
+        else boxes
+    )
 
 
-def _valid_boxes(boxes):
+def _valid_boxes(boxes, *, return_mask=False):
     if not len(boxes):
-        return boxes
+        return (boxes, torch.empty(0, dtype=torch.bool)) if return_mask else boxes
     ok = (
         torch.isfinite(boxes.T_world_object._data).all(-1)
         & torch.isfinite(boxes.bb3_diagonal).all(-1)
         & (boxes.bb3_diagonal > 0).all(-1)
         & torch.isfinite(boxes.prob).reshape(-1)
     )
-    return boxes[ok]
+    return (boxes[ok], ok) if return_mask else boxes[ok]
 
 
 def read_results(path, camera_mode=None):
@@ -482,10 +493,22 @@ def _infer_keyframe(
             "boxes_2d": bb2.tolist(),
             "scores_2d": scores.tolist(),
             "labels_2d": names,
+            "detection_ids": [
+                detection_id(frame, cid, view_id, i) for i in range(len(bb2))
+            ],
+            "image_file": image_file(frame_record, cid),
             "detections": [],
         }
+        source_ids = []
         if args.cache3d:
             boxes = records_to_obbs(cached["detections"])
+            for record in cached["detections"]:
+                refs = record.get("source_detection_ids", [])
+                if len(refs) != 1 or refs[0] not in observation["detection_ids"]:
+                    raise ValueError(
+                        "3D cache has missing 2D provenance; rerun with --cache2d"
+                    )
+                source_ids.append(refs[0])
         elif len(bb2):
             datum["bb2d"] = bb2
             autocast = (
@@ -504,6 +527,7 @@ def _infer_keyframe(
                 predictions = boxer.forward(datum, **keywords)
             boxes = predictions["obbs_pr_w"].cpu()[0]
             keep = (boxes.prob >= args.thresh3d).reshape(-1)
+            source_indices = torch.nonzero(keep).reshape(-1)
             boxes = boxes[keep].clone()
             selected = [name for name, ok in zip(names, keep) if ok]
             if len(boxes):
@@ -522,11 +546,16 @@ def _infer_keyframe(
                     )
                 )
                 boxes.set_inst_id(torch.full((len(boxes),), -1, dtype=torch.int32))
-            boxes = _valid_boxes(boxes)
+            boxes, valid = _valid_boxes(boxes, return_mask=True)
+            source_ids = [
+                observation["detection_ids"][i] for i in source_indices[valid].tolist()
+            ]
         else:
             boxes = empty_obbs()
         with profiler.stage("records"):
             observation["detections"] = box_records(boxes)
+            for record, identity in zip(observation["detections"], source_ids):
+                record["source_detection_ids"] = [identity]
         raw.extend(list(boxes))
         frame_record["observations"].append(observation)
     with profiler.stage("transfer.descriptors"):
@@ -620,6 +649,11 @@ def _run_xnav(args, *, runtime, loader, profiler):
     )
     if previous and not set(loader.frame_ids) <= cached_frames.keys():
         raise ValueError("Cache does not cover selected frames")
+    if args.cache3d and previous.get("provenance_version") != PROVENANCE_VERSION:
+        raise ValueError(
+            "3D cache has no detection provenance; "
+            "rerun with --cache2d or without cache"
+        )
 
     device = runtime.device if runtime is not None else select_device(args.force_cpu)
     parallel = device == "cuda" and getattr(args, "xnav_execution", "auto") != "serial"
@@ -701,6 +735,7 @@ def _run_xnav(args, *, runtime, loader, profiler):
     output.mkdir(parents=True, exist_ok=True)
     results = {
         "schema_version": 2,
+        "provenance_version": PROVENANCE_VERSION,
         "status": "running",
         "map_root": str(loader.root),
         "manifest": loader.manifest,
@@ -741,15 +776,8 @@ def _run_xnav(args, *, runtime, loader, profiler):
     prefix = args.write_name
     writers = {}
     if not parallel and not args.no_csv:
-        for kind, suffix in (
-            ("detections", "3dbbs"),
-            ("snapshots", "3dbbs_tracks"),
-            ("final", "3dbbs_tracked"),
-        ):
-            writers[kind] = ObbCsvWriter2(str(output / f"{prefix}_{suffix}.csv"))
-        # Always create a header, even when every source frame has zero detections.
-        save_bb2d_csv(
-            str(output / "owl_2dbbs.csv"), 0, np.empty((0, 4)), [], [], append=False
+        writers["provenance"] = ProvenanceCsvWriter(
+            output, prefix, loader.size, {label: i for i, label in enumerate(labels)}
         )
     if not parallel and not args.skip_viz:
         preview_dir = output / "preview_frames"
@@ -759,6 +787,7 @@ def _run_xnav(args, *, runtime, loader, profiler):
             path.unlink()
     dtype = inference_dtype(device, args.force_precision)
     sem_map = {label: i for i, label in enumerate(labels)}
+    provenance = ProvenanceIndex(loader.size, sem_map)
     observed_index, start = 0, time.perf_counter()
     store = None
     counts = Counter()
@@ -880,9 +909,23 @@ def _run_xnav(args, *, runtime, loader, profiler):
                     else None
                 )
                 with profiler.stage("fusion", cuda=True):
-                    fused = fuse_keyframe(boxes, embed, args.force_cpu)
+                    fused, groups = fuse_keyframe(
+                        boxes, embed, args.force_cpu, return_groups=True
+                    )
                 with profiler.stage("records"):
                     frame_record["detections"] = box_records(fused)
+                    raw_sources = [
+                        record["source_detection_ids"]
+                        for observation in frame_record["observations"]
+                        for record in observation["detections"]
+                    ]
+                    for i, (record, group) in enumerate(
+                        zip(frame_record["detections"], groups)
+                    ):
+                        record["bbox3d_id"] = f"f{processing_frame_id(frame)}:b{i}"
+                        record["source_detection_ids"] = [
+                            identity for j in group for identity in raw_sources[j]
+                        ]
                 if tracker:
                     observations = [
                         ViewObservation(
@@ -919,30 +962,17 @@ def _run_xnav(args, *, runtime, loader, profiler):
                             [t.obb for t in all_tracks], all_tracks
                         )
                     results["id_aliases"] = dict(tracker.id_aliases)
+                for i, record in enumerate(frame_record["detections"]):
+                    record["matched_track_id"] = (
+                        tracker.last_associations.get(i) if tracker else None
+                    )
+                provenance.add_frame(frame_record, results["id_aliases"], enrich=True)
                 with profiler.stage("records"):
                     tracks = records_to_obbs(
                         frame_record["tracks"], confirmed_only=True
                     )
                 if writers:
-                    for observation in frame_record["observations"]:
-                        bb2 = np.asarray(
-                            observation["boxes_2d"], dtype=np.float32
-                        ).reshape(-1, 4)
-                        save_bb2d_csv(
-                            str(output / "owl_2dbbs.csv"),
-                            processing_frame_id(frame),
-                            bb2[:, [0, 2, 1, 3]],
-                            np.asarray(observation["scores_2d"], dtype=np.float32),
-                            observation["labels_2d"],
-                            sem_name_to_id=sem_map,
-                            time_ns=observation["image_stamp_ns"],
-                            img_width=loader.size,
-                            img_height=loader.size,
-                            sensor=f"cam{observation['camera_id']}/{observation['view_id']}",
-                            device="x-nav",
-                        )
-                    writers["detections"].write(fused, frame["time_ns"])
-                    writers["snapshots"].write(tracks, frame["time_ns"])
+                    writers["provenance"].append(frame_record, results["id_aliases"])
                 results["elapsed_seconds"] = time.perf_counter() - start
                 profiler.computation_finished()
                 if parallel:
@@ -1023,9 +1053,13 @@ def _run_xnav(args, *, runtime, loader, profiler):
                 if parallel:
                     output_worker.poll()
         final = frame_record["tracks"] if tracker and frame_record else []
-        results["objects"] = [o for o in final if o["state"] != "TENTATIVE"]
+        results["objects"] = provenance.finalize(
+            [o for o in final if o["state"] != "TENTATIVE"], results["id_aliases"]
+        )
         if writers:
-            writers["final"].write(records_to_obbs(results["objects"]), timestamps_ns=0)
+            writers["provenance"].finish(
+                results["objects"], results["id_aliases"], loader.root
+            )
         results["status"] = "complete"
         results["statistics"] = {**counts, "confirmed_objects": len(results["objects"])}
         results["execution"].update(

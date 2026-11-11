@@ -528,11 +528,12 @@ output/server/
         ├── boxer_3dbbs.csv
         ├── boxer_3dbbs_tracks.csv
         ├── boxer_3dbbs_tracked.csv
+        ├── boxer_3dbbs_observations.csv
         └── performance.json       # profile=true 时生成
 ```
 
 以 API 返回的 `results_path` 为准，服务地图 ID 与地图清单的 `map_id` 不是同一个概念。
-`no_csv=false` 且任务成功时，四份 CSV 还会保存到宿主机地图的
+`no_csv=false` 且任务成功时，五份 CSV 还会保存到宿主机地图的
 `nav_map/demo_map/3dbbox/`，覆盖已有同名结果；任务目录保留原件。
 需要保留之前的地图导出时，先备份该目录。
 

@@ -888,7 +888,7 @@ curl -i -H 'If-None-Match: "首次响应的完整哈希"' \
 | `/api/jobs/{job_id}/3dbbox` | `Box3DPage` | 各已提交帧多视图融合后的 3D 检测 |
 | `/api/jobs/{job_id}/owl_2dbbox` | `Box2DPage` | 各已提交帧、相机和视图的 OWL 2D 检测 |
 
-首个接口名称统一为 `3dbbox_tracked`。四个接口均返回 `application/json`，`items` 使用对应 CSV 的全部列名。字段值取自已保存的 JSON 结果，浮点数保留保存精度。
+首个接口名称统一为 `3dbbox_tracked`。四个接口均返回 `application/json`，`items` 使用对应 CSV 的全部列名。3D 浮点数取自已保存的 JSON；带来源信息的新 2D 结果按 CSV 的坐标两位、概率六位小数输出。
 
 #### 分页和读取时机
 
@@ -904,6 +904,7 @@ curl -i -H 'If-None-Match: "首次响应的完整哈希"' \
 | `offset` | 整数 | 本次请求的记录偏移 |
 | `limit` | 整数 | 本次请求的最大记录数 |
 | `items` | 对象数组 | 本页检测框，长度不超过 `limit` |
+| `provenance_version` | 整数或 null | 新来源关联格式为 `1`；旧结果为 null，不伪造缺失关联 |
 
 未知任务、任务结果尚未建立时返回 `404`。已建立的合法空快照、无检测、关闭跟踪时的跟踪结果，以及 `offset >= total` 均返回 `200` 和空 `items`。非法分页参数返回 `422`。失败和中断任务仍可查询已提交前缀。
 
@@ -919,7 +920,7 @@ curl -i -H 'If-None-Match: "首次响应的完整哈希"' \
 
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
-| `time_ns` | 字符串 | 逐帧 3D 使用处理帧位姿时间；全局物体固定为 `"0"` |
+| `time_ns` | 字符串 | 新结果为来源图像时间：融合框取全部来源最早时间，轨迹取最近匹配组最早时间，最终物体取完整历史最早时间；旧结果保留原位姿时间/全局 `"0"` |
 | `tx_world_object`、`ty_world_object`、`tz_world_object` | 数值 | 保存的 `center`，地图坐标系，单位米 |
 | `qw_world_object`、`qx_world_object`、`qy_world_object`、`qz_world_object` | 数值 | 保存的物体旋转四元数，顺序为 `wxyz` |
 | `scale_x`、`scale_y`、`scale_z` | 数值 | 保存的 `size`，物体局部轴完整边长，单位米 |
@@ -927,6 +928,17 @@ curl -i -H 'If-None-Match: "首次响应的完整哈希"' \
 | `instance` | 整数 | 保存的 `track_id`；未跟踪检测通常为 `-1` |
 | `sem_id` | 整数 | 保存的语义 ID |
 | `prob` | 数值 | 保存的框置信度 |
+| `bbox3d_id` | 字符串或 null | 融合 3D 检测的稳定 ID；轨迹/最终物体为 null |
+| `object_id` | 整数或 null | 解析别名后的最终物体 ID；未归属确认物体时为 null |
+| `source_detection_id`、`image_file` | 字符串或 null | 该行时间对应的 2D 检测 ID，以及相对地图根目录的原图路径 |
+| `frame_id`、`pose_time_ns` | 整数/纳秒字符串或 null | 逐帧记录的处理帧与位姿时间；最终物体使用第一条来源观测 |
+| `observations_2d` | 对象数组或 null | 全局物体的全部关联 2D 检测，包含确认前及被合并轨迹的观测；逐帧结果/旧结果为 null |
+
+`observations_2d` 每个元素包含对应 `Box2DRow` 的完整字段及 `bbox3d_id`，以
+`detection_id` 唯一对应 OWL 行。按图像时间、帧、相机、视图和检测序号排序，
+同图的不同框和视图分别保留。其首项的时间和图像路径等于最终物体的
+`time_ns` 和 `image_file`。原图从原地图包读取；ZIP 不复制 `images/`。
+未匹配的新轨迹快照保留上次实际观测时间，同时更新其处理帧和 `pose_time_ns`。
 
 例如查询当前确认物体：
 
@@ -937,27 +949,32 @@ curl --fail-with-body -sS \
 
 ```json
 {
-  "status": "running",
+  "status": "complete",
   "processed_frames": 12,
+  "provenance_version": 1,
   "total": 1,
   "offset": 0,
   "limit": 200,
   "items": [{
-    "time_ns": "0",
-    "tx_world_object": 1.125,
-    "ty_world_object": -2.5,
-    "tz_world_object": 3.75,
-    "qw_world_object": 0.8,
-    "qx_world_object": 0.2,
-    "qy_world_object": 0.4,
-    "qz_world_object": 0.4,
-    "scale_x": 0.6,
-    "scale_y": 1.2,
-    "scale_z": 2.4,
-    "name": "chair",
-    "instance": 17,
-    "sem_id": 1,
-    "prob": 0.8123456789
+    "time_ns": "1793948371675919357",
+    "tx_world_object": 1.125, "ty_world_object": -2.5, "tz_world_object": 3.75,
+    "qw_world_object": 0.8, "qx_world_object": 0.2,
+    "qy_world_object": 0.4, "qz_world_object": 0.4,
+    "scale_x": 0.6, "scale_y": 1.2, "scale_z": 2.4,
+    "name": "chair", "instance": 17, "sem_id": 1, "prob": 0.8123456789,
+    "object_id": 17, "source_detection_id": "f3:c1:vnative:d0",
+    "image_file": "images/3_cam1.jpg", "frame_id": 3,
+    "pose_time_ns": "1793948371675919000",
+    "observations_2d": [{
+      "time_ns": "1793948371675919357", "frame_id": 3,
+      "sensor": "cam1/native", "device": "x-nav",
+      "img_width": 960, "img_height": 960,
+      "x1": 10.25, "y1": 20.5, "x2": 60.75, "y2": 90.25,
+      "name": "chair", "instance": -1, "sem_id": 1, "prob": 0.91,
+      "detection_id": "f3:c1:vnative:d0", "object_id": 17,
+      "camera_id": 1, "view_id": "native", "image_file": "images/3_cam1.jpg",
+      "pose_time_ns": "1793948371675919000", "bbox3d_id": "f3:b0"
+    }]
   }]
 }
 ```
@@ -978,6 +995,14 @@ curl --fail-with-body -sS \
 | `instance` | 整数 | 固定为 `-1` |
 | `sem_id` | 整数 | 按结果中保存的 `parameters.labels` 顺序映射；缺少词表或类别未收录时为 `-1` |
 | `prob` | 数值 | 保存的 OWL 置信度 |
+| `detection_id` | 字符串或 null | 本次结果集内唯一的 2D 检测 ID |
+| `object_id` | 整数或 null | 对应最终物体 ID；未关联/未确认时为 null |
+| `camera_id`、`view_id` | 整数/字符串或 null | 来源相机及预处理视图 |
+| `image_file` | 字符串或 null | 相对原地图根目录的原图路径，例如 `images/12_cam0.jpg` |
+| `pose_time_ns` | 字符串或 null | 原处理帧位姿时间 |
+
+`GET /api/jobs/{job_id}/owl_2dbbox?object_id=17` 可筛选该物体的全部关联 2D 检测，
+支持相同的 `offset`/`limit` 分页。旧结果不补造来源，该筛选返回空列表。
 
 保存的 `boxes_2d` 顺序为 `[xmin,xmax,ymin,ymax]`，接口对应 `x1=xmin`、`y1=ymin`、`x2=xmax`、`y2=ymax`。这些坐标对应预处理视图，包含缩放和填充；不能直接叠加到未处理的源图像上。
 
@@ -1265,7 +1290,7 @@ DINOv3 特征默认合并到地图包的 `3dbbox/dino_features.csv`，每张有�
 
 ### 11.3 写入源地图 `3dbbox/`
 
-普通 server 任务成功、所有输出关闭且 `no_csv=false` 时，会将以下四个文件复制到输入地图的 `3dbbox/`，覆盖同名结果：
+普通 server 任务成功、所有输出关闭且 `no_csv=false` 时，会将以下五个文件复制到输入地图的 `3dbbox/`，覆盖同名结果：
 
 | 文件 | 内容 |
 | --- | --- |
@@ -1273,10 +1298,11 @@ DINOv3 特征默认合并到地图包的 `3dbbox/dino_features.csv`，每张有�
 | `boxer_3dbbs_tracks.csv` | 每个处理帧的已确认跟踪框 |
 | `boxer_3dbbs.csv` | 各处理帧融合后的 3D 检测 |
 | `owl_2dbbs.csv` | 各相机/视图的 2D 检测 |
+| `boxer_3dbbs_observations.csv` | 逐条 2D 检测、融合框与轨迹的关联明细 |
 
-3D CSV 的平移和边长为米，四元数按 `wxyz` 保存。最终全局物体的 `time_ns` 固定为 `0`，逐帧 3D 记录使用处理帧位姿时间。2D CSV 使用原始图像时间，框坐标对应预处理视图的像素。表头与检测框查询字段对应，CSV 的数值和类别文本可能经过格式化。
+3D CSV 的平移和边长为米，四元数按 `wxyz` 保存。新结果的 3D `time_ns` 使用关联来源图像时间，最终物体取全部关联的最早时间；`pose_time_ns` 保存原位姿时间。2D CSV 使用原始图像时间，框坐标对应预处理视图的像素。旧结果的时间语义保持不变。表头与检测框查询字段对应，CSV 的数值和类别文本可能经过格式化。
 
-服务先暂存四份文件，再逐个原子替换，任务目录保留原件。这是逐文件发布，不是四个文件整体的事务；同步读取多个文件时，应在任务 `complete` 后读取。
+服务先暂存五份文件，再逐个原子替换，任务目录保留原件。这是逐文件发布，不是五个文件整体的事务；同步读取多个文件时，应在任务 `complete` 后读取。
 
 新联合流程中，地图 CSV 导出后 Boxer 阶段即可标记 `complete`，待分割与绑定完成再保存房间目录和生成 `3dbbox.zip`，详见第 15.4 节。缺少所需 CSV 或 CSV 导出失败仍使 Boxer 阶段失败；房间保存和 ZIP 失败由 `workflow.map_export` 报告并使整体失败。此时仍可从各任务目录或结果接口读取成功阶段的产物。历史任务的归档行为保持原样。
 

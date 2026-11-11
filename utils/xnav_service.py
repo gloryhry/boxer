@@ -21,6 +21,17 @@ from utils.taxonomy import load_text_labels
 from utils.xnav_archive import create_map_archive
 from utils.xnav_export import export_map_csv
 from utils.xnav_pipeline import XNavReplay
+from utils.xnav_provenance import (
+    PROVENANCE_VERSION,
+    ProvenanceIndex,
+    resolve_alias,
+)
+from utils.xnav_provenance import (
+    box2d_row as _box2d_row,
+)
+from utils.xnav_provenance import (
+    box3d_row as _box3d_row,
+)
 from utils.xnav_result_store import _atomic_json
 from utils.xnav_web_scene import MapScene
 from utils.xnav_worker_client import InferenceWorker
@@ -261,26 +272,6 @@ class FramePage(BaseModel):
     frames: list[FrameSummary]
 
 
-class Box3DRow(BaseModel):
-    """Saved 3D box values using the boxer_3dbbs CSV column names."""
-
-    time_ns: str = Field(description="Frame time in nanoseconds; global objects use 0.")
-    tx_world_object: float
-    ty_world_object: float
-    tz_world_object: float
-    qw_world_object: float
-    qx_world_object: float
-    qy_world_object: float
-    qz_world_object: float
-    scale_x: float
-    scale_y: float
-    scale_z: float
-    name: str
-    instance: int
-    sem_id: int
-    prob: float
-
-
 class Box2DRow(BaseModel):
     """Saved 2D box values using the owl_2dbbs CSV column names."""
 
@@ -298,6 +289,45 @@ class Box2DRow(BaseModel):
     instance: int
     sem_id: int
     prob: float
+    detection_id: str | None = None
+    object_id: int | None = None
+    camera_id: int | None = None
+    view_id: str | None = None
+    image_file: str | None = None
+    pose_time_ns: str | None = None
+
+
+class AssociatedBox2DRow(Box2DRow):
+    bbox3d_id: str
+
+
+class Box3DRow(BaseModel):
+    """CSV-compatible boxes; provenance is absent for legacy saved results."""
+
+    time_ns: str = Field(
+        description="Source image time; final objects use their earliest observation."
+    )
+    tx_world_object: float
+    ty_world_object: float
+    tz_world_object: float
+    qw_world_object: float
+    qx_world_object: float
+    qy_world_object: float
+    qz_world_object: float
+    scale_x: float
+    scale_y: float
+    scale_z: float
+    name: str
+    instance: int
+    sem_id: int
+    prob: float
+    bbox3d_id: str | None = None
+    object_id: int | None = None
+    source_detection_id: str | None = None
+    image_file: str | None = None
+    frame_id: int | None = None
+    pose_time_ns: str | None = None
+    observations_2d: list[AssociatedBox2DRow] | None = None
 
 
 class BoxPage(BaseModel):
@@ -306,6 +336,7 @@ class BoxPage(BaseModel):
     total: int = Field(ge=0, description="Box count in this committed snapshot.")
     offset: int = Field(ge=0)
     limit: int = Field(ge=1, le=1000)
+    provenance_version: int | None = None
 
 
 class Box3DPage(BoxPage):
@@ -366,51 +397,6 @@ class Box2DPage(BoxPage):
     items: list[Box2DRow]
 
 
-def _box3d_row(record, time_ns):
-    tx, ty, tz = record["center"]
-    qw, qx, qy, qz = record["quaternion_wxyz"]
-    sx, sy, sz = record["size"]
-    return {
-        "time_ns": str(time_ns),
-        "tx_world_object": tx,
-        "ty_world_object": ty,
-        "tz_world_object": tz,
-        "qw_world_object": qw,
-        "qx_world_object": qx,
-        "qy_world_object": qy,
-        "qz_world_object": qz,
-        "scale_x": sx,
-        "scale_y": sy,
-        "scale_z": sz,
-        "name": record["label"],
-        "instance": record["track_id"],
-        "sem_id": record["sem_id"],
-        "prob": record["prob"],
-    }
-
-
-def _box2d_row(frame, observation, index, *, image_size, sem_map):
-    x1, x2, y1, y2 = observation["boxes_2d"][index]
-    labels, scores = observation["labels_2d"], observation["scores_2d"]
-    name = labels[index] if index < len(labels) else "unknown"
-    return {
-        "time_ns": str(observation["image_stamp_ns"]),
-        "frame_id": processing_frame_id(frame),
-        "sensor": f"cam{observation['camera_id']}/{observation['view_id']}",
-        "device": "x-nav",
-        "img_width": image_size,
-        "img_height": image_size,
-        "x1": x1,
-        "y1": y1,
-        "x2": x2,
-        "y2": y2,
-        "name": name,
-        "instance": -1,
-        "sem_id": sem_map.get(name, -1),
-        "prob": scores[index] if index < len(scores) else 0.0,
-    }
-
-
 def _box3d_entries(replay, kind):
     if kind in ("3dbbox_tracked", "3dbbox_tracks"):
         if not replay.results["tracking"]["enabled"]:
@@ -436,6 +422,38 @@ def _box3d_entries(replay, kind):
         for record in frame[key]:
             if key != "tracks" or record.get("state") != "TENTATIVE":
                 yield record, frame["time_ns"]
+
+
+def _confirmed_objects(replay):
+    if not replay.results.get("tracking", {}).get("enabled", False):
+        return []
+    if replay.results.get("status") == "complete" and "objects" in replay.results:
+        return replay.results["objects"]
+    return (
+        [r for r in replay.frames[-1]["tracks"] if r.get("state") != "TENTATIVE"]
+        if replay.frames
+        else []
+    )
+
+
+def _replay_provenance(replay):
+    if replay.results.get("provenance_version") != PROVENANCE_VERSION:
+        return None
+    index = getattr(replay, "_provenance_index", None)
+    if (
+        index is None
+        or getattr(replay, "_provenance_frames", None) is not replay.frames
+    ):
+        parameters = replay.results["parameters"]
+        index = ProvenanceIndex(
+            parameters["image_size"],
+            {label: i for i, label in enumerate(parameters["labels"])},
+        )
+        replay._provenance_index = index
+        replay._provenance_frames = replay.frames
+    for frame in replay.frames[index.frame_count :]:
+        index.add_frame(frame, replay.results.get("id_aliases", {}))
+    return index
 
 
 def timestamps(value):
@@ -1050,10 +1068,28 @@ class JobManager:
                 )
             return {"total": len(replay.frames), "offset": offset, "frames": frames}
 
-    def box_page(self, identity, kind, offset, limit):
+    def box_page(self, identity, kind, offset, limit, *, object_id=None):
         """Project one page from the replay cache, never from in-progress CSVs."""
         with self.lock:
             replay = self.replay(identity)
+            aliases = replay.results.get("id_aliases", {})
+            objects = _confirmed_objects(replay)
+            confirmed = {r["track_id"] for r in objects}
+            has_provenance = (
+                replay.results.get("provenance_version") == PROVENANCE_VERSION
+            )
+            final_objects = (
+                replay.results.get("status") == "complete"
+                and "objects" in replay.results
+            )
+            # Completed objects already carry their expanded history. Other 3D
+            # pages only need stored source summaries and the current aliases.
+            provenance = (
+                _replay_provenance(replay)
+                if kind == "owl_2dbbox"
+                or (kind == "3dbbox_tracked" and not final_objects)
+                else None
+            )
             if kind == "owl_2dbbox":
                 parameters = replay.results["parameters"]
                 entries = (
@@ -1062,21 +1098,43 @@ class JobManager:
                     for observation in frame["observations"]
                     for index in range(len(observation["boxes_2d"]))
                 )
-                project = partial(
-                    _box2d_row,
-                    image_size=parameters.get("image_size", -1),
-                    sem_map={
-                        label: index
-                        for index, label in enumerate(parameters.get("labels", []))
-                    },
-                )
+                sem_map = {
+                    label: i for i, label in enumerate(parameters.get("labels", []))
+                }
+
+                def project(frame, observation, index):
+                    target = (
+                        provenance.object_id(
+                            observation["detection_ids"][index], aliases, confirmed
+                        )
+                        if provenance is not None
+                        else None
+                    )
+                    return _box2d_row(
+                        frame,
+                        observation,
+                        index,
+                        image_size=parameters.get("image_size", -1),
+                        sem_map=sem_map,
+                        object_id=target,
+                    )
             else:
-                entries = _box3d_entries(replay, kind)
-                project = _box3d_row
+                if has_provenance and kind == "3dbbox_tracked":
+                    if not final_objects:
+                        objects = provenance.finalize(objects, aliases)
+                    entries = ((r, 0) for r in objects)
+                else:
+                    entries = _box3d_entries(replay, kind)
+                project = partial(_box3d_row, aliases=aliases, confirmed_ids=confirmed)
             total, items = 0, []
             for entry in entries:
+                row = None
+                if object_id is not None:
+                    row = project(*entry)
+                    if row.get("object_id") != resolve_alias(object_id, aliases):
+                        continue
                 if offset <= total < offset + limit:
-                    items.append(project(*entry))
+                    items.append(row if row is not None else project(*entry))
                 total += 1
             return {
                 "status": self.jobs[identity]["status"],
@@ -1084,6 +1142,7 @@ class JobManager:
                 "total": total,
                 "offset": offset,
                 "limit": limit,
+                "provenance_version": replay.results.get("provenance_version"),
                 "items": items,
             }
 
