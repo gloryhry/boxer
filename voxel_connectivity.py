@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import tempfile
-import time
 from pathlib import Path
 
 import yaml
@@ -43,15 +42,15 @@ def load_voxel_connectivity_config():
 def run(input_path, output_dir, options):
     import numpy as np
 
-    from utils.potential_field_runtime.pointcloud import read_cloud, room_color
+    from utils.potential_field_runtime.pointcloud import read_cloud
     from utils.voxel_connectivity_runtime.room_polygons import room_polygons
-    from utils.voxel_connectivity_runtime.voxel_connectivity import run_voxel_connectivity
+    from utils.voxel_connectivity_runtime.voxel_connectivity import METHOD_VERSION, run_voxel_connectivity
 
-    started = time.perf_counter()
     source = Path(input_path).resolve(strict=True)
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
-    if any((destination / name).exists() for name in (*ARTIFACT_TYPES, "result_colored.ply")):
+    legacy_artifacts = ("result_colored.ply", "labels.npy", "rooms.json", "summary.json")
+    if any((destination / name).exists() for name in (*ARTIFACT_TYPES, *legacy_artifacts)):
         raise ValueError("Output directory already contains room segmentation results")
 
     config = load_voxel_connectivity_config()
@@ -62,6 +61,7 @@ def run(input_path, output_dir, options):
         print(message, flush=True)
 
     log(f"输入 {source.name}：{len(xyz):,} 个有效点；Z-up，单位米")
+    log(f"方法 {METHOD_VERSION}")
     log("参数 " + json.dumps(params, ensure_ascii=False))
     with tempfile.TemporaryDirectory(prefix=".voxel-connectivity-", dir=destination) as scratch:
         scratch = Path(scratch)
@@ -74,53 +74,29 @@ def run(input_path, output_dir, options):
         if (raw_labels.shape != (len(xyz),) or not np.issubdtype(raw_labels.dtype, np.integer)
                 or np.any(raw_labels < -1) or np.any(raw_labels > np.iinfo(np.int32).max)):
             raise ValueError("算法标签必须与全量点云一一对应，为 -1 或非负整数")
-        labels = raw_labels.astype(np.int32, copy=True)
-        native_rooms = {room["id"]: room for room in artifacts["rooms"]}
-        room_ids, counts = np.unique(labels[labels >= 0], return_counts=True)
-        if any(int(identity) not in native_rooms for identity in room_ids):
+        native_ids = {room["id"] for room in artifacts["rooms"]}
+        room_ids, counts = np.unique(raw_labels[raw_labels >= 0], return_counts=True)
+        if any(int(identity) not in native_ids for identity in room_ids):
             raise ValueError("点标签引用了不存在的原生房间")
 
         filtered = counts < params["min_room_points"]
-        filtered_count = int(counts[filtered].sum())
         if filtered.any():
-            labels[np.isin(labels, room_ids[filtered])] = -1
-            log(f"点数阈值隐藏 {int(filtered.sum())} 个候选、{filtered_count:,} 个已分配点。")
-
-        rooms = []
-        for room_id, count in zip(room_ids[~filtered], counts[~filtered]):
-            identity = int(room_id)
-            points = xyz[labels == identity]
-            native_room = native_rooms[identity]
-            rooms.append(dict(id=identity, name=f"房间 {identity + 1:02d}", point_count=int(count),
-                              color=list(room_color(identity)), bounds=[points.min(0).tolist(), points.max(0).tolist()],
-                              center=points.mean(0).tolist(), confidence=None,
-                              area_m2=native_room["area_m2"], cell_count=native_room["cell_count"]))
+            log(f"点数阈值隐藏 {int(filtered.sum())} 个候选、{int(counts[filtered].sum()):,} 个已分配点。")
 
         label_map = np.load(native / "label_map.npy", mmap_mode="r", allow_pickle=False)
         polygons = room_polygons(label_map, artifacts["transform"], room_ids[~filtered])
         polygons.update(volume_type="vertical_prism", z_bounds_source="labeled_point_extents")
-        z_bounds = {room["id"]: [corner[2] for corner in room["bounds"]] for room in rooms}
         for footprint in polygons["rooms"]:
-            footprint["z_bounds_m"] = z_bounds[footprint["id"]]
+            z = xyz[raw_labels == footprint["id"], 2]
+            footprint["z_bounds_m"] = [float(z.min()), float(z.max())]
 
-        diagnostics = artifacts["statistics"]
-        assigned = int(np.count_nonzero(labels >= 0))
-        summary = dict(
-            algorithm="voxel_connectivity", method_version=diagnostics["method_version"], parameters=params,
-            room_count=len(rooms), raw_room_count=len(room_ids), native_room_count=len(native_rooms),
-            filtered_room_count=int(filtered.sum()), point_count_filtered_count=filtered_count,
-            point_count=len(xyz), assigned_count=assigned, unassigned_count=len(xyz) - assigned,
-            assigned_ratio=assigned / len(xyz), inference_seconds=diagnostics["inference_seconds"],
-            total_seconds=time.perf_counter() - started, diagnostics=diagnostics,
+        name = "room_polygons.json"
+        (scratch / name).write_text(
+            json.dumps(polygons, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8",
         )
-        np.save(scratch / "labels.npy", labels.astype("<i4", copy=False), allow_pickle=False)
-        for name, payload in (("rooms.json", rooms), ("summary.json", summary), ("room_polygons.json", polygons)):
-            (scratch / name).write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8",
-            )
-        for name in ARTIFACT_TYPES:
-            os.replace(scratch / name, destination / name)
-    log(f"完成：原始 {len(room_ids)} 个实例 → 保留 {len(rooms)} 个房间；标注覆盖率 {summary['assigned_ratio']:.1%}")
+        os.replace(scratch / name, destination / name)
+    coverage = counts[~filtered].sum() / len(xyz)
+    log(f"完成：原始 {len(room_ids)} 个实例 → 保留 {len(polygons['rooms'])} 个房间；标注覆盖率 {coverage:.1%}")
 
 
 def main(argv=None):

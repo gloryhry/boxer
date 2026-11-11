@@ -3,6 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+import { buildRoomOutlines } from './room-geometry';
 import type { Box, Observation, SceneInfo } from './types';
 
 /** Follow is a translation only. Manual pans accumulate in world coordinates. */
@@ -45,6 +46,8 @@ export class SceneView {
   readonly controls: OrbitControls;
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene = new THREE.Scene();
+  private readonly mapGroup = new THREE.Group();
+  private readonly roomGroup = new THREE.Group();
   private readonly boxGroup = new THREE.Group();
   private readonly labels: { point: THREE.Vector3; element: HTMLSpanElement }[] = [];
   private readonly cameraMarker = new THREE.Group();
@@ -53,6 +56,9 @@ export class SceneView {
   private trajectory?: THREE.Line;
   private center = new THREE.Vector3();
   private radius = 5;
+  private roomView = false;
+  private roomBounds?: THREE.Sphere;
+  private savedMapView?: { target: THREE.Vector3; position: THREE.Vector3; maxDistance: number };
   private lastTarget = new THREE.Vector3();
   private internalChange = false;
   private lastTime = performance.now();
@@ -74,7 +80,7 @@ export class SceneView {
     this.controls.minDistance = 0.05;
     this.controls.maxDistance = 1000;
     this.controls.addEventListener('change', () => {
-      if (!this.internalChange) this.follow.pan(this.controls.target.clone().sub(this.lastTarget));
+      if (!this.internalChange && !this.roomView) this.follow.pan(this.controls.target.clone().sub(this.lastTarget));
       this.lastTarget.copy(this.controls.target);
     });
     const grid = new THREE.GridHelper(20, 20, '#c2d1da', '#e1e8ed');
@@ -88,7 +94,9 @@ export class SceneView {
     );
     axes.material.toneMapped = false;
     sourceAxes.dispose();
-    this.scene.add(grid, axes, this.boxGroup, this.cameraMarker);
+    this.mapGroup.add(grid, axes, this.boxGroup, this.cameraMarker);
+    this.roomGroup.visible = false;
+    this.scene.add(this.mapGroup, this.roomGroup);
     this.fit();
     new ResizeObserver(() => {
       const { width, height } = host.getBoundingClientRect();
@@ -140,17 +148,17 @@ export class SceneView {
     this.clearFrame();
     this.setTrajectory([]);
     this.map = this.cloud(data, 1.8);
-    this.scene.add(this.map);
+    this.mapGroup.add(this.map);
     this.center.fromArray(info.center);
     this.radius = info.radius;
-    this.controls.maxDistance = Math.max(100, info.radius * 20);
-    this.fit();
+    this.savedMapView = undefined;
+    if (!this.roomView) this.fit();
   }
 
   setObserved(data?: ArrayBuffer) {
     if (this.observed) release(this.observed);
     this.observed = data ? this.cloud(data, 2.5) : undefined;
-    if (this.observed) this.scene.add(this.observed);
+    if (this.observed) this.mapGroup.add(this.observed);
   }
 
   showMap(show: boolean) { if (this.map) this.map.visible = show; }
@@ -159,7 +167,7 @@ export class SceneView {
     if (this.trajectory) release(this.trajectory);
     const geometry = new THREE.BufferGeometry().setFromPoints(positions.map(p => new THREE.Vector3().fromArray(p)));
     this.trajectory = new THREE.Line(geometry, new THREE.LineBasicMaterial({ color: '#2c8ba5' }));
-    this.scene.add(this.trajectory);
+    this.mapGroup.add(this.trajectory);
   }
 
   setBoxes(boxes: Box[], tracked: boolean) {
@@ -181,12 +189,57 @@ export class SceneView {
       }
       const element = document.createElement('span');
       element.className = 'object-label';
+      element.hidden = true;
       element.textContent = `${tracked ? `#${box.track_id} ` : ''}${box.label}`;
       element.style.borderColor = `#${color.getHexString()}`;
       this.host.append(element);
       this.labels.push({ point: center, element });
     }
     this.boxGroup.add(this.lineSegments(positions, 0xffffff, colors));
+  }
+
+  setRoomOutlines(payload: unknown): number {
+    const { rooms, bounds } = buildRoomOutlines(payload);
+    this.clearRoomOutlines();
+    for (const { id, positions } of rooms) {
+      const color = new THREE.Color().setHSL((id * 0.61803398875) % 1, 0.7, 0.4);
+      this.roomGroup.add(this.lineSegments(positions, color));
+    }
+    if (bounds) {
+      this.roomBounds = new THREE.Box3(
+        new THREE.Vector3(...bounds.min), new THREE.Vector3(...bounds.max),
+      ).getBoundingSphere(new THREE.Sphere());
+      if (this.roomView) this.fit();
+    }
+    return rooms.length;
+  }
+
+  clearRoomOutlines() {
+    for (const child of [...this.roomGroup.children]) release(child);
+    this.roomBounds = undefined;
+  }
+
+  setRoomView(enabled: boolean) {
+    if (enabled === this.roomView) return;
+    this.roomView = enabled;
+    this.roomGroup.visible = enabled;
+    this.mapGroup.visible = !enabled;
+    this.renderer.domElement.setAttribute('aria-label', `${enabled ? '三维房间框' : '三维点云'}：左键旋转，右键平移，滚轮缩放`);
+    if (enabled) {
+      this.savedMapView = {
+        target: this.controls.target.clone(),
+        position: this.camera.position.clone(),
+        maxDistance: this.controls.maxDistance,
+      };
+      for (const label of this.labels) label.element.hidden = true;
+      this.fit();
+    } else if (this.savedMapView) {
+      this.controls.maxDistance = this.savedMapView.maxDistance;
+      this.positionCamera(this.savedMapView.target, this.savedMapView.position);
+      this.savedMapView = undefined;
+    } else {
+      this.fit();
+    }
   }
 
   setObservation(observation?: Observation, snap = false) {
@@ -202,30 +255,41 @@ export class SceneView {
       }
       this.cameraMarker.add(this.lineSegments(positions, '#167d90'));
     }
-    if (snap) this.moveTarget(this.follow.delta(this.controls.target, 0, true));
+    if (snap && !this.roomView) this.moveTarget(this.follow.delta(this.controls.target, 0, true));
   }
 
   setFollow(enabled: boolean) {
     this.follow.enabled = enabled;
-    if (enabled) this.moveTarget(this.follow.delta(this.controls.target, 0, true));
+    if (enabled && !this.roomView) this.moveTarget(this.follow.delta(this.controls.target, 0, true));
   }
 
   focus() {
+    if (this.roomView) return;
     this.follow.offset.set(0, 0, 0);
     if (this.follow.pose) this.moveTarget(this.follow.pose.clone().sub(this.controls.target));
   }
 
   fit() {
-    this.follow.enabled = false;
-    this.follow.offset.set(0, 0, 0);
+    if (!this.roomView) {
+      this.follow.enabled = false;
+      this.follow.offset.set(0, 0, 0);
+    }
+    const bounds = this.roomView ? this.roomBounds : undefined;
+    const center = bounds?.center ?? this.center;
+    const radius = Math.max(0.1, bounds?.radius ?? this.radius);
+    const distance = radius * 2.8 / Math.min(1, Math.max(this.camera.aspect, 0.1));
+    this.controls.maxDistance = Math.max(100, radius * 20, distance);
+    this.positionCamera(center, center.clone().add(new THREE.Vector3(0.6124, 0.6124, 0.5).multiplyScalar(distance)));
+  }
+
+  private positionCamera(target: THREE.Vector3, position: THREE.Vector3) {
     this.internalChange = true;
     // Flush pending damping so an old drag cannot move a newly fitted scene.
     const damping = this.controls.enableDamping;
     this.controls.enableDamping = false;
     this.controls.update();
-    const distance = this.radius * 2.8 / Math.min(1, Math.max(this.camera.aspect, 0.1));
-    this.controls.target.copy(this.center);
-    this.camera.position.copy(this.center).add(new THREE.Vector3(0.6124, 0.6124, 0.5).multiplyScalar(distance));
+    this.controls.target.copy(target);
+    this.camera.position.copy(position);
     this.controls.update();
     this.controls.enableDamping = damping;
     this.lastTarget.copy(this.controls.target);
@@ -238,12 +302,13 @@ export class SceneView {
     const now = performance.now(), dt = Math.min((now - this.lastTime) / 1000, 0.1);
     this.lastTime = now;
     this.controls.update();
-    this.moveTarget(this.follow.delta(this.controls.target, dt));
+    if (!this.roomView) this.moveTarget(this.follow.delta(this.controls.target, dt));
     const distance = this.camera.position.distanceTo(this.controls.target);
     this.camera.near = Math.max(0.005, distance / 10000);
-    this.camera.far = Math.max(1000, distance + this.radius * 4);
+    this.camera.far = Math.max(1000, distance + (this.roomView ? this.roomBounds?.radius ?? this.radius : this.radius) * 4);
     this.camera.updateProjectionMatrix();
     this.renderer.render(this.scene, this.camera);
+    if (this.roomView) return;
     const occupied: [number, number][] = [];
     for (const label of this.labels) {
       const p = label.point.clone().project(this.camera);

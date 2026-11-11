@@ -31,7 +31,8 @@ ARTIFACTS = {
     "rooms.json": "application/json",
     "summary.json": "application/json",
 }
-ARTIFACT_MEDIA_TYPES = ARTIFACTS | VOXEL_CONNECTIVITY_ARTIFACTS
+# Completed jobs from earlier versions can still advertise their saved files.
+ARTIFACT_MEDIA_TYPES = ARTIFACTS | VOXEL_CONNECTIVITY_ARTIFACTS | {"labels.npy": "application/octet-stream"}
 ACTIVE = {"running", "stopping"}
 JobStatus = Literal["running", "stopping", "complete", "failed", "interrupted"]
 
@@ -389,7 +390,7 @@ class VoxelConnectivityJobs(PotentialFieldJobs):
     python_envs = ("BOXER_VC_PYTHON", "BOXER_PF_PYTHON")
     name = "Voxel-connectivity"
     artifact_types = VOXEL_CONNECTIVITY_ARTIFACTS
-    json_artifact_types = {**PotentialFieldJobs.json_artifact_types, "room_polygons.json": dict}
+    json_artifact_types = {"room_polygons.json": dict}
 
 
 def install_room_segmentation_routes(
