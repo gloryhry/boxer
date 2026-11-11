@@ -3,6 +3,7 @@ import { SceneView } from './camera';
 import { initializeWorkspaceLayout } from './layout';
 import { inferenceControls, shouldSyncOptions } from './inference';
 import { initializeUploadPanel } from './upload-ui';
+import { RoomResults } from './rooms';
 import type { InferenceState } from './inference';
 import type { Frame, FrameSummary, Job, MapDirectories, MapDirectory, MapInfo, Observation, SceneInfo } from './types';
 
@@ -41,7 +42,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     <div class="parameter-apply"><button id="apply-options" class="secondary" disabled>应用参数</button><p id="inference-note" class="hint" role="status" aria-live="polite">正在连接模型服务…</p></div>
     <div class="actions"><button id="start" class="primary" disabled>▶ 开始推理</button><button id="stop" class="danger" disabled>■ 停止推理</button></div>
     <p id="busy-note" class="hint" hidden>已有其他推理任务运行中，可在历史任务中查看。</p>
-    <div class="job-card"><div class="job-top"><span id="job-status" class="status" data-state="idle"><span class="dot"></span>尚未开始</span><span id="progress-text" class="mono">0 / 0</span></div><progress id="progress" max="1" value="0" aria-label="已提交帧进度"></progress><p id="job-detail" class="hint">加载地图后即可开始推理，也可以加载已有结果。</p><details id="output-details"><summary>输出与日志</summary><p id="output" class="path"></p><button id="refresh-log" class="text-button">刷新日志</button><pre id="log"></pre></details></div>
+    <div class="job-card"><div class="job-top"><span id="job-status" class="status" data-state="idle"><span class="dot"></span>尚未开始</span><span id="progress-text" class="mono">0 / 0</span></div><progress id="progress" max="1" value="0" aria-label="Boxer 已提交帧进度"></progress><p id="workflow-stages" class="hint" role="status" aria-live="polite"></p><p id="job-detail" class="hint">加载地图后开始推理，同时运行 Boxer 和房间分割。</p><details id="output-details"><summary>输出与日志</summary><p id="output" class="path"></p><button id="refresh-log" class="text-button">刷新日志</button><pre id="log"></pre></details></div>
+    <section id="room-results" class="room-results" aria-label="房间分割与物体绑定"></section>
     <details class="settings"><summary>已有结果与历史任务</summary><label for="results-path">results.json 路径</label><div class="input-action"><input id="results-path" placeholder="/path/to/results.json" spellcheck="false"><button id="import" class="secondary" disabled>加载结果</button></div><label for="history">历史任务</label><div class="input-action"><select id="history"><option value="">选择任务</option></select><button id="refresh-history" class="secondary" aria-label="刷新历史任务">刷新</button></div></details>
     <section class="playback" aria-label="结果回放"><div class="section-heading"><h2>结果回放</h2><span id="stream-state" class="hint">等待结果</span></div>
       <div class="timeline"><button id="play" class="secondary" disabled aria-label="播放回放">▶</button><input id="frame" type="range" min="0" max="0" value="0" disabled aria-label="回放帧"><span id="frame-number" class="mono">0 / 0</span></div>
@@ -66,8 +68,8 @@ function element<T extends HTMLElement = HTMLElement>(id: string) { return docum
 function input(id: string) { return element<HTMLInputElement>(id); }
 function checked(id: string) { return input(id).checked; }
 initializeWorkspaceLayout(element('workspace'), element('reset-layout'));
-const labels: Record<string, string> = { starting: '准备推理', running: '推理中', stopping: '正在停止', complete: '已完成', failed: '失败', interrupted: '已中断' };
-const active = (job: Job | null) => job && ['starting', 'running', 'stopping'].includes(job.status);
+const labels: Record<string, string> = { starting: '准备任务', running: '运行中', stopping: '正在停止', complete: '已完成', failed: '失败', interrupted: '已中断', pending: '等待中', skipped: '已跳过' };
+const active = (job: Job | null) => job && ['starting', 'running', 'stopping'].includes(job.workflow?.status || job.status);
 let scene: SceneView | undefined;
 let map: MapInfo | null = null, job: Job | null = null, frame: Frame | null = null;
 let summaries: FrameSummary[] = [], jobs: Job[] = [];
@@ -81,6 +83,11 @@ let mapDirectories: MapDirectory[] = [], loadingDirectories = false;
 let preferredMapPath = localStorage.getItem('boxer-map-path') || '';
 try { scene = new SceneView(element('canvas-host')); }
 catch { showError('浏览器无法初始化 WebGL。请启用硬件加速或使用支持 WebGL 的浏览器；接口和图像回放仍可使用。'); }
+const roomResults = new RoomResults(element('room-results'), scene, fetchOk, () => {
+  if (roomResults.active) { setPlaying(false); scene?.setFollow(false); syncFollow(); }
+  else if (job?.processed_frames) void selectFrame(index, false);
+  buttons();
+}, showError, count => { element('object-count').textContent = `${count} 个最终目标`; });
 
 function showError(message: string) { element('error').textContent = message; element('error').hidden = false; }
 function clearError() { element('error').hidden = true; }
@@ -99,15 +106,16 @@ function buttons() {
   element<HTMLButtonElement>('start').disabled = busy || !map || !state.canStart;
   element<HTMLButtonElement>('apply-options').disabled = busy || !state.canApply;
   element('inference-note').textContent = state.message;
-  element<HTMLButtonElement>('stop').disabled = busy || !active(job) || !!job?.readonly || job?.status === 'stopping';
+  element<HTMLButtonElement>('stop').disabled = busy || !active(job) || !!job?.readonly || (job?.workflow?.status || job?.status) === 'stopping';
   const selectedMapPath = element<HTMLSelectElement>('map-path').value;
   element<HTMLButtonElement>('load-map').disabled = busy || loadingDirectories || !mapDirectories.some(item => item.path === selectedMapPath);
   element<HTMLSelectElement>('map-path').disabled = busy || loadingDirectories || !mapDirectories.length;
   element<HTMLButtonElement>('refresh-maps').disabled = busy || loadingDirectories;
   element<HTMLButtonElement>('import').disabled = busy || !map;
-  element<HTMLButtonElement>('play').disabled = !job?.processed_frames;
-  input('frame').disabled = !job?.processed_frames;
-  element<HTMLButtonElement>('focus').disabled = !scene?.follow.pose;
+  element<HTMLButtonElement>('play').disabled = !job?.processed_frames || roomResults.active;
+  input('frame').disabled = !job?.processed_frames || roomResults.active;
+  element<HTMLButtonElement>('focus').disabled = roomResults.active || !scene?.follow.pose;
+  element<HTMLButtonElement>('follow-camera').disabled = roomResults.active;
   element('busy-note').hidden = !activeJobId || job?.id === activeJobId;
 }
 async function action(work: () => Promise<void>) {
@@ -134,6 +142,7 @@ function syncFollow() { element('follow-camera').setAttribute('aria-pressed', St
 function detachJob() {
   events?.close(); frameRequest?.abort(); setPlaying(false);
   frame = null; job = null; summaries = []; index = 0; viewKey = '';
+  roomResults.update(null);
   clearImages(); scene?.clearFrame(); scene?.setTrajectory([]);
   element('frame-number').textContent = '0 / 0'; input('frame').value = '0'; input('frame').max = '0';
   element('object-count').textContent = '0 个目标';
@@ -142,9 +151,10 @@ function detachJob() {
   element<HTMLSelectElement>('view').disabled = true;
   element('job-status').innerHTML = '<span class="dot"></span>尚未开始';
   element('job-status').dataset.state = 'idle';
+  element('workflow-stages').textContent = '';
   element('progress-text').textContent = '0 / 0';
   element<HTMLProgressElement>('progress').value = 0;
-  element('job-detail').textContent = '地图已加载，可以开始推理或加载已有结果。';
+  element('job-detail').textContent = '地图已加载，开始推理后同时运行 Boxer 和房间分割。';
   element('output').textContent = ''; element('log').textContent = '';
   element('stream-state').textContent = '等待结果';
   buttons();
@@ -202,19 +212,23 @@ function setInference(value: InferenceState) {
 
 function showJob(value: Job) {
   job = value;
+  const overallStatus = value.workflow?.status || value.status;
   const status = element('job-status');
-  status.replaceChildren(Object.assign(document.createElement('span'), { className: 'dot' }), document.createTextNode(`${value.readonly ? '回放 · ' : ''}${labels[value.status] || value.status}`));
-  status.dataset.state = value.status;
+  status.replaceChildren(Object.assign(document.createElement('span'), { className: 'dot' }), document.createTextNode(`${value.readonly ? '回放 · ' : ''}${labels[overallStatus] || overallStatus}`));
+  status.dataset.state = overallStatus;
+  element('workflow-stages').textContent = value.workflow ? `Boxer：${labels[value.status]} · 房间分割：${labels[value.workflow.room_segmentation.status]} · 物体绑定：${labels[value.workflow.binding.status]}${value.workflow.map_export ? ` · 地图保存：${labels[value.workflow.map_export.status]}` : ''}` : '';
+  roomResults.update(value);
   element('progress-text').textContent = `${value.processed_frames} / ${value.total_frames}`;
   const progress = element<HTMLProgressElement>('progress');
   progress.max = Math.max(1, value.total_frames); progress.value = value.processed_frames;
   element('job-detail').textContent = `${value.device} · ${value.elapsed_seconds.toFixed(1)} 秒 · ${value.options.xnav_dedup === 'conservative' ? '保守去重' : '旧版去重'}${value.readonly ? ' · 只读结果' : ''}`;
-  element('output').textContent = `任务输出：${value.output_dir}${!value.readonly && !value.options.no_csv && value.status === 'complete' && map ? `\n地图 CSV：${map.path}/3dbbox` : ''}`;
+  element('output').textContent = `任务输出：${value.output_dir}${!value.readonly && !value.options.no_csv && value.status === 'complete' && map ? `\n地图 CSV：${map.path}/3dbbox` : ''}${value.workflow?.map_export && map ? `\n房间结果位置：${map.path}/${value.workflow.map_export.relative_path}` : ''}`;
   input('frame').max = String(Math.max(0, value.processed_frames - 1));
   element('frame-number').textContent = `${value.processed_frames ? index + 1 : 0} / ${value.processed_frames}`;
   input('show-tracks').disabled = !value.tracking;
   if (!value.tracking) input('show-tracks').checked = false;
   if (value.error) showError(value.error);
+  if (value.workflow?.error) showError(value.workflow.error);
   if (!value.readonly) activeJobId = active(value) ? value.id : activeJobId === value.id ? null : activeJobId;
   buttons();
 }
@@ -293,8 +307,9 @@ async function selectFrame(next: number, snap: boolean) {
     });
     const tracked = checked('show-tracks');
     const boxes = (tracked ? value.tracks : value.detections).filter(box => !tracked || checked('tentative') || box.state !== 'TENTATIVE');
-    scene?.setBoxes(boxes, tracked); scene?.setObserved(cloud); scene?.setObservation(observation, snap);
-    element('object-count').textContent = `${boxes.length} 个目标`;
+    if (!roomResults.active) scene?.setBoxes(boxes, tracked);
+    scene?.setObserved(cloud); scene?.setObservation(observation, snap && !roomResults.active);
+    if (!roomResults.active) element('object-count').textContent = `${boxes.length} 个目标`;
     element('image-title-3d').textContent = tracked ? '3D 轨迹投影' : '3D 检测投影';
     const views = element<HTMLSelectElement>('view');
     views.replaceChildren(...value.observations.map(o => new Option(`cam${o.camera_id} / ${o.view_id}`, `${o.camera_id}/${o.view_id}`)));
@@ -343,21 +358,21 @@ async function refreshMapDirectories() {
 async function refreshHistory() {
   jobs = await api<Job[]>('/api/jobs');
   const history = element<HTMLSelectElement>('history');
-  history.replaceChildren(new Option('选择任务', ''), ...jobs.map(item => new Option(`${item.readonly ? '回放' : labels[item.status]} · ${new Date(item.created_at).toLocaleString()} · ${item.processed_frames} 帧`, item.id)));
+  history.replaceChildren(new Option('选择任务', ''), ...jobs.map(item => new Option(`${item.readonly ? '回放' : labels[item.workflow?.status || item.status]} · ${new Date(item.created_at).toLocaleString()} · ${item.processed_frames} 帧`, item.id)));
   if (job) history.value = job.id;
 }
 async function health() {
   const generation = serviceGeneration;
   try {
     const [value, models] = await Promise.all([
-      api<{ cuda_available: boolean; device: string; active_job_id: string | null }>('/api/health'),
+      api<{ cuda_available: boolean; device: string; active_job_id: string | null; active_workflow_id?: string | null }>('/api/health'),
       api<InferenceState>('/api/inference'),
     ]);
     if (generation !== serviceGeneration) return;
-    activeJobId = value.active_job_id;
+    activeJobId = value.active_workflow_id || value.active_job_id;
     connected = true; setInference(models);
     const device = models.status === 'ready' ? models.device : value.device;
-    const state = models.status === 'loading' ? '模型加载中' : models.status === 'failed' ? '模型加载失败' : activeJobId ? '推理中' : '模型就绪';
+    const state = models.status === 'loading' ? '模型加载中' : models.status === 'failed' ? '模型加载失败' : activeJobId ? '任务运行中' : '模型就绪';
     element('health').replaceChildren(Object.assign(document.createElement('span'), { className: 'dot' }), document.createTextNode(`${device} / ${state}`));
   } catch (error) {
     if (generation !== serviceGeneration) return;

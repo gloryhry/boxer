@@ -22,6 +22,7 @@ from loaders.xnav_loader import processing_frame_id
 from utils.potential_field_service import (
     LogInfo,
     PotentialFieldJobs,
+    RoomSegmentationDispatcher,
     VoxelConnectivityJobs,
     install_room_segmentation_routes,
 )
@@ -40,6 +41,8 @@ from utils.xnav_service import (
     MapDirectories,
     MapInfo,
     MapRequest,
+    RoomBindingPage,
+    RoomResult,
     SceneInfo,
     list_map_directories,
 )
@@ -52,6 +55,7 @@ from utils.xnav_upload import (
     storage_error,
 )
 from utils.xnav_web_scene import cloud_bytes, render_observation
+from utils.xnav_workflow import MapWorkflows
 
 
 class ErrorResponse(BaseModel):
@@ -63,6 +67,7 @@ class HealthInfo(BaseModel):
     cuda_available: bool
     device: str
     active_job_id: str | None
+    active_workflow_id: str | None = None
     inference_status: Literal["loading", "ready", "failed"]
     inference_error: str | None = None
 
@@ -90,6 +95,12 @@ def create_app(
         potential_field_jobs = PotentialFieldJobs(room_output)
     if voxel_connectivity_jobs is None:
         voxel_connectivity_jobs = VoxelConnectivityJobs(room_output)
+    room_dispatcher = RoomSegmentationDispatcher(
+        manager, potential_field_jobs, voxel_connectivity_jobs
+    )
+    workflows = MapWorkflows(
+        manager, room_dispatcher, voxel_connectivity_jobs, room_output
+    )
     web_dir = Path(web_dir) if web_dir is not None else REPO / "web" / "dist"
 
     @asynccontextmanager
@@ -109,6 +120,7 @@ def create_app(
                 await asyncio.to_thread(manager.poll)
                 await asyncio.to_thread(potential_field_jobs.poll)
                 await asyncio.to_thread(voxel_connectivity_jobs.poll)
+                await asyncio.to_thread(workflows.poll)
                 await asyncio.sleep(0.3)
 
         task = asyncio.create_task(monitor())
@@ -121,17 +133,21 @@ def create_app(
                     await task
             finally:
                 try:
-                    await asyncio.to_thread(potential_field_jobs.close)
+                    await asyncio.to_thread(workflows.close)
                 finally:
                     try:
-                        await asyncio.to_thread(voxel_connectivity_jobs.close)
+                        await asyncio.to_thread(potential_field_jobs.close)
                     finally:
-                        await asyncio.to_thread(uploads.close)
-                        await asyncio.to_thread(manager.close)
+                        try:
+                            await asyncio.to_thread(voxel_connectivity_jobs.close)
+                        finally:
+                            await asyncio.to_thread(uploads.close)
+                            await asyncio.to_thread(manager.close)
+                            await asyncio.to_thread(workflows.poll)
 
     app = FastAPI(
         title="Boxer x-nav API",
-        version="1.1.0",
+        version="1.2.0",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -139,12 +155,15 @@ def create_app(
             "Local/LAN map inference and committed-result replay. "
             "Nanosecond timestamps are strings. Cloud responses contain "
             "little-endian float32 xyzrgb vertices (24 bytes per point)."
+            " POST /api/jobs runs Boxer and voxel room segmentation concurrently; "
+            "workflow.status describes the complete workflow, status describes Boxer."
         ),
     )
     app.state.manager = manager
     app.state.uploads = uploads
     app.state.potential_field_jobs = potential_field_jobs
     app.state.voxel_connectivity_jobs = voxel_connectivity_jobs
+    app.state.workflows = workflows
     app.state.stopping = False
 
     @app.exception_handler(Interrupted)
@@ -166,6 +185,7 @@ def create_app(
             "status": "ok",
             **app.state.hardware,
             "active_job_id": manager.active_id,
+            "active_workflow_id": workflows.active_id,
             "inference_status": inference["status"],
             "inference_error": inference["error"],
         }
@@ -322,16 +342,18 @@ def create_app(
     install_room_segmentation_routes(
         app, manager, potential_field_jobs, voxel_connectivity_jobs,
         errors=ERRORS, artifact_response=cloud_response,
+        dispatcher=room_dispatcher,
     )
 
     @app.get("/api/jobs", response_model=list[JobInfo], responses=ERRORS)
     def list_jobs():
-        with manager.lock:
-            return [manager.info(key) for key in reversed(manager.jobs)]
+        return workflows.list()
 
     @app.post("/api/jobs", response_model=JobInfo, status_code=202, responses=ERRORS)
     def start_job(body: JobRequest):
-        return manager.start(body)
+        if app.state.stopping:
+            raise HTTPException(503, "Workflow service is shutting down")
+        return workflows.start(body)
 
     # Literal routes precede the dynamic job-ID route.
     @app.post("/api/jobs/import", response_model=JobInfo, responses=ERRORS)
@@ -340,7 +362,7 @@ def create_app(
 
     @app.get("/api/jobs/{job_id}", response_model=JobInfo, responses=ERRORS)
     def job_info(job_id: str):
-        return manager.info(job_id)
+        return workflows.info(job_id)
 
     @app.post(
         "/api/jobs/{job_id}/stop",
@@ -349,7 +371,50 @@ def create_app(
         responses=ERRORS,
     )
     def stop_job(job_id: str):
-        return manager.stop(job_id)
+        return workflows.stop(job_id)
+
+    @app.get("/api/jobs/{job_id}/rooms", response_model=RoomResult, responses=ERRORS)
+    def job_rooms(job_id: str):
+        """Completed room segmentation, available independently of Boxer/binding."""
+        return workflows.room_result(job_id)
+
+    @app.get(
+        "/api/jobs/{job_id}/rooms/cloud", response_class=Response,
+        responses={**ERRORS, **cloud_response},
+    )
+    def job_room_cloud(
+        job_id: str, request: Request, room_id: int | None = Query(None, ge=-1),
+    ):
+        """At most 500000 xyzrgb vertices; -1 selects unassigned cloud points."""
+        return binary(
+            workflows.room_cloud(job_id, room_id), request, "application/octet-stream"
+        )
+
+    @app.get(
+        "/api/jobs/{job_id}/room-bindings", response_model=RoomBindingPage,
+        responses=ERRORS,
+    )
+    def job_room_bindings(
+        job_id: str, offset: int = Query(0, ge=0),
+        limit: int = Query(200, ge=1, le=1000),
+        room_id: int | None = Query(None, ge=-1),
+    ):
+        """Final OBB room votes. room_id=-1 selects unbound objects; omit for all."""
+        return workflows.binding_page(job_id, offset, limit, room_id)
+
+    @app.get(
+        "/api/jobs/{job_id}/room-bindings.json", response_class=FileResponse,
+        responses={
+            **ERRORS,
+            200: {"content": {"application/json": {"schema": {"type": "object"}}}},
+        },
+    )
+    def download_room_bindings(job_id: str):
+        """Immutable full result, including provenance, thresholds and vote evidence."""
+        return FileResponse(
+            workflows.binding_path(job_id), media_type="application/json",
+            filename=f"room-bindings-{job_id}.json",
+        )
 
     @app.get("/api/jobs/{job_id}/log", response_model=LogInfo, responses=ERRORS)
     def job_log(job_id: str):
@@ -370,13 +435,13 @@ def create_app(
         },
     )
     async def events(job_id: str, request: Request):
-        manager.info(job_id)
+        workflows.info(job_id)
 
         async def stream():
             previous = None
             heartbeat = 0
             while not app.state.stopping and not await request.is_disconnected():
-                data = json.dumps(manager.info(job_id), ensure_ascii=False)
+                data = json.dumps(workflows.info(job_id), ensure_ascii=False)
                 if data != previous:
                     yield f"event: job\ndata: {data}\n\n"
                     previous = data
@@ -413,16 +478,17 @@ def create_app(
             },
         },
         description=(
-            "Download the 3dbbox snapshot published before a new inference job "
-            "becomes complete. ZIP entries include the top-level 3dbbox/ directory "
-            "and map-wide accumulated DINO features. Returns 409 for jobs that "
+            "Download the immutable 3dbbox snapshot. New workflows archive after "
+            "room results are saved; workflow.status must be complete. Includes "
+            "detection CSVs, room segmentation, object bindings and accumulated "
+            "DINO features under 3dbbox/. Returns 409 for jobs that "
             "have not completed successfully or used no_csv=true; 404 for unknown "
             "jobs, imported replays, or historical jobs without an archive."
         ),
     )
     def download_job_archive(job_id: str):
         return FileResponse(
-            manager.archive_path(job_id),
+            workflows.archive_path(job_id),
             media_type="application/zip",
             filename=f"3dbbox-{job_id}.zip",
         )
@@ -631,9 +697,9 @@ def main(*, manager_factory=JobManager):
             # End SSE connections before Uvicorn waits for HTTP requests to drain.
             app.state.stopping = True
             app.state.uploads.stop.set()
-            identity = app.state.manager.active_id
+            identity = app.state.workflows.active_id or app.state.manager.active_id
             if identity is not None:
-                app.state.manager.stop(identity)
+                app.state.workflows.stop(identity)
             super().handle_exit(sig, frame)
 
     LocalServer(

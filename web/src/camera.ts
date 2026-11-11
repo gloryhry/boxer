@@ -49,6 +49,9 @@ export class SceneView {
   private readonly labels: { point: THREE.Vector3; element: HTMLSpanElement }[] = [];
   private readonly cameraMarker = new THREE.Group();
   private map?: THREE.Points;
+  private roomCloud?: THREE.Points;
+  private roomsMode = false;
+  private mapVisible = true;
   private observed?: THREE.Points;
   private trajectory?: THREE.Line;
   private center = new THREE.Vector3();
@@ -136,6 +139,8 @@ export class SceneView {
   }
 
   setMap(info: SceneInfo, data: ArrayBuffer) {
+    this.setRoomCloud();
+    this.setRoomsMode(false);
     if (this.map) release(this.map);
     this.clearFrame();
     this.setTrajectory([]);
@@ -150,15 +155,31 @@ export class SceneView {
   setObserved(data?: ArrayBuffer) {
     if (this.observed) release(this.observed);
     this.observed = data ? this.cloud(data, 2.5) : undefined;
-    if (this.observed) this.scene.add(this.observed);
+    if (this.observed) { this.scene.add(this.observed); this.observed.visible = !this.roomsMode; }
   }
 
-  showMap(show: boolean) { if (this.map) this.map.visible = show; }
+  setRoomCloud(data?: ArrayBuffer) {
+    if (this.roomCloud) release(this.roomCloud);
+    this.roomCloud = data ? this.cloud(data, 1.8) : undefined;
+    if (this.roomCloud) { this.scene.add(this.roomCloud); this.roomCloud.visible = this.roomsMode && this.mapVisible; }
+  }
+
+  setRoomsMode(enabled: boolean) {
+    this.roomsMode = enabled;
+    if (this.map) this.map.visible = !enabled && this.mapVisible;
+    if (this.roomCloud) this.roomCloud.visible = enabled && this.mapVisible;
+    if (this.observed) this.observed.visible = !enabled;
+    if (this.trajectory) this.trajectory.visible = !enabled;
+    this.cameraMarker.visible = !enabled;
+  }
+
+  showMap(show: boolean) { this.mapVisible = show; this.setRoomsMode(this.roomsMode); }
 
   setTrajectory(positions: number[][]) {
     if (this.trajectory) release(this.trajectory);
     const geometry = new THREE.BufferGeometry().setFromPoints(positions.map(p => new THREE.Vector3().fromArray(p)));
     this.trajectory = new THREE.Line(geometry, new THREE.LineBasicMaterial({ color: '#2c8ba5' }));
+    this.trajectory.visible = !this.roomsMode;
     this.scene.add(this.trajectory);
   }
 

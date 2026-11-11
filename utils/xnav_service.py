@@ -162,6 +162,34 @@ class SceneInfo(BaseModel):
     unit: str
 
 
+StageStatus = Literal[
+    "pending", "running", "stopping", "complete", "failed", "interrupted", "skipped"
+]
+
+
+class WorkflowStage(BaseModel):
+    status: StageStatus = "pending"
+    job_id: str | None = None
+    error: str | None = None
+    reason: str | None = None
+    artifacts: dict[str, str] = Field(default_factory=dict)
+
+
+class MapExportInfo(BaseModel):
+    status: StageStatus = "pending"
+    relative_path: str = "3dbbox/room_segmentation"
+    error: str | None = None
+
+
+class WorkflowInfo(BaseModel):
+    status: Status = "starting"
+    room_segmentation: WorkflowStage = Field(default_factory=WorkflowStage)
+    binding: WorkflowStage = Field(default_factory=WorkflowStage)
+    map_export: MapExportInfo | None = None
+    error: str | None = None
+    finished_at: str | None = None
+
+
 class JobInfo(BaseModel):
     id: str
     map_id: str
@@ -177,6 +205,7 @@ class JobInfo(BaseModel):
     tracking: bool = False
     device: str = "initializing"
     error: str | None = None
+    workflow: WorkflowInfo | None = None
 
 
 class SavedModel(BaseModel):
@@ -281,6 +310,56 @@ class BoxPage(BaseModel):
 
 class Box3DPage(BoxPage):
     items: list[Box3DRow]
+
+
+class RoomInfo(BaseModel):
+    id: int = Field(ge=0)
+    name: str
+    point_count: int = Field(ge=0)
+    color: list[int]
+    bounds: list[list[float]]
+    center: list[float]
+    confidence: float | None = None
+    area_m2: float | None = None
+    cell_count: int | None = None
+
+
+class RoomResult(BaseModel):
+    job_id: str
+    map_id: str
+    segmentation_job_id: str
+    algorithm: Literal["voxel_connectivity"] = "voxel_connectivity"
+    rooms: list[RoomInfo]
+    summary: dict
+    artifacts: dict[str, str]
+
+
+class RoomVote(BaseModel):
+    room_id: int
+    point_count: int = Field(ge=0)
+
+
+class RoomBindingRow(Box3DRow):
+    room_id: int | None
+    room_name: str | None
+    point_count: int = Field(ge=0)
+    labeled_point_count: int = Field(ge=0)
+    support_points: int = Field(ge=0)
+    vote_ratio: float = Field(ge=0, le=1)
+    votes: list[RoomVote]
+    reason: str | None
+
+
+class RoomBindingPage(BaseModel):
+    job_id: str
+    map_id: str
+    segmentation_job_id: str
+    status: Literal["complete"] = "complete"
+    summary: dict
+    total: int = Field(ge=0)
+    offset: int = Field(ge=0)
+    limit: int = Field(ge=1, le=1000)
+    items: list[RoomBindingRow]
 
 
 class Box2DPage(BoxPage):
@@ -535,8 +614,8 @@ class JobManager:
                     self._spawn_worker(values)
             return self.inference_info()
 
-    def _new_job(self, map_id, options, readonly=False):
-        identity = uuid.uuid4().hex
+    def _new_job(self, map_id, options, readonly=False, *, identity=None):
+        identity = identity or uuid.uuid4().hex
         return {
             "id": identity,
             "map_id": map_id,
@@ -552,7 +631,8 @@ class JobManager:
             "error": None,
         }
 
-    def start(self, request):
+    def prepare_start(self, request):
+        """Validate without publishing a job or dispatching model work."""
         with self.lock:
             if self._closing:
                 raise HTTPException(503, "The inference service is shutting down")
@@ -584,7 +664,13 @@ class JobManager:
                 skip_n=options["skip_n"],
                 max_n=options["max_n"],
             )
-            job = self._new_job(request.map_id, options)
+            return loader, options
+
+    def start(self, request, *, identity=None, defer_archive=False):
+        with self.lock:
+            loader, options = self.prepare_start(request)
+            job = self._new_job(request.map_id, options, identity=identity)
+            job["defer_archive"] = defer_archive
             job["total_frames"] = len(loader)
             job["results_path"] = str(
                 loader.output_path(job["output_dir"]) / "results.json"
@@ -717,6 +803,7 @@ class JobManager:
                     self._export_results,
                     Path(job["results_path"]).parent,
                     self.map_records[job["map_id"]]["path"],
+                    None if job.get("defer_archive") else
                     self.root / "jobs" / identity / "3dbbox.zip",
                     cancel,
                 )
@@ -747,7 +834,8 @@ class JobManager:
         except Exception as error:
             raise RuntimeError(f"Could not export map CSVs: {error}") from error
         try:
-            create_map_archive(map_root, archive, cancel)
+            if archive is not None:
+                create_map_archive(map_root, archive, cancel)
         except CancelledError:
             raise
         except Exception as error:

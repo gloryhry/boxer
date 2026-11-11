@@ -2,12 +2,12 @@
 
 本文覆盖 `server.py` 的地图注册与上传、Boxer 物体检测与回放、房间分割和任务输出文件。
 
-核对日期为 2026-11-10，服务 API 版本为 `1.1.0`。部署版本的字段与约束可通过 `/openapi.json` 核对。
+核对日期为 2026-11-11，服务 API 版本为 `1.2.0`。部署版本的字段与约束可通过 `/openapi.json` 核对。
 
 | 用途 | 提交入口 | 结果入口 |
 | --- | --- | --- |
 | 注册或上传 x-nav 地图 | `POST /api/maps` 或 `POST /api/maps/uploads` | 地图 `id`、场景元数据、预览点云 |
-| Boxer 物体检测与跟踪 | `POST /api/jobs` | 逐帧回放、检测框 JSON、`3dbbox.zip` |
+| Boxer 与体素房间分割联合流程 | `POST /api/jobs` | 逐帧回放、检测框、房间、物体绑定、`3dbbox.zip` |
 | 势场法房间分割 | `POST /api/potential-field/jobs` | 带房间标签的 PLY、房间列表和统计 JSON |
 | 体素连通复核 | `POST /api/voxel-connectivity/jobs` | 带房间标签的 PLY、房间列表和统计 JSON |
 
@@ -27,7 +27,8 @@
 - [12. 错误处理与排查](#12-错误处理与排查)
 - [13. 势场法房间分割](#13-势场法房间分割)
 - [14. 体素连通复核](#14-体素连通复核)
-- [15. 实现位置与维护](#15-实现位置与维护)
+- [15. 联合工作流与物体房间绑定](#15-联合工作流与物体房间绑定)
+- [16. 实现位置与维护](#16-实现位置与维护)
 
 ## 1. 服务入口与部署
 
@@ -130,6 +131,8 @@ API 中的 `path`、`results_path`、`ckpt` 都是**服务进程可见的文件�
 
 Boxer 物体检测最多运行一个活动任务。势场法和体素连通复核共享一个独立的 CPU 分割任务槽。分割任务运行或停止期间，两个分割入口均拒绝新的分割提交。物体检测的模型与已应用参数由所有客户端共享，历史回放可以同时读取。
 
+`POST /api/jobs` 同时提交 Boxer 与体素连通复核，成功后自动绑定最终物体。联合流程同时只受理一个，已有流程或 CPU 分割占槽时返回 `409`，不排队。导入目录和 ZIP 上传完成仍只注册地图，不启动任务。完整流程以 `workflow.status` 为准；顶层 `status` 仍仅表示 Boxer 阶段。
+
 `PUT /api/inference`、`POST /api/jobs`、停止任务接口的正常响应码为 `202`，表示请求已受理；最终状态需要继续查询。地图注册和结果导入正常返回 `200`。
 
 关闭浏览器、断开 HTTP 请求或关闭 SSE 连接不会停止推理。需要停止时显式调用任务的 `/stop` 接口。
@@ -204,7 +207,7 @@ curl --fail-with-body -sS \
 
 ## 4. 接口总览
 
-下表列出全部 36 个业务 API 操作，包含 30 个原有操作和 6 个势场操作。成功状态码指正常受理或读取时的状态。
+下表列出业务 API 操作。成功状态码指正常受理或读取时的状态。
 
 | 方法 | 路径 | 成功码 | 用途 |
 | --- | --- | --- | --- |
@@ -223,13 +226,17 @@ curl --fail-with-body -sS \
 | `GET` | `/api/maps/{map_id}/scene` | `200` | 查询全局场景元数据 |
 | `GET` | `/api/maps/{map_id}/cloud` | `200` / `304` | 获取全局可视化点云 |
 | `GET` | `/api/jobs` | `200` | 获取任务列表 |
-| `POST` | `/api/jobs` | `202` | 创建推理任务 |
+| `POST` | `/api/jobs` | `202` | 同时创建 Boxer 与体素分割任务 |
 | `POST` | `/api/jobs/import` | `200` | 导入已有结果用于只读回放 |
 | `GET` | `/api/jobs/{job_id}` | `200` | 获取任务摘要与进度 |
 | `POST` | `/api/jobs/{job_id}/stop` | `202` | 请求停止推理任务 |
 | `GET` | `/api/jobs/{job_id}/log` | `200` | 获取任务日志尾部 |
 | `GET` | `/api/jobs/{job_id}/events` | `200` | 订阅任务 SSE 事件 |
 | `GET` | `/api/jobs/{job_id}/3dbbox.zip` | `200` | 下载成功任务的 `3dbbox/` ZIP 快照 |
+| `GET` | `/api/jobs/{job_id}/rooms` | `200` | 查询关联房间列表、统计及原始产物地址 |
+| `GET` | `/api/jobs/{job_id}/rooms/cloud` | `200` / `304` | 获取房间着色预览点云 |
+| `GET` | `/api/jobs/{job_id}/room-bindings` | `200` | 分页查询最终物体的房间归属 |
+| `GET` | `/api/jobs/{job_id}/room-bindings.json` | `200` | 下载完整绑定结果 |
 | `GET` | `/api/jobs/{job_id}/frames` | `200` | 分页查询已提交帧摘要 |
 | `GET` | `/api/jobs/{job_id}/frames/{index}` | `200` | 获取单帧完整结果 |
 | `GET` | `/api/jobs/{job_id}/frames/{index}/images/{kind}` | `200` / `304` | 获取 2D 或 3D 叠加 JPEG |
@@ -265,6 +272,7 @@ curl --fail-with-body -sS \
   "cuda_available": true,
   "device": "NVIDIA GPU 名称",
   "active_job_id": null,
+  "active_workflow_id": null,
   "inference_status": "ready",
   "inference_error": null
 }
@@ -273,6 +281,8 @@ curl --fail-with-body -sS \
 `status: "ok"` 表示 HTTP 服务可响应，不能单独用来判断可否开始推理。即使模型加载失败，该接口仍可正常返回；应检查 `inference_status` 和 `inference_error`。
 
 这里的 `device` 是硬件名称，CUDA 不可用时为 `cpu`；实际模型执行设备以 `/api/inference` 的 `device` 为准。例如设置 `force_cpu=true` 后，健康信息仍可能显示存在 NVIDIA GPU。
+
+`active_job_id` 表示正在运行的 Boxer 任务；`active_workflow_id` 表示尚未结束的联合流程，两者使用同一个 Boxer 任务 ID。Boxer 完成但分割或绑定仍运行时，前者可为 `null`，后者仍有值。
 
 ### 5.2 `GET /api/inference`
 
@@ -548,6 +558,8 @@ python scripts/upload_xnav_map.py /path/to/园区A.zip \
 
 正常返回 `202` 和 `JobInfo`；返回时通常为 `starting`。仍需检查响应中的 `status` 和后续任务状态：worker 发送失败等异常也可能使此次返回的任务已经为 `failed`。
 
+从 1.2.0 开始，此接口也派发体素连通复核。请求体保持不变；分割读取 `config/voxel_connectivity.yaml`，可由 `BOXER_VC_CONFIG` 指定。提交前检查模型、地图、`global_map.pcd`、解释器、配置和两个任务槽。模型未就绪返回 `503`，地图/全局点云不存在返回 `404`，占槽返回 `409`。受理后的阶段失败通过 `workflow` 报告，另一项继续运行。
+
 ### 7.2 `GET /api/jobs`
 
 无请求参数，返回 `JobInfo[]`，同时包含推理任务和导入的只读任务。当前按内存记录插入顺序逆序返回，没有分页或过滤参数。服务重启从磁盘恢复后的顺序不应作为严格的创建时间排序；需要时使用 `created_at` 自行排序。
@@ -571,11 +583,12 @@ python scripts/upload_xnav_map.py /path/to/园区A.zip \
   "elapsed_seconds": 20.5,
   "tracking": true,
   "device": "cuda",
-  "error": null
+  "error": null,
+  "workflow": null
 }
 ```
 
-示例仅简写了 `options`；普通推理任务实际保存完整解析配置，导入任务则只保存部分历史信息。
+示例为没有关联工作流的历史任务，并简写了 `options`；普通推理任务实际保存完整解析配置，导入任务则只保存部分历史信息。新任务的 `workflow` 见第 15 节。
 
 | 字段 | 说明 |
 | --- | --- |
@@ -592,17 +605,18 @@ python scripts/upload_xnav_map.py /path/to/园区A.zip \
 | `tracking` | 是否包含跟踪结果；优先取保存结果中的跟踪设置 |
 | `device` | 执行设备或保存结果中的设备信息 |
 | `error` | 错误详情，无错误通常为 `null` |
+| `workflow` | 联合流程状态、关联分割与绑定阶段；历史/只读任务为 `null` |
 
 | 状态 | 含义 | 客户端处理 |
 | --- | --- | --- |
 | `starting` | 任务已记录，等待 worker 开始 | 继续等待 |
 | `running` | 正在推理、提交帧或进行收尾 | 读取已提交结果并继续等待 |
 | `stopping` | 已请求中断，正在等待退出 | 继续等待最终状态 |
-| `complete` | 推理、输出关闭及要求的地图 CSV 导出和 ZIP 归档均完成 | 本次推理成功结束 |
+| `complete` | Boxer 推理、输出关闭及要求的地图 CSV 导出完成；旧任务还包含其 ZIP 收尾 | 继续检查联合流程的保存与归档状态 |
 | `failed` | 推理、结果读取、导出或 ZIP 归档失败 | 读取 `error` 和日志；已提交帧可能仍可回放 |
 | `interrupted` | 用户停止、服务重启或其他中断 | 已提交帧保留，不会自动续推 |
 
-对普通推理任务，`complete`、`failed`、`interrupted` 是客户端等待的结束状态。`processed_frames == total_frames` 不等于任务成功：输出收尾、地图 CSV 导出和 ZIP 归档仍可能未完成或失败。`no_csv=true` 跳过检测 CSV 导出和 ZIP 归档，任务仍可正常完成。
+上述状态描述 Boxer 阶段。新联合流程须等待 `workflow.status` 的 `complete`、`failed` 或 `interrupted`；历史任务与只读导入任务的 `workflow` 为 `null`，按顶层状态处理。`processed_frames == total_frames` 不等于成功：输出收尾、地图 CSV 导出、ZIP、分割、绑定或地图保存仍可能未结束。`no_csv=true` 跳过检测 CSV 导出和 ZIP，仍执行分割、绑定及房间地图保存。
 
 ### 7.4 `POST /api/jobs/{job_id}/stop`
 
@@ -613,6 +627,8 @@ curl --fail-with-body -sS -X POST "$API_BASE/api/jobs/$JOB_ID/stop"
 ```
 
 活动任务先进入 `stopping`，向正在执行的推理发送 SIGINT。默认等待最多 60 秒，然后向 worker 进程组发送 SIGTERM，5 秒后仍未退出则升级 SIGKILL。正常中断后可以复用模型；worker 被强制结束后会重新准备模型。
+
+联合流程的 `workflow.status` 进入 `stopping`，同时停止仍运行的 Boxer、关联分割与绑定，并取消未发布的地图导出和 ZIP。即使 Boxer 已完成也能停止剩余阶段。分割和绑定先发送 SIGTERM，超时升级 SIGKILL；已经成功发布的计算结果和地图目录保留。
 
 如果任务仍在 `starting`，服务会在收到 worker 的开始通知后再发送中断。重复停止或停止已结束的普通推理任务返回其当前摘要，不会重新执行推理。导入任务为只读，调用此接口返回 `409`。
 
@@ -672,12 +688,12 @@ curl --fail-with-body -N "$API_BASE/api/jobs/$JOB_ID/events"
 
 ### 7.8 `GET /api/jobs/{job_id}/3dbbox.zip`
 
-无请求体和查询参数。新建普通推理任务在 `no_csv=false` 且成功完成后，提供完成时源地图
-`3dbbox/` 的持久化 ZIP 快照；下载不会重新压缩当前地图目录。同一地图后续重跑或服务
+无请求体和查询参数。新联合任务在 `no_csv=false` 且 `workflow.status=complete` 后，提供完成时源地图
+`3dbbox/` 的持久化 ZIP 快照，包含本次房间分割、绑定与来源记录。Boxer 顶层 `status=complete` 仅说明自身输出和 CSV 已完成；此时可能仍不能下载 ZIP。下载不会重新压缩当前地图目录。同一地图后续重跑或服务
 重启不会改变该任务的 ZIP 内容。
 
 ```bash
-# 先查询任务并等待 status == "complete"，再下载。
+# 新任务先等待 workflow.status == "complete"；旧任务仍按 status 判断。
 curl --fail-with-body -sS \
   "$API_BASE/api/jobs/$JOB_ID/3dbbox.zip" -o "3dbbox-$JOB_ID.zip"
 ```
@@ -686,23 +702,23 @@ curl --fail-with-body -sS \
 `Content-Disposition: attachment; filename="3dbbox-<job_id>.zip"`。
 ZIP 保留顶层 `3dbbox/` 及业务子目录，包含四个检测/跟踪 CSV、`labels.csv`、
 `dino_features.csv` 和目录内其他业务文件；空结果 CSV 仍保留表头。
-DINO 特征保留归档时的地图级累计行，并不只包含该任务新增的行。
+DINO 特征保留归档时的地图级累计行，并不只包含该任务新增的行。新任务还包含
+`3dbbox/room_segmentation/` 的五个文件，见第 15.4 节。
 内部 `.dino_features.lock`、`.boxer-*` 暂存项和原子写入临时文件不进入 ZIP；
 遇到符号链接、特殊文件或不可读文件时归档失败。
 
 | 情况 | 状态码 | 客户端处理 |
 | --- | --- | --- |
-| 成功完成且归档存在 | `200` | 保存二进制 ZIP |
-| `starting`、`running`、`stopping`、`failed` 或 `interrupted` | `409` | 等待成功完成，或检查任务错误 |
+| 联合流程成功完成且归档存在；旧任务按原规则 | `200` | 保存二进制 ZIP |
+| 新联合流程未成功完成，或旧任务的 Boxer 未成功完成 | `409` | 即使 Boxer 已完成，也须等待地图保存及归档 |
 | `no_csv=true` | `409` | 此类任务不生成 ZIP，即使目录保留旧 CSV 也不提供下载 |
 | 未知任务、导入的只读任务、历史任务无归档或归档已删除 | `404` | 不会用当前地图目录补生成历史 ZIP |
 
-地图导出和压缩由单线程后台任务完成，不持有任务管理器全局锁；期间任务保持 `running`，
-查询和健康检查仍可用，新推理任务须等待收尾。ZIP 使用 DEFLATE、ZIP64 和分块读写，
-临时写入后原子发布；发布成功后任务才进入 `complete`。
-磁盘空间、权限等归档错误会使任务进入 `failed`，`error` 记录原因，已有推理结果保留。
+新联合流程中，Boxer 后台导出 CSV 后进入 `complete`；待绑定完成，再由工作流后台保存房间结果并统一压缩。期间 `workflow.status` 保持 `running`，查询和健康检查仍可用，新联合任务须等待收尾。ZIP 使用 DEFLATE、ZIP64 和分块读写，
+临时写入后原子发布；归档及完成状态持久化成功后，整体才进入 `complete`。
+磁盘空间、权限等保存或归档错误会使整体进入 `failed`，`workflow.map_export.error` 记录原因，已经成功的计算结果保留。
 收尾期间可以请求停止，任务经过 `stopping` 进入 `interrupted`，未发布 ZIP 被清理；
-此时地图 CSV 可能已经导出。服务关闭时取消并等待收尾退出，重启不自动续做归档。
+此时地图 CSV 或房间目录可能已经成功发布。服务关闭时取消并等待收尾退出，重启不自动续做归档。历史任务已有 ZIP 不补包或重写。
 
 ## 8. 帧数据、检测框、图像与点云接口
 
@@ -1077,8 +1093,9 @@ deadline = time.monotonic() + 3600
 
 while True:
     job = api("GET", f"/api/jobs/{job_id}")
-    print(job["status"], job["processed_frames"], "/", job["total_frames"])
-    if job["status"] in {"complete", "failed", "interrupted"}:
+    state = job.get("workflow") or job
+    print(state["status"], job["processed_frames"], "/", job["total_frames"])
+    if state["status"] in {"complete", "failed", "interrupted"}:
         break
     if time.monotonic() >= deadline:
         # 本例约定等待超时后也中断服务器任务。
@@ -1086,15 +1103,18 @@ while True:
         raise TimeoutError(f"Job {job_id} timed out; stop requested")
     time.sleep(1)
 
-if job["status"] != "complete":
+if state["status"] != "complete":
     log = api("GET", f"/api/jobs/{job_id}/log")["text"]
-    raise RuntimeError(f"{job['status']}: {job['error']}\n{log}")
+    raise RuntimeError(f"{state['status']}: {state['error']}\n{log}")
 
 page = api("GET", f"/api/jobs/{job_id}/frames", params={"limit": 1})
 if page["frames"]:
     frame = api("GET", f"/api/jobs/{job_id}/frames/0")
     print(json.dumps(frame, ensure_ascii=False, indent=2))
 print("Server results path:", job["results_path"])
+if job.get("workflow"):
+    print(api("GET", f"/api/jobs/{job_id}/rooms"))
+    print(api("GET", f"/api/jobs/{job_id}/room-bindings", params={"limit": 1000}))
 ```
 
 等待时限是客户端示例策略，实际地图规模和首次模型编译时间不同，应按部署环境调整。发生网络超时不代表服务任务停止，调用方应保留 `job_id` 并重新查询。
@@ -1109,9 +1129,10 @@ const events = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/events`);
 
 events.addEventListener("job", (event) => {
   const job = JSON.parse(event.data);
-  console.log(job.status, job.processed_frames, job.total_frames);
+  const state = job.workflow || job;
+  console.log(state.status, job.processed_frames, job.total_frames);
   // 根据 processed_frames 按需获取新增帧。
-  if (["complete", "failed", "interrupted"].includes(job.status)) {
+  if (["complete", "failed", "interrupted"].includes(state.status)) {
     events.close();
   }
 });
@@ -1257,11 +1278,11 @@ DINOv3 特征默认合并到地图包的 `3dbbox/dino_features.csv`，每张有�
 
 服务先暂存四份文件，再逐个原子替换，任务目录保留原件。这是逐文件发布，不是四个文件整体的事务；同步读取多个文件时，应在任务 `complete` 后读取。
 
-地图 CSV 导出后，服务保存该任务的 `3dbbox.zip` 快照，ZIP 原子发布后才标记任务 `complete`。缺少所需 CSV、地图目录不可写或 ZIP 归档失败时，任务显示 `failed`，即使推理结果自身已经完整。此时可继续从任务目录或帧接口读取已提交结果，并查看 `error` 中的导出或归档失败原因。
+新联合流程中，地图 CSV 导出后 Boxer 阶段即可标记 `complete`，待分割与绑定完成再保存房间目录和生成 `3dbbox.zip`，详见第 15.4 节。缺少所需 CSV 或 CSV 导出失败仍使 Boxer 阶段失败；房间保存和 ZIP 失败由 `workflow.map_export` 报告并使整体失败。此时仍可从各任务目录或结果接口读取成功阶段的产物。历史任务的归档行为保持原样。
 
 `no_csv=true`、推理失败、中断或导入历史结果时不执行 CSV 地图导出；已逐帧保存的 DINOv3 特征会保留。无检测或关闭跟踪时，相关 CSV 仍可只有表头。新增的 `3dbbox/` 不计入地图来源签名。
 
-同一地图反复处理时，`no_csv=true` 会保留以前的检测 CSV，而词表和 DINOv3 特征仍可能更新。需要交付某次成功任务的地图产物时，使用该任务的 `3dbbox.zip`。
+同一地图反复处理时，`no_csv=true` 会保留以前的检测 CSV，而词表、DINOv3 特征和本次房间结果仍可能更新；不生成 ZIP。需要交付某次成功完整流程的地图产物时，使用该任务的 `3dbbox.zip`。
 
 ### 11.4 重启与恢复
 
@@ -1478,7 +1499,92 @@ curl --fail-with-body -sS -X POST "$API_BASE/api/voxel-connectivity/jobs" \
   --resolution 0.10 --min-room-points 20000
 ```
 
-## 15. 实现位置与维护
+## 15. 联合工作流与物体房间绑定
+
+### 15.1 状态与结果来源
+
+新建 `JobInfo` 增加以下字段；列表、详情和 SSE 的字段一致：
+
+```json
+{
+  "workflow": {
+    "status": "running",
+    "room_segmentation": {
+      "status": "complete", "job_id": "关联体素任务ID", "error": null,
+      "reason": null, "artifacts": {"rooms.json": "/api/voxel-connectivity/jobs/关联体素任务ID/artifacts/rooms.json"}
+    },
+    "binding": {"status": "pending", "job_id": null, "error": null, "reason": null, "artifacts": {}},
+    "map_export": {"status": "pending", "relative_path": "3dbbox/room_segmentation", "error": null},
+    "error": null, "finished_at": null
+  }
+}
+```
+
+整体状态沿用 `starting/running/stopping/complete/failed/interrupted`。分割、绑定和地图保存阶段另有 `pending`（等待）和 `skipped`（上游未成功）。一项失败时，整体保持运行直到另一项及可执行的地图保存结束，再标为 `failed`；成功计算结果可单独读取。两项均完成、绑定 JSON 发布、房间保存与要求的 ZIP 完成后，整体才为 `complete`。引入地图导出前的历史工作流，其 `map_export` 为 `null`，不自动补写地图。
+
+关联记录位于 `<output_dir>/jobs/<job_id>/workflow.json`。绑定输入、日志和结果分别为同目录下的 `binding-input.json`、`binding.log`、`room-bindings.json`。记录保存地图源签名与 `global_map.pcd` 文件指纹，绑定开始及发布前检查版本。房间 ID 仅在关联分割任务内有效，物体 `instance` 仅在 Boxer 任务内有效；查询使用明确的任务关联，不复用“最近一次”的分割或地图目录 CSV。已完成结果不会被后续重跑覆盖。
+
+服务重启将未结束流程标为 `interrupted`，不补跑分割、绑定或地图导出。已完成的绑定继续可读；恢复未完成的目录替换，清理未发布 ZIP 和暂存文件，保留成功发布的地图目录。旧任务及 `POST /api/jobs/import` 的只读任务返回 `workflow: null`，不自动建立关联。
+
+### 15.2 房间结果与预览
+
+`GET /api/jobs/{job_id}/rooms` 返回 `job_id`、`map_id`、`segmentation_job_id`、`algorithm: "voxel_connectivity"`、`rooms`、`summary`、`artifacts`。房间与统计采用第 14 节原始产物字段。分割成功后即可读取，不要求 Boxer 或绑定成功。
+
+`GET /api/jobs/{job_id}/rooms/cloud` 返回第 8.5 节的二进制 `xyzrgb`，颜色归一化到 0–1，最多 50 万点。可传 `room_id>=0` 只显示该房间；`room_id=-1` 显示标签为 -1 的点；省略显示全部。不存在的非负房间 ID 返回 `404`。抽样同时读取同一 PLY 的坐标和颜色，不能与地图预览按点序拼接。支持 ETag/304。
+
+### 15.3 绑定规则与分页查询
+
+绑定使用最终 `results.json.objects`，与 `3dbbox_tracked` 一致，排除 `TENTATIVE`。在米制、+Z 向上的 map 坐标系中，按 bbox 四元数、中心及尺寸判断完整分割点云是否落在朝向框内。边界容差为 `1e-5` 米。每个物体最多属于一个房间。
+
+获胜房间至少包含 **10 个支持点**，且占框内全部有效点 **≥60%**。标签 -1 的点参与分母，不投给任何房间。无有效证据时保留物体并返回 `room_id: null`；不按最近房间补配。预览抽样不参与投票。
+
+`GET /api/jobs/{job_id}/room-bindings` 支持 `offset=0`、`limit=200`（1–1000）。`room_id>=0` 筛选房间，`room_id=-1` 筛选未绑定物体，省略返回全部。`total` 是筛选后物体数，顺序与最终 tracked 物体一致。
+
+返回包含 `job_id/map_id/segmentation_job_id/status/summary/total/offset/limit/items`。每个 `items` 保留第 8.7 节的 3D bbox 字段，另含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `room_id`、`room_name` | 归属房间；未绑定时均为 `null` |
+| `point_count` | 框内全部有效点数，包含标签 -1 |
+| `labeled_point_count` | 框内标签非负的点数 |
+| `support_points`、`vote_ratio` | 得票最多房间的点数、占框内全部有效点的比例 |
+| `votes` | 按票数降序排列的 `{room_id,point_count}`；并列按房间 ID 排序 |
+| `reason` | 已绑定为 `null`；其余为 `invalid_bbox/no_rooms/no_points/no_labeled_points/insufficient_support/ambiguous_room` |
+
+`GET /api/jobs/{job_id}/room-bindings.json` 下载完整 JSON，包含 `schema_version=1`、地图版本、坐标约定、实际门槛 `parameters`、`summary` 及所有 `items`。`summary` 包含 `object_count/assigned_count/unassigned_count/reason`。关闭跟踪时成功返回空绑定，原因为 `tracking_disabled`；开启跟踪但没有最终物体时为 `no_tracked_objects`。
+
+上述结果接口对未知任务或没有联合流程的历史/只读任务返回 `404`；关联阶段未成功完成返回 `409`。分页或筛选参数无效返回 `422`。分割为 0 个房间时仍可成功，最终物体全部未绑定。
+
+```bash
+# 等待 workflow.status == "complete"，也可先在分割成功后读取 rooms。
+curl --fail-with-body -sS "$API_BASE/api/jobs/$JOB_ID/rooms" | jq
+curl --fail-with-body -sS "$API_BASE/api/jobs/$JOB_ID/rooms/cloud" -o rooms.xyzrgb
+curl --fail-with-body -sS "$API_BASE/api/jobs/$JOB_ID/room-bindings?room_id=-1&limit=1000" | jq
+curl --fail-with-body -sS "$API_BASE/api/jobs/$JOB_ID/room-bindings.json" -o room-bindings.json
+```
+
+### 15.4 保存到地图包并统一归档
+
+仅 `POST /api/jobs` 的新联合流程，在收尾阶段将房间产物保存到输入 x-nav 地图包：
+
+```text
+<地图>/3dbbox/room_segmentation/
+├── result_colored.ply
+├── rooms.json
+├── summary.json
+├── room-bindings.json
+└── source.json
+```
+
+前三个文件逐字节复制关联分割任务的产物。绑定成功时保存 `room-bindings.json`；Boxer 或绑定失败但分割成功时，仍保存三个分割文件和 `source.json`，不保留旧绑定，也不生成该失败流程的 ZIP。分割失败时不替换地图中的房间目录。显式停止不启动新的导出。
+
+`source.json` 包含 `schema_version=1`、`job_id`、`map_id`、`segmentation_job_id`、`algorithm`、`source_signature`、`global_map_fingerprint`、`exported_at` 和实际 `files` 列表。它描述本次保存的计算来源；所有原件继续位于任务目录，结果 API 不依赖地图目录。
+
+每次先完整暂存，再整体替换专用房间目录，失败时还原旧目录。替换日志位于 `<output_dir>/jobs/<job_id>/map-export.json`；以 `.boxer-rooms-` 开头的暂存和备份不进入 ZIP。复制前、发布前及归档前后检查地图版本。仅成功联合流程生成完整 ZIP，后续重跑不会修改旧任务归档。
+
+`no_csv=true` 仍写入上述房间结果，继续跳过检测 CSV 和 ZIP。独立的势场及体素分割接口、历史任务、只读导入不增加地图写入。Web 显示“地图保存”阶段和保存位置，完整成功后提供“完整结果 ZIP”链接。
+
+## 16. 实现位置与维护
 
 文档主要依据以下项目文件；扩展接口或调整参数后，应同步更新本文并核对部署服务的 schema：
 
@@ -1486,6 +1592,9 @@ curl --fail-with-body -sS -X POST "$API_BASE/api/voxel-connectivity/jobs" \
 | --- | --- |
 | [server.py](../server.py) | HTTP 路由、状态码、SSE、JPEG 与二进制响应、Swagger UI |
 | [utils/xnav_service.py](../utils/xnav_service.py) | 请求/响应模型、配置与任务状态、目录发现、持久化和恢复 |
+| [utils/xnav_workflow.py](../utils/xnav_workflow.py) | 联合调度、父子关联、生命周期与房间结果读取 |
+| [utils/xnav_room_binding.py](../utils/xnav_room_binding.py) | 独立 CPU 绑定进程、完整点云投票和房间预览 |
+| [utils/xnav_room_export.py](../utils/xnav_room_export.py) | 房间地图目录发布、恢复及工作流 ZIP 归档 |
 | [utils/xnav_upload.py](../utils/xnav_upload.py) | 上传会话、分块提交、ZIP 安全解压、后台校验和发布恢复 |
 | [utils/xnav_runtime.py](../utils/xnav_runtime.py) | 模型加载复用、设备和精度选择 |
 | [utils/xnav_web_scene.py](../utils/xnav_web_scene.py) | 地图场景、点云编码、图像渲染与缓存 |

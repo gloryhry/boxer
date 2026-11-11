@@ -157,3 +157,11 @@ pre { font-size: 10px; white-space: pre-wrap; overflow-wrap: anywhere; max-heigh
 }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 @keyframes breathe { 50% { opacity: .35; } }
+/* The room view shares the existing viewport and keeps its lists scrollable. */
+.room-results { margin: 16px 0; padding-top: 12px; border-top: 1px solid var(--border, #dce5ea); }
+.room-downloads { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 10px 0; font-size: 12px; }
+.room-downloads a { color: #167d90; }
+.room-objects { list-style: none; padding: 0; margin: 8px 0; max-height: 300px; overflow-y: auto; }
+.room-objects li { display: grid; gap: 4px; padding: 9px 0; border-bottom: 1px solid #e1e8ed; }
+.room-objects strong { font-size: 13px; }
+.room-objects span { font-size: 11px; color: #526878; line-height: 1.5; }

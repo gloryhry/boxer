@@ -100,7 +100,9 @@ class PotentialFieldJobs:
     name = "Potential-field"
 
     def __init__(self, output_dir, *, command=None):
-        self.root = Path(output_dir).expanduser().resolve() / self.worker_module / "jobs"
+        self.root = (
+            Path(output_dir).expanduser().resolve() / self.worker_module / "jobs"
+        )
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.jobs = {}
@@ -134,13 +136,16 @@ class PotentialFieldJobs:
                     _atomic_json(path, job)
                 self.jobs[job["id"]] = job
             except (OSError, ValueError):
-                LOG.exception("Could not recover %s job %s", self.name, path.parent.name)
+                LOG.exception(
+                    "Could not recover %s job %s", self.name, path.parent.name
+                )
 
     def _worker_command(self):
         if self.command is not None:
             return self.command
         env = next(
-            (key for key in self.python_envs if os.environ.get(key)), self.python_envs[0]
+            (key for key in self.python_envs if os.environ.get(key)),
+            self.python_envs[0],
         )
         python = Path(os.environ.get(env) or sys.executable)
         if (
@@ -163,13 +168,16 @@ class PotentialFieldJobs:
         except KeyError:
             raise HTTPException(404, f"{self.name} job not found") from None
 
-    def start(self, request, map_root):
+    def prepare_start(self, map_root):
+        """Check the CPU slot, input and interpreter without spawning a worker."""
         with self.lock:
             self._poll()
             if self.closing:
                 raise HTTPException(503, f"{self.name} service is shutting down")
             if self.active_id is not None:
-                raise HTTPException(409, f"A {self.name.lower()} job is already running")
+                raise HTTPException(
+                    409, f"A {self.name.lower()} job is already running"
+                )
             root = Path(map_root).resolve()
             map_cloud = root / "global_map.pcd"
             source = map_cloud.resolve()
@@ -177,6 +185,11 @@ class PotentialFieldJobs:
                 raise HTTPException(404, "Registered map has no local global_map.pcd")
             command = self._worker_command()
             fingerprint = _fingerprint(source)
+            return map_cloud, source, command, fingerprint
+
+    def start(self, request, map_root):
+        with self.lock:
+            map_cloud, source, command, fingerprint = self.prepare_start(map_root)
             identity = uuid.uuid4().hex
             directory = self.root / identity
             options = request.options.model_dump(exclude_none=True)
@@ -385,12 +398,40 @@ class VoxelConnectivityJobs(PotentialFieldJobs):
     name = "Voxel-connectivity"
 
 
+class RoomSegmentationDispatcher:
+    """One shared CPU admission lock for standalone and paired submissions."""
+
+    def __init__(self, manager, potential_field_jobs, voxel_connectivity_jobs):
+        self.manager = manager
+        self.jobs = (potential_field_jobs, voxel_connectivity_jobs)
+        self.lock = threading.RLock()
+
+    def prepare_start(self, jobs, request):
+        with self.lock:
+            for candidate in self.jobs:
+                if candidate.has_active_job():
+                    raise HTTPException(
+                        409, f"A {candidate.name.lower()} job is already running"
+                    )
+            scene = self.manager.get_map(request.map_id)
+            scene.check_source()
+            jobs.prepare_start(scene.loader.root)
+            return scene
+
+    def start(self, jobs, request):
+        with self.lock:
+            scene = self.prepare_start(jobs, request)
+            return jobs.start(request, scene.loader.root)
+
+
 def install_room_segmentation_routes(
     app, manager, potential_field_jobs, voxel_connectivity_jobs, *,
-    errors=None, artifact_response=None,
+    errors=None, artifact_response=None, dispatcher=None,
 ):
     """Expose separate job histories while dispatching one CPU job at a time."""
-    dispatch = threading.Lock()
+    dispatcher = dispatcher or RoomSegmentationDispatcher(
+        manager, potential_field_jobs, voxel_connectivity_jobs
+    )
     errors = errors or {}
     artifact_responses = {**errors, **(artifact_response or {})}
 
@@ -411,12 +452,7 @@ def install_room_segmentation_routes(
         def start_job(body: request_model):
             if getattr(app.state, "stopping", False):
                 raise HTTPException(503, f"{jobs.name} service is shutting down")
-            scene = manager.get_map(body.map_id)
-            scene.check_source()
-            with dispatch:
-                if other.has_active_job():
-                    raise HTTPException(409, f"A {other.name.lower()} job is already running")
-                return jobs.start(body, scene.loader.root)
+            return dispatcher.start(jobs, body)
 
         @app.get(
             path + "/{job_id}", name=f"{method}_job_info",

@@ -5,6 +5,7 @@ import re
 import stat
 import zipfile
 from concurrent.futures import CancelledError
+from contextlib import ExitStack
 from pathlib import Path
 
 from utils.xnav_result_store import _atomic_file
@@ -68,22 +69,25 @@ def _add_directory(package, directory, member, cancel):
                 raise ValueError(f"Symlink or special archive entry: {name}")
 
 
-def create_map_archive(map_root, destination, cancel):
+def create_map_archive(map_root, destination, cancel, *, publish_lock=None):
     """Snapshot business files, without following links or publishing partial ZIPs."""
     _check_cancelled(cancel)
     directory = os.open(
         Path(map_root) / "3dbbox", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     )
     try:
-        with _atomic_file(Path(destination)) as output:
-            with zipfile.ZipFile(
-                output,
-                "w",
-                compression=zipfile.ZIP_DEFLATED,
-                compresslevel=6,
-                allowZip64=True,
-            ) as package:
-                _add_directory(package, directory, "3dbbox", cancel)
-            _check_cancelled(cancel)
+        with ExitStack() as publication:
+            with _atomic_file(Path(destination)) as output:
+                with zipfile.ZipFile(
+                    output,
+                    "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    compresslevel=6,
+                    allowZip64=True,
+                ) as package:
+                    _add_directory(package, directory, "3dbbox", cancel)
+                if publish_lock is not None:
+                    publication.enter_context(publish_lock)
+                _check_cancelled(cancel)
     finally:
         os.close(directory)
