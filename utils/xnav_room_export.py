@@ -113,6 +113,7 @@ def export_room_results(
                 "result_colored.ply",
                 "rooms.json",
                 "summary.json",
+                "room_polygons.json",
                 "room-bindings.json",
             }:
                 raise ValueError(f"Unsupported room artifact: {name}")

@@ -4,6 +4,7 @@ import { initializeWorkspaceLayout } from './layout';
 import { inferenceControls, shouldSyncOptions } from './inference';
 import { initializeUploadPanel } from './upload-ui';
 import { RoomResults } from './rooms';
+import { initializeRoomView } from './room-view';
 import type { InferenceState } from './inference';
 import type { Frame, FrameSummary, Job, MapDirectories, MapDirectory, MapInfo, Observation, SceneInfo } from './types';
 
@@ -22,6 +23,11 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     <p id="map-directory-note" class="hint" role="status" aria-live="polite">正在读取 /nav_map 下的地图包…</p>
     <p id="map-info" class="hint">选择地图后加载点云与相机信息。</p>
     <div id="map-upload"></div>
+    <section id="room-panel" aria-labelledby="room-heading">
+      <h2 id="room-heading">房间分割</h2>
+      <div class="actions"><button id="room-start" class="secondary" type="button" disabled>分割房间</button><button id="room-toggle" class="secondary" type="button" aria-pressed="false" disabled>房间框视图</button></div>
+      <p id="room-status" class="hint" role="status" aria-live="polite">加载地图后可分割房间。</p>
+    </section>
     <form id="options">
       <details class="settings"><summary>推理参数 <span>词表 · 相机 · 阈值</span></summary>
         <label for="labels">词表或自定义标签</label><input id="labels" value="indoor" list="vocabularies" placeholder="indoor 或 chair,table,lamp"><datalist id="vocabularies"><option value="lvisplus"><option value="indoor"><option value="small"></datalist>
@@ -54,9 +60,9 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   </section>
   <div class="sidebar-separator" role="separator" aria-label="调整参数栏宽度" aria-orientation="vertical" aria-controls="parameter-panel" tabindex="0"></div>
   <section class="panel viewport" aria-label="三维地图">
-    <div class="viewport-toolbar"><div><h2>地图视图 <span class="eyebrow">3D</span></h2><p id="scene-info" class="hint">Z 轴向上 · 米</p></div><div class="view-actions"><button id="follow-camera" class="secondary" aria-pressed="false">◎ 相机中心跟随</button><button id="focus" class="secondary">定位相机</button><button id="fit" class="secondary">全图视角</button></div></div>
+    <div class="viewport-toolbar"><div><h2><span id="scene-title">地图视图</span> <span class="eyebrow">3D</span></h2><p id="scene-info" class="hint">Z 轴向上 · 米</p></div><div class="view-actions"><button id="follow-camera" class="secondary" aria-pressed="false">◎ 相机中心跟随</button><button id="focus" class="secondary">定位相机</button><button id="fit" class="secondary">全图视角</button></div></div>
     <div id="canvas-host"><div id="empty-scene" class="empty-scene"><span class="empty-symbol">⌖</span><strong>从一张地图开始</strong><p>加载 x-nav 地图包，查看点云、相机轨迹与推理结果。</p></div></div>
-    <div class="viewport-footer"><span id="camera-hint">左键旋转 · 右键平移 · 滚轮缩放</span><span id="object-count" class="mono">0 个目标</span></div>
+    <div class="viewport-footer"><span id="camera-hint">左键旋转 · 右键平移 · 滚轮缩放</span><span id="room-camera-hint" hidden>左键旋转 · 右键平移 · 滚轮缩放</span><span id="object-count" class="mono">0 个目标</span><span id="room-count" class="mono" hidden></span></div>
   </section>
   <section class="image-stack" aria-label="相机图像">
     <figure id="window-2d" class="panel image-panel" data-floating-window data-window-name="2D 检测" aria-label="2D 检测图像窗口"><figcaption data-window-drag tabindex="0" aria-label="移动 2D 检测窗口" aria-describedby="layout-help"><span class="window-name"><i class="image-dot orange"></i>2D 检测</span><span id="image-view-2d" class="hint">CAMERA</span><button type="button" data-window-collapse aria-expanded="true" aria-controls="image-content-2d" aria-label="收起 2D 检测">▴</button></figcaption><div id="image-content-2d" class="image-well"><img id="image-2d" alt="当前视图的二维检测框" draggable="false" hidden><span class="image-empty">等待图像观测</span></div></figure>
@@ -101,6 +107,17 @@ async function fetchOk(url: string, options?: RequestInit) {
 }
 async function api<T>(url: string, options?: RequestInit): Promise<T> { return (await fetchOk(url, options)).json(); }
 function post<T>(url: string, data: unknown) { return api<T>(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }); }
+const roomView = initializeRoomView(element('room-panel'), scene, api, (visible, count) => {
+  element('workspace').toggleAttribute('data-room-view', visible);
+  element('scene-title').textContent = visible ? '房间框' : '地图视图';
+  element('fit').textContent = visible ? '查看全部房间框' : '全图视角';
+  for (const id of ['scene-info', 'object-count', 'focus', 'follow-camera', 'camera-hint']) element(id).hidden = visible;
+  element('room-camera-hint').hidden = !visible;
+  const roomCount = element('room-count');
+  roomCount.hidden = !visible;
+  roomCount.textContent = `${count} 个房间`;
+  syncFollow();
+});
 function buttons() {
   const state = inferenceControls(inference, options(), connected, activeJobId);
   element<HTMLButtonElement>('start').disabled = busy || !map || !state.canStart;
@@ -175,6 +192,7 @@ async function activateMap(info: MapInfo) {
   element('map-info').textContent = `当前地图：${info.path}\n${info.validation.frames} 个${info.validation.frame_unit === 'image' ? '图像组' : '关键帧'} · ${info.validation.keyframes} 个 LiDAR 锚点 · ${info.cameras.length} 个相机`;
   element('scene-info').textContent = `${metadata.point_count.toLocaleString()} 点 · Z ↑ · 米`;
   scene?.setMap(metadata, cloud); scene?.showMap(checked('show-map'));
+  void roomView.setMap(info.id);
   element('empty-scene').hidden = true; syncFollow();
   const cameraList = element<HTMLDataListElement>('camera-list');
   cameraList.replaceChildren(new Option('全部相机', 'all'), ...info.cameras.map(camera => new Option(`cam${camera.id} · ${camera.model}`, String(camera.id))));

@@ -206,6 +206,7 @@ def _project_assigned(points, assignment, origin_xy, resolution, shape, seed_siz
         assignment='local_curvature_seeded_euclidean_normal_curvature',
     )
     return dict(footprint=footprint, observed_footprint=observed, door_columns=doors,
+                door_seed_indices=np.flatnonzero(eroded & doors),
                 projected_regions=projected, diagnostics=diagnostics)
 
 

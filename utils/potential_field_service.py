@@ -19,6 +19,9 @@ from fastapi import HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from utils.voxel_connectivity_runtime import (
+    ARTIFACT_TYPES as VOXEL_CONNECTIVITY_ARTIFACTS,
+)
 from utils.xnav_result_store import _atomic_json
 
 LOG = logging.getLogger(__name__)
@@ -30,6 +33,12 @@ ARTIFACTS = {
     "rooms.json": "application/json",
     "summary.json": "application/json",
 }
+# Completed jobs from earlier versions can still advertise their saved files.
+ARTIFACT_MEDIA_TYPES = (
+    ARTIFACTS
+    | VOXEL_CONNECTIVITY_ARTIFACTS
+    | {"labels.npy": "application/octet-stream"}
+)
 ACTIVE = {"running", "stopping"}
 JobStatus = Literal["running", "stopping", "complete", "failed", "interrupted"]
 
@@ -98,6 +107,8 @@ class PotentialFieldJobs:
     worker_module = "potential_field"
     python_envs = ("BOXER_PF_PYTHON",)
     name = "Potential-field"
+    artifact_types = ARTIFACTS
+    json_artifact_types = {"rooms.json": list, "summary.json": dict}
 
     def __init__(self, output_dir, *, command=None):
         self.root = (
@@ -107,6 +118,8 @@ class PotentialFieldJobs:
         self.lock = threading.RLock()
         self.jobs = {}
         self.command = tuple(command) if command else None
+        self.active_artifact_types = self.artifact_types
+        self.active_json_artifact_types = self.json_artifact_types
         self.active_id = None
         self.process = None
         self.source = None
@@ -187,7 +200,7 @@ class PotentialFieldJobs:
             fingerprint = _fingerprint(source)
             return map_cloud, source, command, fingerprint
 
-    def start(self, request, map_root):
+    def start(self, request, map_root, *, workflow_artifacts=False):
         with self.lock:
             map_cloud, source, command, fingerprint = self.prepare_start(map_root)
             identity = uuid.uuid4().hex
@@ -202,6 +215,14 @@ class PotentialFieldJobs:
             ]
             for name, value in options.items():
                 args.extend([f"--{name.replace('_', '-')}", str(value)])
+            self.active_artifact_types = self.artifact_types
+            self.active_json_artifact_types = self.json_artifact_types
+            if workflow_artifacts:
+                args.append("--workflow-artifacts")
+                self.active_artifact_types = self.artifact_types | ARTIFACTS
+                self.active_json_artifact_types = (
+                    self.json_artifact_types | PotentialFieldJobs.json_artifact_types
+                )
             job = PotentialFieldJobInfo(
                 id=identity,
                 map_id=request.map_id,
@@ -242,7 +263,7 @@ class PotentialFieldJobs:
             try:
                 if staging.is_symlink():
                     raise ValueError("Invalid artifact directory")
-                for name in ARTIFACTS:
+                for name in self.active_artifact_types:
                     path = staging / name
                     if (
                         path.is_symlink()
@@ -250,7 +271,7 @@ class PotentialFieldJobs:
                         or not path.stat().st_size
                     ):
                         raise ValueError(f"Missing or empty artifact: {name}")
-                for name, kind in (("rooms.json", list), ("summary.json", dict)):
+                for name, kind in self.active_json_artifact_types.items():
                     if not isinstance(json.loads((staging / name).read_bytes()), kind):
                         raise ValueError(f"Invalid artifact: {name}")
                 source, fingerprint = self.source
@@ -259,7 +280,7 @@ class PotentialFieldJobs:
                 staging.rename(output)
                 url = f"{self.api_path}/{job['id']}/artifacts"
                 artifacts = {
-                    name: f"{url}/{name}" for name in ARTIFACTS
+                    name: f"{url}/{name}" for name in self.active_artifact_types
                 }
             except (OSError, ValueError) as exc:
                 status, error = "failed", f"Could not publish worker output: {exc}"
@@ -360,7 +381,8 @@ class PotentialFieldJobs:
             path = output / filename
             if (
                 job["status"] != "complete"
-                or filename not in ARTIFACTS
+                or filename not in ARTIFACT_MEDIA_TYPES
+                or filename not in job["artifacts"]
                 or output.is_symlink()
                 or path.is_symlink()
                 or not path.is_file()
@@ -396,6 +418,8 @@ class VoxelConnectivityJobs(PotentialFieldJobs):
     worker_module = "voxel_connectivity"
     python_envs = ("BOXER_VC_PYTHON", "BOXER_PF_PYTHON")
     name = "Voxel-connectivity"
+    artifact_types = VOXEL_CONNECTIVITY_ARTIFACTS
+    json_artifact_types = {"room_polygons.json": dict}
 
 
 class RoomSegmentationDispatcher:
@@ -482,7 +506,7 @@ def install_room_segmentation_routes(
         def job_artifact(job_id: str, filename: str):
             artifact = jobs.artifact(job_id, filename)
             return FileResponse(
-                artifact, filename=filename, media_type=ARTIFACTS[filename]
+                artifact, filename=filename, media_type=ARTIFACT_MEDIA_TYPES[filename]
             )
 
     register(potential_field_jobs, voxel_connectivity_jobs, PotentialFieldJobRequest)

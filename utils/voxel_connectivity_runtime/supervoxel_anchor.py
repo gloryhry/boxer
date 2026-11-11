@@ -196,19 +196,23 @@ def _observed_input_columns(points, shape, origin, resolution):
 
 
 def _fallback_seed_labels(points, working, initial, build_coarse, origin, resolution, coarse_resolution,
-                          values, walls):
-    from .voxel_seed_support import refine_seed_labels
+                          values, walls, verify_doors):
+    from .voxel_seed_support import _coarse_indices, refine_seed_labels
 
     coarse = build_coarse(coarse_resolution)
     observed = coarse["observed_footprint"]
     coarse_walls, _ = wall_boundaries(
         working, initial["normals"], origin, coarse_resolution, observed.shape, observed, values["sa_max_jump"],
     )
+    if verify_doors is not None:
+        verify_doors(working, coarse, coarse_walls, origin, coarse_resolution)
     coarse_doors = coarse["door_columns"]
     coarse_labels, coarse_count, _ = _partition_map(
         coarse["footprint"], observed, coarse_walls, coarse_doors, coarse_resolution, values["sa_min_room_area"],
     )
     diagnostics = dict(coarse_resolution_m=coarse_resolution, coarse_room_count=coarse_count)
+    if verify_doors is not None:
+        diagnostics["initial_door_verification"] = coarse["door_verification"]
     if not coarse_count:
         return None, diagnostics
     input_observed = _observed_input_columns(points, walls.shape, origin, resolution)
@@ -220,7 +224,17 @@ def _fallback_seed_labels(points, working, initial, build_coarse, origin, resolu
     room_count = int(labels.max()) + 1
     if not room_count:
         return None, diagnostics
-    return (labels, room_count, walls, doors, input_observed), diagnostics
+    confirmed = None
+    if verify_doors is not None:
+        confirmed = initial["confirmed_door_columns"]
+        coarse_confirmed = coarse["confirmed_door_columns"]
+        if coarse_confirmed.any():
+            indices = [_coarse_indices(fine, coarse_size, resolution, coarse_resolution)
+                       for fine, coarse_size in zip(confirmed.shape, coarse_confirmed.shape)]
+            covered = tuple(slice(0, len(axis)) for axis in indices)
+            confirmed = confirmed.copy()
+            confirmed[covered] |= coarse_confirmed[np.ix_(*indices)]
+    return (labels, room_count, walls, doors, input_observed, confirmed), diagnostics
 
 
 def run_supervoxel_anchor(xyz, params, output_dir, log=None, stage=None):
@@ -230,7 +244,7 @@ def run_supervoxel_anchor(xyz, params, output_dir, log=None, stage=None):
 
 def _run_anchor_pipeline(xyz, values, output_dir, log, stage, *,
                          method="supervoxel_anchor", method_version=METHOD_VERSION, review=None,
-                         robust_seeds=False):
+                         robust_seeds=False, verify_doors=None):
     log = log or (lambda message: None)
     stage = stage or (lambda name: None)
     started = time.perf_counter()
@@ -270,6 +284,9 @@ def _run_anchor_pipeline(xyz, values, output_dir, log, stage, *,
     stage("墙体证据与锚点连接")
     walls, wall_diagnostics = wall_boundaries(working, initial["normals"], origin, resolution,
                                               shape, initial["observed_footprint"], values["sa_max_jump"])
+    if verify_doors is not None:
+        stage("核验初始门洞")
+        verify_doors(working, initial, walls, origin, resolution, cache_heights=True)
     stage("连通房间提取与三维回投影" if review is None else "提取初始房间")
     footprint = initial["footprint"]
     observed = initial["observed_footprint"]
@@ -289,12 +306,14 @@ def _run_anchor_pipeline(xyz, values, output_dir, log, stage, *,
             for scale in (1., 1.5, 2.25):
                 result, diagnostics = _fallback_seed_labels(
                     points, working, initial, build_coarse, origin, resolution,
-                    coarse_resolution * scale, values, walls,
+                    coarse_resolution * scale, values, walls, verify_doors,
                 )
                 attempts.append(diagnostics)
                 if result is not None and diagnostics["fine_observed_seed_cells"] > fine_supported_cells:
-                    labels_xy, room_count, walls, doors, input_observed = result
+                    labels_xy, room_count, walls, doors, input_observed, confirmed = result
                     initial["door_columns"] = doors
+                    if confirmed is not None:
+                        initial["confirmed_door_columns"] = confirmed
                     seed_diagnostics.update(diagnostics, mode="coarse_to_fine")
                     log(f"稳定种子：{diagnostics['coarse_resolution_m']:.3f} m/px 提取 "
                         f"{diagnostics['coarse_room_count']} 个区域，细化到 {resolution:.3f} m/px 后保留 {room_count} 个区域")
@@ -338,6 +357,8 @@ def _run_anchor_pipeline(xyz, values, output_dir, log, stage, *,
                  supervoxels=initial["diagnostics"], anchor_walls=wall_diagnostics, warnings=warnings)
     if seed_diagnostics is not None:
         stats["seed_support"] = seed_diagnostics
+    if verify_doors is not None:
+        stats["initial_door_verification"] = initial["door_verification"]
     if review_stats is not None:
         stats["review"] = review_stats
         if review_stats["status"] == "unsupported_height_range":
@@ -348,6 +369,8 @@ def _run_anchor_pipeline(xyz, values, output_dir, log, stage, *,
     colors = np.asarray([(80, 80, 80), *(room_color(room["id"]) for room in rooms)], dtype=np.uint8)
     Image.fromarray(colors[label_map[::-1] + 1]).save(output / "segmentation.png")
     structure = dict(observed=observed.T, initial_footprint=footprint.T, doors=doors.T, walls=walls.T)
+    if verify_doors is not None:
+        structure["confirmed_initial_doors"] = initial["confirmed_door_columns"].T
     if input_observed is not None:
         structure["input_observed"] = input_observed.T
     if review is not None:

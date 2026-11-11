@@ -1,20 +1,24 @@
 """Validate measured doorway proposals against full-label XY connectivity."""
 
 from collections import Counter
-from itertools import chain, combinations
+from itertools import combinations
 import math
 import time
 
 import numpy as np
 from scipy import ndimage
 
-from .voxel_door_candidates import propose_door_cuts
+from .voxel_door_candidates import (
+    _DIRECTIONS, _bank_span, _bits, _run_starts, _side_points, propose_door_cuts,
+)
+from .voxel_connectivity_review import _floor_level
 
 
 _MIN_INTERIOR_AREA = 1.8
 _MIN_INTERIOR_WIDTH = .8
 _MIN_CORE_RADIUS = .35
 _MIN_CORE_AREA = .18
+_MAX_WALL_GAP_M = .25
 
 
 def _ordered_cuts(candidates, labels):
@@ -125,6 +129,60 @@ def _label_without(room_mask, result, cells, audit):
     return count
 
 
+def _measured_wall_gaps(labels, room, walls, observed, horizontal, vertical, z_step, resolution):
+    """Find short gaps with measured wall returns between two grounded wall banks."""
+    wall_scope = walls & observed
+    seeds = np.argwhere(wall_scope & (vertical != 0))
+    inside = (labels == room) & observed & (vertical != 0) & ~walls
+    gaps = []
+    seen = set()
+    for direction in np.asarray(_DIRECTIONS):
+        length = np.linalg.norm(direction)
+        tangent = direction / length
+        normal = np.array([-tangent[1], tangent[0]])
+        max_cells = math.floor(_MAX_WALL_GAP_M / (resolution * length) + 1e-9)
+        starts = seeds
+        for count in range(1, max_cells + 1):
+            # Retain only lines whose gap cells belong to this room and have returns.
+            ends = starts + count * direction
+            valid = ((ends >= 0) & (ends < labels.shape)).all(axis=1)
+            starts, ends = starts[valid], ends[valid]
+            starts = starts[inside[tuple(ends.T)]]
+            if not len(starts):
+                break
+            stops = starts + (count + 1) * direction
+            valid = np.flatnonzero(((stops >= 0) & (stops < labels.shape)).all(axis=1))
+            supported = valid[wall_scope[tuple(stops[valid].T)]]
+            for first, last in zip(starts[supported], stops[supported]):
+                gap = first + np.arange(1, count + 1)[:, None] * direction
+                key = tuple(sorted(map(tuple, gap)))
+                if key in seen:
+                    continue
+                levels = []
+                for side in (-1, 1):
+                    points = _side_points(gap, side * normal, labels, observed, room, resolution)
+                    levels.append(_floor_level(horizontal, vertical, *points.T, np.ones(len(points), bool), z_step))
+                if any(level is None for level in levels):
+                    continue
+                floors, tops = np.asarray(levels).T
+                if np.ptp(floors) * z_step > .25 or np.min(tops - floors) * z_step < 1.60:
+                    continue
+                cells = tuple(gap.T)
+                if np.any(horizontal[cells] & _bits(int(floors.min()) - 1, int(floors.max()) + 1)):
+                    continue
+                floor = int(round(floors.mean()))
+                low = _bits(floor - max(1, math.floor(.20 / z_step)), floor + max(1, math.floor(.26 / z_step)))
+                run = max(2, math.ceil(.75 / z_step - 1e-9))
+                if not np.all(_run_starts(vertical[cells], run, z_step, bridge_missing=False) & low):
+                    continue
+                if all(_bank_span(endpoint, outward, vertical, wall_scope, floor, z_step, resolution,
+                                  require_contact=True) > 0
+                       for endpoint, outward in ((first, -tangent), (last, tangent))):
+                    gaps.append(gap)
+                    seen.add(key)
+    return gaps
+
+
 def _trial(components, count, room_mask, result, cuts, seen, walls, resolution, min_area, audit,
            continuation=None):
     """Assess whether one or two lines add exactly one stable partition."""
@@ -170,7 +228,8 @@ def _trial(components, count, room_mask, result, cuts, seen, walls, resolution, 
     return evidence, 'accepted', parent
 
 
-def _next_split(components, count, room_mask, result, remaining, seen, walls, resolution, min_area, audit, rejected):
+def _next_split(components, count, room_mask, result, remaining, seen, walls, resolution, min_area, audit,
+                rejected, wall_gaps):
     redundant = []
     for index, cut in enumerate(remaining):
         evidence, reason, parent = _trial(components, count, room_mask, result, [cut], seen, walls,
@@ -194,15 +253,18 @@ def _next_split(components, count, room_mask, result, remaining, seen, walls, re
         if evidence is not None:
             return evidence, (a, b), None
         rejected[reason] += 1
-        if reason == 'does_not_disconnect' and (len(first['local_continuation']) or len(second['local_continuation'])):
-            repair_pairs.append((a, b))
+        if reason == 'does_not_disconnect':
+            repair_pairs.append(((a, b), parent_a))
 
     # Ordinary door cuts take precedence. Only try a measured continuation
     # when the corresponding aperture trial left a path around its banks.
-    repair_singles = ((index,) for index, _ in redundant if len(remaining[index]['local_continuation']))
-    for indices in chain(repair_singles, repair_pairs):
+    repair_options = [((index,), parent) for index, parent in redundant] + repair_pairs
+    for indices, _ in repair_options:
         cuts = [remaining[index] for index in indices]
-        continuation = np.unique(np.concatenate([cut['local_continuation'] for cut in cuts]), axis=0)
+        continuation = np.concatenate([cut['local_continuation'] for cut in cuts])
+        if not len(continuation):
+            continue
+        continuation = np.unique(continuation, axis=0)
         aperture = {tuple(cell) for cut in cuts for cell in cut['local_line']}
         if any(tuple(cell) in aperture for cell in continuation):
             rejected['continuation_overlaps_aperture'] += 1
@@ -212,6 +274,30 @@ def _next_split(components, count, room_mask, result, remaining, seen, walls, re
         if evidence is not None:
             return evidence, indices, continuation
         rejected[reason] += 1
+
+    if repair_options:
+        # Some remaining paths cross a small independent seam in a different
+        # wall segment. Keep all measured door apertures out of wall repairs.
+        apertures = {tuple(cell) for cut in remaining for cell in cut['local_line']}
+        by_parent = {}
+        for indices, parent in repair_options:
+            by_parent.setdefault(parent, []).append(indices)
+        for gap in wall_gaps():
+            if any(tuple(cell) in apertures for cell in gap):
+                continue
+            owners = np.unique(components[tuple(gap.T)])
+            if len(owners) != 1 or owners[0] == 0:
+                continue
+            options = by_parent.get(owners[0])
+            if not options or _label_without(room_mask, result, gap, audit) != count:
+                continue
+            for indices in options:
+                cuts = [remaining[index] for index in indices]
+                evidence, reason, _ = _trial(components, count, room_mask, result, cuts, seen, walls,
+                                             resolution, min_area, audit, continuation=gap)
+                if evidence is not None:
+                    return evidence, indices, gap
+                rejected[reason] += 1
     return None, (), None
 
 
@@ -273,9 +359,18 @@ def recover_door_splits(labels, walls, observed, horizontal, vertical, z_step, r
         accepted = []
         room_mask = original.copy()
         trial_result = np.empty_like(components)
+        measured_gaps = None
+
+        def wall_gaps():
+            nonlocal measured_gaps
+            if measured_gaps is None:
+                measured_gaps = _measured_wall_gaps(labels[box], room, walls[box], observed[box],
+                                                    horizontal[box], vertical[box], z_step, resolution)
+            return measured_gaps
+
         while cuts:
             evidence, indices, continuation = _next_split(components, count, room_mask, trial_result, cuts,
-                observed[box], walls[box], resolution, min_area, audit, rejected)
+                observed[box], walls[box], resolution, min_area, audit, rejected, wall_gaps)
             if evidence is None:
                 break
             components, trial_result = trial_result, components

@@ -189,7 +189,9 @@ class MapWorkflows:
                 self._path(identity, "workflow.json").unlink(missing_ok=True)
                 raise
             try:
-                child = self.rooms.start(room_request, scene.loader.root)
+                child = self.rooms.start(
+                    room_request, scene.loader.root, workflow_artifacts=True
+                )
             except Exception as error:
                 record["workflow"]["room_segmentation"].update(
                     status="failed", error=f"Could not start room segmentation: {error}"
@@ -351,6 +353,13 @@ class MapWorkflows:
                     "summary.json",
                 )
             }
+            if (
+                "room_polygons.json"
+                in record["workflow"]["room_segmentation"]["artifacts"]
+            ):
+                sources["room_polygons.json"] = self.rooms.artifact(
+                    child, "room_polygons.json"
+                )
             bound = record["workflow"]["binding"]["status"] == "complete"
             if bound:
                 sources["room-bindings.json"] = self.binding_path(identity)

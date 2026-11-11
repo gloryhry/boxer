@@ -236,7 +236,7 @@ def _measure_gap(pair, labels, walls, observed, horizontal, vertical, scope, z_s
     sides = [_side_points(aperture, sign * normal, labels, observed, room, resolution) for sign in (-1, 1)]
     if min(map(len, sides)) < 3:
         return None, "insufficient_passage_support"
-    levels = [_floor_level(horizontal, vertical, points[:, 0], points[:, 1], np.ones(len(points), bool))
+    levels = [_floor_level(horizontal, vertical, points[:, 0], points[:, 1], np.ones(len(points), bool), z_step)
               for points in sides]
     if any(level is None for level in levels):
         return None, "unknown_floor"
