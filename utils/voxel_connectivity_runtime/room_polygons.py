@@ -3,29 +3,28 @@
 import numpy as np
 
 
-MAX_HOLE_AREA_M2 = 0.25
+def _hole_contains_other_room(hole, labels, room_id):
+    from shapely import contains_xy
+
+    left, bottom, right, top = map(int, hole.bounds)
+    # Batch large interior courtyards to limit the temporary coordinate arrays.
+    rows_per_batch = max(1, 65_536 // (right - left))
+    for first_row in range(bottom, top, rows_per_batch):
+        window = labels[first_row:min(top, first_row + rows_per_batch), left:right]
+        y, x = np.nonzero((window >= 0) & (window != room_id))
+        if x.size and contains_xy(hole, left + x + 0.5, first_row + y + 0.5).any():
+            return True
+    return False
 
 
-def _fill_small_holes(footprint, labels, room_id, resolution):
-    from shapely import Polygon, contains_xy, union_all
+def _fill_room_holes(footprint, labels, room_id):
+    from shapely import Polygon, union_all
 
     parts = [footprint] if footprint.geom_type == "Polygon" else footprint.geoms
     filled = []
     changed = False
     for part in parts:
-        kept_holes = []
-        for ring in part.interiors:
-            hole = Polygon(ring)
-            if hole.area * resolution ** 2 > MAX_HOLE_AREA_M2 + 1e-12:
-                kept_holes.append(ring)
-                continue
-
-            left, bottom, right, top = map(int, hole.bounds)
-            window = labels[bottom:top, left:right]
-            y, x = np.nonzero((window >= 0) & (window != room_id))
-            if contains_xy(hole, left + x + 0.5, bottom + y + 0.5).any():
-                kept_holes.append(ring)
-
+        kept_holes = [ring for ring in part.interiors if _hole_contains_other_room(Polygon(ring), labels, room_id)]
         if len(kept_holes) < len(part.interiors):
             filled.append(Polygon(part.exterior, kept_holes))
             changed = True
@@ -72,7 +71,7 @@ def room_polygons(label_map, transform, room_ids):
         group = slice(start, stop)
         room_id = int(owners[start])
         footprint = union_all(box(left[group], y[group], right[group], y[group] + 1)).simplify(0)
-        footprint = _fill_small_holes(footprint, labels, room_id, resolution)
+        footprint = _fill_room_holes(footprint, labels, room_id)
         parts = [footprint] if footprint.geom_type == "Polygon" else footprint.geoms
         coordinates = []
         for part in parts:

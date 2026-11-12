@@ -1463,7 +1463,7 @@ curl --fail-with-body -sS -X POST "$API_BASE/api/voxel-connectivity/jobs" \
 
 查询、停止、读取日志和下载沿用第 13 节的任务状态与响应字段，入口前缀为 `/api/voxel-connectivity/jobs`。两种算法的历史和下载地址各自独立。体素连通复核的产物存放在 `<output_dir>/voxel_connectivity/jobs/<job_id>/output/`。
 
-新任务的 `artifacts` 只发布 `room_polygons.json`。文件记录保留房间的 `id`、`area_m2`、XY 轮廓 `geometry` 和米制 `z_bounds_m`。轮廓支持 `Polygon` 和 `MultiPolygon`。导出时填补面积不超过 0.25 m² 且不含其他房间标签的封闭内孔，`area_m2` 按填补后的轮廓计算。判断物体归属时，使用与地图同坐标系的 XYZ 检查二维轮廓和 Z 范围。Z 上下界取各房间已标注点的最低和最高 Z。历史任务保留其记录中的下载地址。
+新任务的 `artifacts` 只发布 `room_polygons.json`。文件记录保留房间的 `id`、`area_m2`、XY 轮廓 `geometry` 和米制 `z_bounds_m`。轮廓支持 `Polygon` 和 `MultiPolygon`。导出时填满房间轮廓内未包含其他房间标签的封闭内孔，`area_m2` 按填补后的轮廓计算。判断物体归属时，使用与地图同坐标系的 XYZ 检查二维轮廓和 Z 范围。Z 上下界取各房间已标注点的最低和最高 Z。历史任务保留其记录中的下载地址。
 
 在 Boxer 网页加载地图后，点击「分割房间」。任务完成后，视口自动切换为三维房间线框。已有结果可以通过「房间框视图」打开。
 
