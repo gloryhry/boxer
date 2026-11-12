@@ -1,132 +1,97 @@
-"""CPU-only, full-cloud voting of final oriented boxes into room instances."""
+"""Bind final oriented objects to room prisms using exact intersection volumes."""
 
 import argparse
 import json
-from collections import Counter
 from pathlib import Path
 
 from utils.xnav_result_store import _atomic_json
+from utils.xnav_room_geometry import (
+    BINDING_METHOD,
+    RELATIVE_TOLERANCE,
+    RESULT_SCHEMA_VERSION,
+    box_geometry,
+    intersection_volume,
+    load_room_prisms,
+)
 
-MIN_SUPPORT_POINTS = 10
-MIN_VOTE_RATIO = 0.6
-BOX_TOLERANCE_M = 1e-5
-CHUNK_SIZE = 131_072
-
-
-def read_vertices(path):
-    from plyfile import PlyData
-
-    vertices = PlyData.read(str(path), mmap="r")["vertex"].data
-    if not {"x", "y", "z", "label"}.issubset(vertices.dtype.names or ()):
-        raise ValueError("Room PLY must contain x, y, z and label")
-    return vertices
-
-
-def _box_geometry(box):
-    import numpy as np
-
-    center = np.array([box[f"{axis}_world_object"] for axis in ("tx", "ty", "tz")])
-    size = np.array([box[f"scale_{axis}"] for axis in "xyz"])
-    q = np.array([box[f"{axis}_world_object"] for axis in ("qw", "qx", "qy", "qz")])
-    length = np.linalg.norm(q)
-    if (
-        not np.isfinite(center).all()
-        or not np.isfinite(size).all()
-        or not np.isfinite(q).all()
-        or length < 1e-12
-        or (size <= 0).any()
-    ):
-        return None
-    w, x, y, z = q / length
-    rotation = np.array(
-        [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ]
-    )
-    half = size / 2 + BOX_TOLERANCE_M
-    extent = abs(rotation) @ half
-    return center, half, rotation, center - extent, center + extent
+MIN_OVERLAP_RATIO = 0.6
 
 
 def bind_objects(payload):
-    """Use every finite PLY point, including label=-1 in each box's denominator."""
-    import numpy as np
+    from shapely import STRtree
+    from shapely.geometry import box as rectangle
 
-    rooms = {room["id"]: room for room in payload["rooms"]}
+    _, rooms = load_room_prisms(payload["room_polygons_path"])
+    index = STRtree([room.geometry for room in rooms])
+    names = {room.id: room.name for room in rooms}
     tracking = payload["tracking_enabled"]
     objects = payload["objects"] if tracking else []
-    geometries = [_box_geometry(box) for box in objects]
-    counts = [0 for _ in objects]
-    votes = [Counter() for _ in objects]
-    if objects:
-        vertices = read_vertices(payload["ply_path"])
-        if not np.issubdtype(vertices["label"].dtype, np.integer):
-            raise ValueError("Room labels must be integers")
-        for start in range(0, len(vertices), CHUNK_SIZE):
-            block = vertices[start : start + CHUNK_SIZE]
-            points = np.column_stack([block[axis] for axis in "xyz"]).astype(float)
-            labels = block["label"]
-            finite = np.isfinite(points).all(axis=1)
-            points, labels = points[finite], labels[finite]
-            if any(
-                int(label) not in rooms for label in np.unique(labels) if label >= 0
-            ):
-                raise ValueError("Room PLY references a missing room")
-            if (labels < -1).any():
-                raise ValueError("Room labels must be -1 or nonnegative")
-            for index, geometry in enumerate(geometries):
-                if geometry is None:
-                    continue
-                center, half, rotation, low, high = geometry
-                candidates = ((points >= low) & (points <= high)).all(axis=1)
-                local = (points[candidates] - center) @ rotation
-                inside = (abs(local) <= half).all(axis=1)
-                owners = labels[candidates][inside]
-                counts[index] += len(owners)
-                identities, numbers = np.unique(owners[owners >= 0], return_counts=True)
-                votes[index].update(dict(zip(identities.tolist(), numbers.tolist())))
     items = []
-    for box, geometry, count, owners in zip(objects, geometries, counts, votes):
-        ordered = sorted(owners.items(), key=lambda pair: (-pair[1], pair[0]))
-        winner, support = ordered[0] if ordered else (None, 0)
-        ratio = support / count if count else 0
+    for item in objects:
+        geometry = box_geometry(item)
+        overlaps = []
+        if geometry is not None:
+            center, extent = geometry["center"], geometry["extent"]
+            candidates = index.query(
+                rectangle(
+                    center[0] - extent[0],
+                    center[1] - extent[1],
+                    center[0] + extent[0],
+                    center[1] + extent[1],
+                )
+            )
+            for candidate in candidates:
+                room = rooms[int(candidate)]
+                volume = intersection_volume(geometry, room)
+                ratio = volume / geometry["volume"]
+                if ratio > RELATIVE_TOLERANCE:
+                    overlaps.append(
+                        dict(
+                            room_id=room.id,
+                            intersection_volume_m3=volume,
+                            overlap_ratio=ratio,
+                        )
+                    )
+        overlaps.sort(
+            key=lambda value: (-value["intersection_volume_m3"], value["room_id"])
+        )
+        winner = overlaps[0] if overlaps else None
+        ratio = winner["overlap_ratio"] if winner else 0.0
+        tied = len(overlaps) > 1 and (
+            abs(ratio - overlaps[1]["overlap_ratio"]) <= RELATIVE_TOLERANCE
+        )
         reason = (
             "invalid_bbox"
             if geometry is None
             else "no_rooms"
             if not rooms
-            else "no_points"
-            if not count
-            else "no_labeled_points"
-            if not ordered
-            else "insufficient_support"
-            if support < MIN_SUPPORT_POINTS
-            else "ambiguous_room"
-            if ratio < MIN_VOTE_RATIO
+            else "no_overlap"
+            if not overlaps
+            else "ambiguous_overlap"
+            if tied
+            else "insufficient_overlap"
+            if ratio + RELATIVE_TOLERANCE < MIN_OVERLAP_RATIO
             else None
         )
-        room_id = winner if reason is None else None
+        room_id = winner["room_id"] if reason is None else None
         items.append(
             dict(
-                box,
+                item,
                 room_id=room_id,
-                room_name=rooms[room_id]["name"] if room_id is not None else None,
-                point_count=count,
-                labeled_point_count=sum(owners.values()),
-                support_points=support,
-                vote_ratio=ratio,
+                room_name=names.get(room_id),
+                object_volume_m3=geometry["volume"] if geometry else None,
+                intersection_volume_m3=winner["intersection_volume_m3"]
+                if winner
+                else 0.0,
+                overlap_ratio=ratio,
+                overlaps=overlaps,
                 reason=reason,
-                votes=[
-                    dict(room_id=identity, point_count=number)
-                    for identity, number in ordered
-                ],
             )
         )
     assigned = sum(item["room_id"] is not None for item in items)
     return dict(
-        schema_version=1,
+        schema_version=RESULT_SCHEMA_VERSION,
+        binding_method=BINDING_METHOD,
         job_id=payload["job_id"],
         map_id=payload["map_id"],
         segmentation_job_id=payload["segmentation_job_id"],
@@ -137,9 +102,8 @@ def bind_objects(payload):
         unit="metre",
         up_axis="+Z",
         parameters=dict(
-            min_support_points=MIN_SUPPORT_POINTS,
-            min_vote_ratio=MIN_VOTE_RATIO,
-            box_tolerance_m=BOX_TOLERANCE_M,
+            min_overlap_ratio=MIN_OVERLAP_RATIO,
+            relative_tolerance=RELATIVE_TOLERANCE,
         ),
         summary=dict(
             object_count=len(items),
@@ -153,27 +117,6 @@ def bind_objects(payload):
         ),
         items=items,
     )
-
-
-def preview_cloud(path, room_id=None, *, limit=500_000):
-    """Sample XYZ and RGB together from the labeled artifact, never the map preview."""
-    import numpy as np
-
-    vertices = read_vertices(path)
-    keep = np.ones(len(vertices), dtype=bool)
-    for axis in "xyz":
-        keep &= np.isfinite(vertices[axis])
-    if room_id is not None:
-        keep &= vertices["label"] == room_id
-    indices = np.flatnonzero(keep)
-    if len(indices) > limit:
-        indices = indices[np.linspace(0, len(indices) - 1, limit, dtype=int)]
-    selected = vertices[indices]
-    data = np.empty((len(selected), 6), dtype="<f4")
-    for column, name in enumerate(("x", "y", "z", "red", "green", "blue")):
-        data[:, column] = selected[name]
-    data[:, 3:] /= 255
-    return data.tobytes()
 
 
 def main():

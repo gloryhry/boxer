@@ -17,17 +17,22 @@ export interface WorkflowStage {
   reason: string | null; artifacts: Record<string, string>;
 }
 export interface Workflow {
+  schema_version: 2 | null;
   status: string; room_segmentation: WorkflowStage; binding: WorkflowStage;
   error: string | null; finished_at: string | null;
   map_export?: { status: string; relative_path: string; error: string | null } | null;
 }
+export type RoomGeometry =
+  | { type: 'Polygon'; coordinates: [number, number][][] }
+  | { type: 'MultiPolygon'; coordinates: [number, number][][][] };
 export interface Room {
-  id: number; name: string; point_count: number; color: number[];
-  bounds: number[][]; center: number[]; area_m2: number | null;
+  id: number; name: string; area_m2: number;
+  geometry: RoomGeometry; z_bounds_m: [number, number];
 }
 export interface RoomResult {
-  job_id: string; map_id: string; segmentation_job_id: string;
-  rooms: Room[]; summary: { room_count: number; assigned_ratio: number };
+  schema_version: 2; job_id: string; map_id: string; segmentation_job_id: string;
+  coordinate_frame: 'scene_xy'; units: 'm'; volume_type: 'vertical_prism'; resolution_m: number;
+  rooms: Room[]; summary: { room_count: number; area_m2: number; volume_m3: number };
   artifacts: Record<string, string>;
 }
 export interface RoomBinding {
@@ -36,9 +41,12 @@ export interface RoomBinding {
   scale_x: number; scale_y: number; scale_z: number;
   instance: number; name: string; sem_id: number; prob: number;
   room_id: number | null; room_name: string | null; reason: string | null;
-  point_count: number; labeled_point_count: number; support_points: number; vote_ratio: number;
+  object_volume_m3: number | null; intersection_volume_m3: number; overlap_ratio: number;
+  overlaps: { room_id: number; intersection_volume_m3: number; overlap_ratio: number }[];
 }
 export interface RoomBindingPage {
+  schema_version: 2; binding_method: 'obb_room_volume_v1';
+  job_id: string;
   total: number; items: RoomBinding[];
   summary: { object_count: number; assigned_count: number; unassigned_count: number; reason: string | null };
 }

@@ -1,4 +1,5 @@
 # Add to the existing Boxer environment; do not replace its Torch/CUDA packages.
+-r requirements-potential-field.txt
 fastapi>=0.115,<1
 pydantic>=2.9,<3
 uvicorn>=0.30,<1

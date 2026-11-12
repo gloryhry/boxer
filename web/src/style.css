@@ -61,8 +61,6 @@ h1, h2 { font-size: 14px; font-weight: 650; }
 #map-info, #map-directory-note { margin-top: 7px; }
 #map-info { white-space: pre-line; }
 #map-directory-note[data-state=failed] { color: #985343; }
-#room-panel { margin-top: 12px; padding-top: 10px; border-top: 1px solid #e7edf1; }
-#room-panel .actions { margin: 7px 0 4px; }
 #room-status[data-state=failed] { color: #985343; }
 .settings { border-top: 1px solid #e7edf1; margin-top: 12px; padding-top: 10px; }
 summary { font-size: 12px; color: #44606f; font-weight: 550; line-height: 1.7; }

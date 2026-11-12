@@ -15,17 +15,17 @@ function invalidResult(): never {
 
 function equalPoint(a: XY, b: XY) { return a[0] === b[0] && a[1] === b[1]; }
 
-function exterior(part: unknown): XY[] {
-  if (!Array.isArray(part) || !Array.isArray(part[0])) return invalidResult();
-  const ring = part[0];
-  if (ring.length < 4 || !ring.every(finitePair) || !equalPoint(ring[0], ring[ring.length - 1])) {
-    return invalidResult();
-  }
-  return ring.slice(0, -1);
+function rings(part: unknown): XY[][] {
+  if (!Array.isArray(part) || !part.length) return invalidResult();
+  return part.map(ring => {
+    if (!Array.isArray(ring) || ring.length < 4 || !ring.every(finitePair)
+        || !equalPoint(ring[0], ring[ring.length - 1])) return invalidResult();
+    return ring.slice(0, -1);
+  });
 }
 
 export function buildRoomOutlines(payload: unknown) {
-  if (!record(payload) || payload.schema_version !== 1 || payload.coordinate_frame !== 'scene_xy'
+  if (!record(payload) || (payload.schema_version !== 1 && payload.schema_version !== 2) || payload.coordinate_frame !== 'scene_xy'
       || payload.units !== 'm' || payload.volume_type !== 'vertical_prism' || !Array.isArray(payload.rooms)) {
     return invalidResult();
   }
@@ -45,8 +45,7 @@ export function buildRoomOutlines(payload: unknown) {
     const positions: number[] = [];
     min[2] = Math.min(min[2], bottom);
     max[2] = Math.max(max[2], top);
-    for (const part of parts) {
-      const ring = exterior(part);
+    for (const ring of parts.flatMap(rings)) {
       // Dense raster contours need only a few uprights to show the extrusion.
       const uprightStep = Math.ceil(ring.length / 12);
       for (let index = 0; index < ring.length; index++) {

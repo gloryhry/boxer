@@ -4,7 +4,6 @@ import { initializeWorkspaceLayout } from './layout';
 import { inferenceControls, shouldSyncOptions } from './inference';
 import { initializeUploadPanel } from './upload-ui';
 import { RoomResults } from './rooms';
-import { initializeRoomView } from './room-view';
 import type { InferenceState } from './inference';
 import type { Frame, FrameSummary, Job, MapDirectories, MapDirectory, MapInfo, Observation, SceneInfo } from './types';
 
@@ -23,11 +22,6 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     <p id="map-directory-note" class="hint" role="status" aria-live="polite">正在读取 /nav_map 下的地图包…</p>
     <p id="map-info" class="hint">选择地图后加载点云与相机信息。</p>
     <div id="map-upload"></div>
-    <section id="room-panel" aria-labelledby="room-heading">
-      <h2 id="room-heading">房间分割</h2>
-      <div class="actions"><button id="room-start" class="secondary" type="button" disabled>分割房间</button><button id="room-toggle" class="secondary" type="button" aria-pressed="false" disabled>房间框视图</button></div>
-      <p id="room-status" class="hint" role="status" aria-live="polite">加载地图后可分割房间。</p>
-    </section>
     <form id="options">
       <details class="settings"><summary>推理参数 <span>词表 · 相机 · 阈值</span></summary>
         <label for="labels">词表或自定义标签</label><input id="labels" value="indoor" list="vocabularies" placeholder="indoor 或 chair,table,lamp"><datalist id="vocabularies"><option value="lvisplus"><option value="indoor"><option value="small"></datalist>
@@ -46,9 +40,9 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       </details>
     </form>
     <div class="parameter-apply"><button id="apply-options" class="secondary" disabled>应用参数</button><p id="inference-note" class="hint" role="status" aria-live="polite">正在连接模型服务…</p></div>
-    <div class="actions"><button id="start" class="primary" disabled>▶ 开始推理</button><button id="stop" class="danger" disabled>■ 停止推理</button></div>
+    <div class="actions"><button id="start" class="primary" disabled>▶ 开始任务</button><button id="stop" class="danger" disabled>■ 停止推理</button></div>
     <p id="busy-note" class="hint" hidden>已有其他推理任务运行中，可在历史任务中查看。</p>
-    <div class="job-card"><div class="job-top"><span id="job-status" class="status" data-state="idle"><span class="dot"></span>尚未开始</span><span id="progress-text" class="mono">0 / 0</span></div><progress id="progress" max="1" value="0" aria-label="Boxer 已提交帧进度"></progress><p id="workflow-stages" class="hint" role="status" aria-live="polite"></p><p id="job-detail" class="hint">加载地图后开始推理，同时运行 Boxer 和房间分割。</p><details id="output-details"><summary>输出与日志</summary><p id="output" class="path"></p><button id="refresh-log" class="text-button">刷新日志</button><pre id="log"></pre></details></div>
+    <div class="job-card"><div class="job-top"><span id="job-status" class="status" data-state="idle"><span class="dot"></span>尚未开始</span><span id="progress-text" class="mono">0 / 0</span></div><progress id="progress" max="1" value="0" aria-label="Boxer 已提交帧进度"></progress><p id="workflow-stages" class="hint" role="status" aria-live="polite"></p><p id="job-detail" class="hint">加载地图后开始推理，同时运行 Boxer 和房间分割，完成后计算物品归属。</p><details id="output-details"><summary>输出与日志</summary><p id="output" class="path"></p><label for="log-stage">日志阶段</label><select id="log-stage"><option value="boxer">Boxer 检测</option><option value="room_segmentation">房间分割</option><option value="binding">物品归属</option></select><button id="refresh-log" class="text-button">刷新日志</button><pre id="log"></pre></details></div>
     <section id="room-results" class="room-results" aria-label="房间分割与物体绑定"></section>
     <details class="settings"><summary>已有结果与历史任务</summary><label for="results-path">results.json 路径</label><div class="input-action"><input id="results-path" placeholder="/path/to/results.json" spellcheck="false"><button id="import" class="secondary" disabled>加载结果</button></div><label for="history">历史任务</label><div class="input-action"><select id="history"><option value="">选择任务</option></select><button id="refresh-history" class="secondary" aria-label="刷新历史任务">刷新</button></div></details>
     <section class="playback" aria-label="结果回放"><div class="section-heading"><h2>结果回放</h2><span id="stream-state" class="hint">等待结果</span></div>
@@ -90,10 +84,20 @@ let preferredMapPath = localStorage.getItem('boxer-map-path') || '';
 try { scene = new SceneView(element('canvas-host')); }
 catch { showError('浏览器无法初始化 WebGL。请启用硬件加速或使用支持 WebGL 的浏览器；接口和图像回放仍可使用。'); }
 const roomResults = new RoomResults(element('room-results'), scene, fetchOk, () => {
-  if (roomResults.active) { setPlaying(false); scene?.setFollow(false); syncFollow(); }
+  const visible = roomResults.active;
+  element('workspace').toggleAttribute('data-room-view', visible);
+  element('scene-title').textContent = visible ? '房间归属' : '地图视图';
+  element('fit').textContent = visible ? '查看全部房间' : '全图视角';
+  for (const id of ['scene-info', 'focus', 'follow-camera', 'camera-hint']) element(id).hidden = visible;
+  element('room-camera-hint').hidden = !visible;
+  element('room-count').hidden = !visible;
+  if (visible) { setPlaying(false); scene?.setFollow(false); syncFollow(); }
   else if (job?.processed_frames) void selectFrame(index, false);
   buttons();
-}, showError, count => { element('object-count').textContent = `${count} 个最终目标`; });
+}, showError, count => {
+  element('object-count').textContent = `${count} 个最终物品`;
+  element('room-count').textContent = `${roomResults.roomCount} 个房间`;
+});
 
 function showError(message: string) { element('error').textContent = message; element('error').hidden = false; }
 function clearError() { element('error').hidden = true; }
@@ -107,17 +111,6 @@ async function fetchOk(url: string, options?: RequestInit) {
 }
 async function api<T>(url: string, options?: RequestInit): Promise<T> { return (await fetchOk(url, options)).json(); }
 function post<T>(url: string, data: unknown) { return api<T>(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }); }
-const roomView = initializeRoomView(element('room-panel'), scene, api, (visible, count) => {
-  element('workspace').toggleAttribute('data-room-view', visible);
-  element('scene-title').textContent = visible ? '房间框' : '地图视图';
-  element('fit').textContent = visible ? '查看全部房间框' : '全图视角';
-  for (const id of ['scene-info', 'object-count', 'focus', 'follow-camera', 'camera-hint']) element(id).hidden = visible;
-  element('room-camera-hint').hidden = !visible;
-  const roomCount = element('room-count');
-  roomCount.hidden = !visible;
-  roomCount.textContent = `${count} 个房间`;
-  syncFollow();
-});
 function buttons() {
   const state = inferenceControls(inference, options(), connected, activeJobId);
   element<HTMLButtonElement>('start').disabled = busy || !map || !state.canStart;
@@ -171,8 +164,9 @@ function detachJob() {
   element('workflow-stages').textContent = '';
   element('progress-text').textContent = '0 / 0';
   element<HTMLProgressElement>('progress').value = 0;
-  element('job-detail').textContent = '地图已加载，开始推理后同时运行 Boxer 和房间分割。';
+  element('job-detail').textContent = '地图已加载，开始推理后同时运行 Boxer 和房间分割，完成后计算物品归属。';
   element('output').textContent = ''; element('log').textContent = '';
+  element<HTMLSelectElement>('log-stage').value = 'boxer';
   element('stream-state').textContent = '等待结果';
   buttons();
 }
@@ -192,7 +186,6 @@ async function activateMap(info: MapInfo) {
   element('map-info').textContent = `当前地图：${info.path}\n${info.validation.frames} 个${info.validation.frame_unit === 'image' ? '图像组' : '关键帧'} · ${info.validation.keyframes} 个 LiDAR 锚点 · ${info.cameras.length} 个相机`;
   element('scene-info').textContent = `${metadata.point_count.toLocaleString()} 点 · Z ↑ · 米`;
   scene?.setMap(metadata, cloud); scene?.showMap(checked('show-map'));
-  void roomView.setMap(info.id);
   element('empty-scene').hidden = true; syncFollow();
   const cameraList = element<HTMLDataListElement>('camera-list');
   cameraList.replaceChildren(new Option('全部相机', 'all'), ...info.cameras.map(camera => new Option(`cam${camera.id} · ${camera.model}`, String(camera.id))));
@@ -430,7 +423,14 @@ element('history').onchange = () => void action(async () => {
   const value = jobs.find(item => item.id === input('history').value); if (value) await selectJob(await api<Job>(`/api/jobs/${value.id}`));
 });
 element('refresh-history').onclick = () => void action(refreshHistory);
-element('refresh-log').onclick = () => void action(async () => { if (job) element('log').textContent = (await api<{ text: string }>(`/api/jobs/${job.id}/log`)).text || '暂无日志'; });
+const refreshLog = () => void action(async () => {
+  if (!job) return;
+  const identity = job.id, stage = element<HTMLSelectElement>('log-stage').value;
+  const result = await api<{ text: string }>(`/api/jobs/${identity}/log?stage=${encodeURIComponent(stage)}`);
+  if (job?.id === identity && element<HTMLSelectElement>('log-stage').value === stage) element('log').textContent = result.text || '暂无日志';
+});
+element('refresh-log').onclick = refreshLog;
+element('log-stage').onchange = refreshLog;
 input('frame').oninput = () => { input('follow-latest').checked = false; setPlaying(false); void selectFrame(Number(input('frame').value), true); };
 element('play').onclick = () => { input('follow-latest').checked = false; if (!playing && job && index + 1 >= job.processed_frames) void selectFrame(0, true); setPlaying(!playing); };
 input('follow-latest').onchange = () => { setPlaying(false); if (job && checked('follow-latest')) void selectFrame(job.processed_frames - 1, true); };

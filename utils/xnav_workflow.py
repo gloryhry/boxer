@@ -10,7 +10,6 @@ import subprocess
 import threading
 import time
 import uuid
-from collections import OrderedDict
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,8 +18,12 @@ from fastapi import HTTPException
 
 from utils.potential_field_service import VoxelConnectivityJobRequest, _fingerprint
 from utils.xnav_result_store import _atomic_json, _sync_directory
-from utils.xnav_room_binding import preview_cloud
 from utils.xnav_room_export import export_room_results, recover_room_export
+from utils.xnav_room_geometry import (
+    BINDING_METHOD,
+    RESULT_SCHEMA_VERSION,
+    load_room_prisms,
+)
 from utils.xnav_service import (
     ACTIVE,
     REPO,
@@ -50,7 +53,6 @@ class MapWorkflows:
         self.binding_id = None
         self.stop_deadline = None
         self.closing = False
-        self.cloud_cache = OrderedDict()
         self.exports = {}
         self._exporter = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="xnav-room-export"
@@ -177,7 +179,10 @@ class MapWorkflows:
                 global_map_fingerprint=list(
                     _fingerprint(scene.loader.root / "global_map.pcd")
                 ),
-                workflow=WorkflowInfo(map_export=MapExportInfo()).model_dump(),
+                workflow=WorkflowInfo(
+                    schema_version=RESULT_SCHEMA_VERSION,
+                    map_export=MapExportInfo(),
+                ).model_dump(),
                 stop_requested=False,
             )
             self._path(identity, "workflow.json").parent.mkdir()
@@ -189,9 +194,7 @@ class MapWorkflows:
                 self._path(identity, "workflow.json").unlink(missing_ok=True)
                 raise
             try:
-                child = self.rooms.start(
-                    room_request, scene.loader.root, workflow_artifacts=True
-                )
+                child = self.rooms.start(room_request, scene.loader.root)
             except Exception as error:
                 record["workflow"]["room_segmentation"].update(
                     status="failed", error=f"Could not start room segmentation: {error}"
@@ -208,14 +211,25 @@ class MapWorkflows:
             job_id=child["id"],
             status=child["status"],
             error=child["error"],
-            artifacts=child["artifacts"],
+            artifacts={
+                "room_polygons.json": (
+                    f"/api/jobs/{record['job_id']}/room-polygons.json"
+                )
+            }
+            if child["status"] == "complete"
+            else {},
         )
 
     def _record(self, identity):
         self.manager.info(identity)
-        if identity not in self.records:
-            raise HTTPException(404, "Job has no associated room workflow")
-        return self.records[identity]
+        record = self.records.get(identity)
+        if record is None or record["workflow"].get("schema_version") != (
+            RESULT_SCHEMA_VERSION
+        ):
+            raise HTTPException(
+                409, "This task has no version-2 room results; run a new task"
+            )
+        return record
 
     def _check_source(self, record):
         scene = self.manager.get_map(record["map_id"])
@@ -235,8 +249,7 @@ class MapWorkflows:
         try:
             self._check_source(record)
             child_id = record["workflow"]["room_segmentation"]["job_id"]
-            ply = self.rooms.artifact(child_id, "result_colored.ply")
-            rooms = json.loads(self.rooms.artifact(child_id, "rooms.json").read_bytes())
+            polygons = self.rooms.artifact(child_id, "room_polygons.json")
             with self.manager.lock:
                 replay = self.manager.replay(identity)
                 if replay.results.get("status") != "complete":
@@ -254,8 +267,7 @@ class MapWorkflows:
                 global_map_fingerprint=record["global_map_fingerprint"],
                 tracking_enabled=boxer["tracking"],
                 objects=objects,
-                rooms=rooms,
-                ply_path=str(ply),
+                room_polygons_path=str(polygons),
             )
             source = self._path(identity, "binding-input.json")
             _atomic_json(source, payload)
@@ -316,7 +328,13 @@ class MapWorkflows:
                 self._check_source(record)
                 result = json.loads(staging.read_bytes())
                 if (
-                    result["job_id"] != record["job_id"]
+                    result.get("schema_version") != RESULT_SCHEMA_VERSION
+                    or result.get("binding_method") != BINDING_METHOD
+                    or result["job_id"] != record["job_id"]
+                    or result["map_id"] != record["map_id"]
+                    or result["source_signature"] != record["source_signature"]
+                    or result["global_map_fingerprint"]
+                    != record["global_map_fingerprint"]
                     or result["segmentation_job_id"]
                     != record["workflow"]["room_segmentation"]["job_id"]
                 ):
@@ -346,20 +364,8 @@ class MapWorkflows:
         try:
             child = record["workflow"]["room_segmentation"]["job_id"]
             sources = {
-                name: self.rooms.artifact(child, name)
-                for name in (
-                    "result_colored.ply",
-                    "rooms.json",
-                    "summary.json",
-                )
+                "room_polygons.json": self.rooms.artifact(child, "room_polygons.json")
             }
-            if (
-                "room_polygons.json"
-                in record["workflow"]["room_segmentation"]["artifacts"]
-            ):
-                sources["room_polygons.json"] = self.rooms.artifact(
-                    child, "room_polygons.json"
-                )
             bound = record["workflow"]["binding"]["status"] == "complete"
             if bound:
                 sources["room-bindings.json"] = self.binding_path(identity)
@@ -372,6 +378,7 @@ class MapWorkflows:
                 archive = self._path(identity, "3dbbox.zip")
             snapshot = copy.deepcopy(record)
             provenance = dict(
+                schema_version=RESULT_SCHEMA_VERSION,
                 job_id=identity,
                 map_id=record["map_id"],
                 segmentation_job_id=child,
@@ -596,7 +603,7 @@ class MapWorkflows:
                 raise HTTPException(409, "Workflow archive is not available")
             return self.manager.archive_path(identity)
 
-    def room_result(self, identity):
+    def room_polygons_path(self, identity):
         with self.lock:
             record = self._record(identity)
             stage = record["workflow"]["room_segmentation"]
@@ -604,39 +611,50 @@ class MapWorkflows:
                 raise HTTPException(
                     409, "Room segmentation has not completed successfully"
                 )
-            child = stage["job_id"]
+            return self.rooms.artifact(stage["job_id"], "room_polygons.json")
+
+    def room_result(self, identity):
+        with self.lock:
+            document, rooms = load_room_prisms(self.room_polygons_path(identity))
+            record = self._record(identity)
+            stage = record["workflow"]["room_segmentation"]
             return dict(
+                schema_version=RESULT_SCHEMA_VERSION,
                 job_id=identity,
                 map_id=record["map_id"],
-                segmentation_job_id=child,
-                rooms=json.loads(self.rooms.artifact(child, "rooms.json").read_bytes()),
-                summary=json.loads(
-                    self.rooms.artifact(child, "summary.json").read_bytes()
+                segmentation_job_id=stage["job_id"],
+                algorithm="voxel_connectivity",
+                coordinate_frame="scene_xy",
+                units="m",
+                volume_type="vertical_prism",
+                resolution_m=document["resolution_m"],
+                rooms=[room.record() for room in rooms],
+                summary=dict(
+                    room_count=len(rooms),
+                    area_m2=sum(room.geometry.area for room in rooms),
+                    volume_m3=sum(
+                        room.geometry.area * (room.z_bounds_m[1] - room.z_bounds_m[0])
+                        for room in rooms
+                    ),
                 ),
                 artifacts=stage["artifacts"],
-                algorithm="voxel_connectivity",
             )
 
-    def room_cloud(self, identity, room_id):
-        result = self.room_result(identity)
-        if (
-            room_id is not None
-            and room_id >= 0
-            and room_id not in {room["id"] for room in result["rooms"]}
-        ):
-            raise HTTPException(404, "Room not found")
-        key = identity, room_id
+    def log(self, identity, stage):
         with self.lock:
-            if key in self.cloud_cache:
-                self.cloud_cache.move_to_end(key)
-                return self.cloud_cache[key]
-        path = self.rooms.artifact(result["segmentation_job_id"], "result_colored.ply")
-        data = preview_cloud(path, room_id)
-        with self.lock:
-            self.cloud_cache[key] = data
-            while sum(len(value) for value in self.cloud_cache.values()) > 32 * 1024**2:
-                self.cloud_cache.popitem(last=False)
-        return data
+            self.manager.info(identity)
+            if stage == "boxer":
+                return self.manager.log(identity)
+            record = self._record(identity)
+            if stage == "room_segmentation":
+                child = record["workflow"][stage]["job_id"]
+                return self.rooms.log(child) if child else ""
+            path = self._path(identity, "binding.log")
+            if path.is_symlink() or not path.is_file():
+                return ""
+            with path.open("rb") as stream:
+                stream.seek(max(0, os.fstat(stream.fileno()).st_size - 65_536))
+                return stream.read(65_536).decode("utf-8", errors="replace")
 
     def binding_path(self, identity):
         with self.lock:
@@ -646,6 +664,11 @@ class MapWorkflows:
             path = self._path(identity, "room-bindings.json")
             if path.is_symlink() or not path.is_file():
                 raise HTTPException(404, "Room binding artifact not found")
+            result = json.loads(path.read_bytes())
+            if result.get("schema_version") != RESULT_SCHEMA_VERSION or (
+                result.get("binding_method") != BINDING_METHOD
+            ):
+                raise HTTPException(409, "Unsupported room bindings; run a new task")
             return path
 
     def binding_page(self, identity, offset, limit, room_id):
@@ -655,6 +678,8 @@ class MapWorkflows:
             owner = None if room_id == -1 else room_id
             items = [item for item in items if item["room_id"] == owner]
         return dict(
+            schema_version=RESULT_SCHEMA_VERSION,
+            binding_method=BINDING_METHOD,
             job_id=identity,
             map_id=result["map_id"],
             segmentation_job_id=result["segmentation_job_id"],

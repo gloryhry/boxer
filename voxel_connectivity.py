@@ -4,13 +4,12 @@ import argparse
 import json
 import os
 import tempfile
-import time
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from potential_field import _publish_artifacts, _watch_owner
+from potential_field import _watch_owner
 from utils.potential_field_runtime.config import _ConfigLoader
 from utils.voxel_connectivity_runtime import ARTIFACT_TYPES
 
@@ -41,17 +40,16 @@ def load_voxel_connectivity_config():
         ) from error
 
 
-def run(input_path, output_dir, options, *, workflow_artifacts=False):
+def run(input_path, output_dir, options):
     import numpy as np
 
-    from utils.potential_field_runtime.pointcloud import read_cloud, room_color
+    from utils.potential_field_runtime.pointcloud import read_cloud
     from utils.voxel_connectivity_runtime.room_polygons import room_polygons
     from utils.voxel_connectivity_runtime.voxel_connectivity import (
         METHOD_VERSION,
         run_voxel_connectivity,
     )
 
-    started = time.perf_counter()
     source = Path(input_path).resolve(strict=True)
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -68,7 +66,7 @@ def run(input_path, output_dir, options, *, workflow_artifacts=False):
 
     config = load_voxel_connectivity_config()
     params = VoxelConnectivityConfig.model_validate({**config, **options}).model_dump()
-    xyz, normals = read_cloud(source)
+    xyz, _ = read_cloud(source)
 
     def log(message):
         print(message, flush=True)
@@ -117,52 +115,6 @@ def run(input_path, output_dir, options, *, workflow_artifacts=False):
             z = xyz[raw_labels == footprint["id"], 2]
             footprint["z_bounds_m"] = [float(z.min()), float(z.max())]
 
-        if workflow_artifacts:
-            # Binding and coloured previews need labels in original point order.
-            labels = raw_labels.astype(np.int32, copy=True)
-            labels[np.isin(labels, room_ids[filtered])] = -1
-            native_rooms = {room["id"]: room for room in artifacts["rooms"]}
-            rooms = []
-            for room_id, count in zip(room_ids[~filtered], counts[~filtered]):
-                identity = int(room_id)
-                points = xyz[labels == identity]
-                native_room = native_rooms[identity]
-                rooms.append(
-                    dict(
-                        id=identity,
-                        name=f"房间 {identity + 1:02d}",
-                        point_count=int(count),
-                        color=list(room_color(identity)),
-                        bounds=[points.min(0).tolist(), points.max(0).tolist()],
-                        center=points.mean(0).tolist(),
-                        confidence=None,
-                        area_m2=native_room["area_m2"],
-                        cell_count=native_room["cell_count"],
-                    )
-                )
-            diagnostics = artifacts["statistics"]
-            assigned = int(np.count_nonzero(labels >= 0))
-            summary = dict(
-                algorithm="voxel_connectivity",
-                method_version=diagnostics["method_version"],
-                parameters=params,
-                room_count=len(rooms),
-                raw_room_count=len(room_ids),
-                native_room_count=len(native_rooms),
-                filtered_room_count=int(filtered.sum()),
-                point_count_filtered_count=int(counts[filtered].sum()),
-                point_count=len(xyz),
-                assigned_count=assigned,
-                unassigned_count=len(xyz) - assigned,
-                assigned_ratio=assigned / len(xyz),
-                inference_seconds=diagnostics["inference_seconds"],
-                total_seconds=time.perf_counter() - started,
-                diagnostics=diagnostics,
-            )
-            _publish_artifacts(
-                scratch, destination, xyz, labels, normals, rooms, summary
-            )
-
         name = "room_polygons.json"
         (scratch / name).write_text(
             json.dumps(polygons, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
@@ -184,16 +136,12 @@ def main(argv=None):
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--resolution", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--min-room-points", type=int, default=argparse.SUPPRESS)
-    parser.add_argument(
-        "--workflow-artifacts", action="store_true", help=argparse.SUPPRESS
-    )
     args = vars(parser.parse_args(argv))
     source = args.pop("input")
     destination = args.pop("output_dir")
-    workflow_artifacts = args.pop("workflow_artifacts")
     try:
         _watch_owner()
-        run(source, destination, args, workflow_artifacts=workflow_artifacts)
+        run(source, destination, args)
     except ImportError as error:
         parser.exit(
             1,

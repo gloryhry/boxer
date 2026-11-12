@@ -21,10 +21,8 @@ from starlette.requests import ClientDisconnect
 from loaders.xnav_loader import processing_frame_id
 from utils.potential_field_service import (
     LogInfo,
-    PotentialFieldJobs,
     RoomSegmentationDispatcher,
     VoxelConnectivityJobs,
-    install_room_segmentation_routes,
 )
 from utils.xnav_service import (
     REPO,
@@ -42,6 +40,8 @@ from utils.xnav_service import (
     MapInfo,
     MapRequest,
     RoomBindingPage,
+    RoomBindingResult,
+    RoomPolygonDocument,
     RoomResult,
     SceneInfo,
     list_map_directories,
@@ -85,18 +85,15 @@ def create_app(
     web_dir=None,
     map_root="/nav_map",
     upload_limits=None,
-    potential_field_jobs=None,
     voxel_connectivity_jobs=None,
 ):
     manager = manager or JobManager(output_dir)
     uploads = UploadManager(map_root, manager, limits=upload_limits)
     room_output = getattr(manager, "root", output_dir)
-    if potential_field_jobs is None:
-        potential_field_jobs = PotentialFieldJobs(room_output)
     if voxel_connectivity_jobs is None:
         voxel_connectivity_jobs = VoxelConnectivityJobs(room_output)
     room_dispatcher = RoomSegmentationDispatcher(
-        manager, potential_field_jobs, voxel_connectivity_jobs
+        manager, voxel_connectivity_jobs
     )
     workflows = MapWorkflows(
         manager, room_dispatcher, voxel_connectivity_jobs, room_output
@@ -118,7 +115,6 @@ def create_app(
         async def monitor():
             while True:
                 await asyncio.to_thread(manager.poll)
-                await asyncio.to_thread(potential_field_jobs.poll)
                 await asyncio.to_thread(voxel_connectivity_jobs.poll)
                 await asyncio.to_thread(workflows.poll)
                 await asyncio.sleep(0.3)
@@ -136,18 +132,15 @@ def create_app(
                     await asyncio.to_thread(workflows.close)
                 finally:
                     try:
-                        await asyncio.to_thread(potential_field_jobs.close)
+                        await asyncio.to_thread(voxel_connectivity_jobs.close)
                     finally:
-                        try:
-                            await asyncio.to_thread(voxel_connectivity_jobs.close)
-                        finally:
-                            await asyncio.to_thread(uploads.close)
-                            await asyncio.to_thread(manager.close)
-                            await asyncio.to_thread(workflows.poll)
+                        await asyncio.to_thread(uploads.close)
+                        await asyncio.to_thread(manager.close)
+                        await asyncio.to_thread(workflows.poll)
 
     app = FastAPI(
         title="Boxer x-nav API",
-        version="1.2.0",
+        version="2.0.0",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
@@ -155,13 +148,14 @@ def create_app(
             "Local/LAN map inference and committed-result replay. "
             "Nanosecond timestamps are strings. Cloud responses contain "
             "little-endian float32 xyzrgb vertices (24 bytes per point)."
-            " POST /api/jobs runs Boxer and voxel room segmentation concurrently; "
+            " POST /api/jobs is the only computation entrypoint: Boxer and "
+            "voxel room segmentation run concurrently, followed by volume-based "
+            "object binding; "
             "workflow.status describes the complete workflow, status describes Boxer."
         ),
     )
     app.state.manager = manager
     app.state.uploads = uploads
-    app.state.potential_field_jobs = potential_field_jobs
     app.state.voxel_connectivity_jobs = voxel_connectivity_jobs
     app.state.workflows = workflows
     app.state.stopping = False
@@ -339,12 +333,6 @@ def create_app(
         scene.scene()
         return binary(scene.cloud, request, "application/octet-stream")
 
-    install_room_segmentation_routes(
-        app, manager, potential_field_jobs, voxel_connectivity_jobs,
-        errors=ERRORS, artifact_response=cloud_response,
-        dispatcher=room_dispatcher,
-    )
-
     @app.get("/api/jobs", response_model=list[JobInfo], responses=ERRORS)
     def list_jobs():
         return workflows.list()
@@ -379,15 +367,17 @@ def create_app(
         return workflows.room_result(job_id)
 
     @app.get(
-        "/api/jobs/{job_id}/rooms/cloud", response_class=Response,
-        responses={**ERRORS, **cloud_response},
+        "/api/jobs/{job_id}/room-polygons.json", response_class=FileResponse,
+        responses={
+            **ERRORS,
+            200: {"model": RoomPolygonDocument},
+        },
     )
-    def job_room_cloud(
-        job_id: str, request: Request, room_id: int | None = Query(None, ge=-1),
-    ):
-        """At most 500000 xyzrgb vertices; -1 selects unassigned cloud points."""
-        return binary(
-            workflows.room_cloud(job_id, room_id), request, "application/octet-stream"
+    def download_room_polygons(job_id: str):
+        """Immutable Polygon/MultiPolygon footprints with metre-scale Z bounds."""
+        return FileResponse(
+            workflows.room_polygons_path(job_id), media_type="application/json",
+            filename=f"room-polygons-{job_id}.json",
         )
 
     @app.get(
@@ -399,26 +389,30 @@ def create_app(
         limit: int = Query(200, ge=1, le=1000),
         room_id: int | None = Query(None, ge=-1),
     ):
-        """Final OBB room votes. room_id=-1 selects unbound objects; omit for all."""
+        """Final OBB/prism overlaps; room_id=-1 selects unbound objects."""
         return workflows.binding_page(job_id, offset, limit, room_id)
 
     @app.get(
         "/api/jobs/{job_id}/room-bindings.json", response_class=FileResponse,
         responses={
             **ERRORS,
-            200: {"content": {"application/json": {"schema": {"type": "object"}}}},
+            200: {"model": RoomBindingResult},
         },
     )
     def download_room_bindings(job_id: str):
-        """Immutable full result, including provenance, thresholds and vote evidence."""
+        """Immutable full result with provenance, thresholds and volume evidence."""
         return FileResponse(
             workflows.binding_path(job_id), media_type="application/json",
             filename=f"room-bindings-{job_id}.json",
         )
 
     @app.get("/api/jobs/{job_id}/log", response_model=LogInfo, responses=ERRORS)
-    def job_log(job_id: str):
-        return {"text": manager.log(job_id)}
+    def job_log(
+        job_id: str,
+        stage: Literal["boxer", "room_segmentation", "binding"] = Query("boxer"),
+    ):
+        """Read the selected stage's log using the parent task ID."""
+        return {"text": workflows.log(job_id, stage)}
 
     @app.get(
         "/api/jobs/{job_id}/events",
@@ -683,6 +677,14 @@ def create_app(
                 },
             )
         return FileResponse(path)
+
+    @app.api_route(
+        "/api/{path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+        include_in_schema=False,
+    )
+    def unknown_api(path: str):
+        raise HTTPException(404, "API route not found")
 
     if web_dir.is_dir():
         app.mount("/", StaticFiles(directory=web_dir), name="web")

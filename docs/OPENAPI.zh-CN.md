@@ -2,14 +2,12 @@
 
 本文覆盖 `server.py` 的地图注册与上传、Boxer 物体检测与回放、房间分割和任务输出文件。
 
-核对日期为 2026-11-11，服务 API 版本为 `1.2.0`。部署版本的字段与约束可通过 `/openapi.json` 核对。
+核对日期为 2026-11-11，服务 API 版本为 `2.0.0`。部署版本的字段与约束可通过 `/openapi.json` 核对。
 
 | 用途 | 提交入口 | 结果入口 |
 | --- | --- | --- |
 | 注册或上传 x-nav 地图 | `POST /api/maps` 或 `POST /api/maps/uploads` | 地图 `id`、场景元数据、预览点云 |
 | Boxer 与体素房间分割联合流程 | `POST /api/jobs` | 逐帧回放、检测框、房间、物体绑定、`3dbbox.zip` |
-| 势场法房间分割 | `POST /api/potential-field/jobs` | 带房间标签的 PLY、房间列表和统计 JSON |
-| 体素连通复核 | `POST /api/voxel-connectivity/jobs` | 带房间标签的 PLY、房间列表和统计 JSON |
 
 ## 目录
 
@@ -25,8 +23,8 @@
 - [10. 客户端接入示例](#10-客户端接入示例)
 - [11. 文件输出与历史恢复](#11-文件输出与历史恢复)
 - [12. 错误处理与排查](#12-错误处理与排查)
-- [13. 势场法房间分割](#13-势场法房间分割)
-- [14. 体素连通复核](#14-体素连通复核)
+- [13. 房间分割配置与运行](#13-房间分割配置与运行)
+- [14. 房间几何格式](#14-房间几何格式)
 - [15. 联合工作流与物体房间绑定](#15-联合工作流与物体房间绑定)
 - [16. 实现位置与维护](#16-实现位置与维护)
 
@@ -61,7 +59,7 @@ npm --prefix web run build
 .venv/bin/python server.py
 ```
 
-已有 Boxer 环境、模型权重和默认 `indoor` 词表是前提；`requirements-server.txt` 只补充 FastAPI、Pydantic 和 Uvicorn。环境配置见 [本地 CUDA 环境](LOCAL_CUDA.md) 和 [Jetson 部署](JETSON_ORIN_NX.md)。
+已有 Boxer 环境、模型权重和默认 `indoor` 词表是前提；`requirements-server.txt` 补充 HTTP 依赖和 `requirements-potential-field.txt` 中的 CPU 房间分割、几何计算依赖。环境配置见 [本地 CUDA 环境](LOCAL_CUDA.md) 和 [Jetson 部署](JETSON_ORIN_NX.md)。
 
 可设置的服务启动参数如下：
 
@@ -81,7 +79,7 @@ npm --prefix web run build
   --output_dir /path/to/server-output
 ```
 
-HTTP 启动时会异步预加载默认 Boxer 模型及 `indoor` 词表。提交物体检测任务前，应查询 `/api/inference` 并等待 `status` 为 `ready`。势场法通过[独立任务接口](#13-势场法房间分割)运行，任务状态以该接口为准。
+HTTP 启动时会异步预加载默认 Boxer 模型及 `indoor` 词表。提交物体检测任务前，应查询 `/api/inference` 并等待 `status` 为 `ready`。检测、房间分割与物品归属统一通过 `POST /api/jobs` 提交，完整流程以 `workflow.status` 为准。
 
 ### 1.3 Docker 部署与路径映射
 
@@ -129,9 +127,9 @@ API 中的 `path`、`results_path`、`ckpt` 都是**服务进程可见的文件�
 
 ### 2.3 并发和异步行为
 
-Boxer 物体检测最多运行一个活动任务。势场法和体素连通复核共享一个独立的 CPU 分割任务槽。分割任务运行或停止期间，两个分割入口均拒绝新的分割提交。物体检测的模型与已应用参数由所有客户端共享，历史回放可以同时读取。
+服务同时只受理一个联合计算任务。物体检测的模型与已应用参数由所有客户端共享，历史回放可以同时读取。
 
-`POST /api/jobs` 同时提交 Boxer 与体素连通复核，成功后自动绑定最终物体。联合流程同时只受理一个，已有流程或 CPU 分割占槽时返回 `409`，不排队。导入目录和 ZIP 上传完成仍只注册地图，不启动任务。完整流程以 `workflow.status` 为准；顶层 `status` 仍仅表示 Boxer 阶段。
+`POST /api/jobs` 同时提交 Boxer 与体素连通复核，成功后自动绑定最终物体。联合流程同时只受理一个，已有活动流程或内部 CPU 分割占槽时返回 `409`，不排队。导入目录和 ZIP 上传完成仍只注册地图，不启动任务。完整流程以 `workflow.status` 为准；顶层 `status` 仍仅表示 Boxer 阶段。
 
 `PUT /api/inference`、`POST /api/jobs`、停止任务接口的正常响应码为 `202`，表示请求已受理；最终状态需要继续查询。地图注册和结果导入正常返回 `200`。
 
@@ -234,7 +232,7 @@ curl --fail-with-body -sS \
 | `GET` | `/api/jobs/{job_id}/events` | `200` | 订阅任务 SSE 事件 |
 | `GET` | `/api/jobs/{job_id}/3dbbox.zip` | `200` | 下载成功任务的 `3dbbox/` ZIP 快照 |
 | `GET` | `/api/jobs/{job_id}/rooms` | `200` | 查询关联房间列表、统计及原始产物地址 |
-| `GET` | `/api/jobs/{job_id}/rooms/cloud` | `200` / `304` | 获取房间着色预览点云 |
+| `GET` | `/api/jobs/{job_id}/room-polygons.json` | `200` | 下载房间轮廓与高度范围 |
 | `GET` | `/api/jobs/{job_id}/room-bindings` | `200` | 分页查询最终物体的房间归属 |
 | `GET` | `/api/jobs/{job_id}/room-bindings.json` | `200` | 下载完整绑定结果 |
 | `GET` | `/api/jobs/{job_id}/frames` | `200` | 分页查询已提交帧摘要 |
@@ -245,18 +243,6 @@ curl --fail-with-body -sS \
 | `GET` | `/api/jobs/{job_id}/3dbbox_tracks` | `200` | 分页获取各已提交帧的确认跟踪框 |
 | `GET` | `/api/jobs/{job_id}/3dbbox` | `200` | 分页获取各已提交帧融合后的 3D 检测 |
 | `GET` | `/api/jobs/{job_id}/owl_2dbbox` | `200` | 分页获取各已提交帧、相机和视图的 OWL 2D 检测 |
-| `GET` | `/api/potential-field/jobs` | `200` | 查询势场任务列表 |
-| `POST` | `/api/potential-field/jobs` | `202` | 对注册地图提交势场任务 |
-| `GET` | `/api/potential-field/jobs/{job_id}` | `200` | 查询势场任务状态及下载地址 |
-| `POST` | `/api/potential-field/jobs/{job_id}/stop` | `202` | 请求停止势场任务 |
-| `GET` | `/api/potential-field/jobs/{job_id}/log` | `200` | 读取势场任务日志尾部 |
-| `GET` | `/api/potential-field/jobs/{job_id}/artifacts/{filename}` | `200` | 下载势场任务的 PLY 或 JSON 文件 |
-| `GET` | `/api/voxel-connectivity/jobs` | `200` | 查询体素连通复核任务列表 |
-| `POST` | `/api/voxel-connectivity/jobs` | `202` | 对注册地图提交体素连通复核任务 |
-| `GET` | `/api/voxel-connectivity/jobs/{job_id}` | `200` | 查询体素连通复核任务状态和下载地址 |
-| `POST` | `/api/voxel-connectivity/jobs/{job_id}/stop` | `202` | 请求停止体素连通复核任务 |
-| `GET` | `/api/voxel-connectivity/jobs/{job_id}/log` | `200` | 读取体素连通复核任务日志尾部 |
-| `GET` | `/api/voxel-connectivity/jobs/{job_id}/artifacts/{filename}` | `200` | 下载体素连通复核的 PLY 或 JSON 文件 |
 
 `/docs`、`/openapi.json`、`/` 和静态资源地址不计入业务操作数。
 
@@ -558,7 +544,7 @@ python scripts/upload_xnav_map.py /path/to/园区A.zip \
 
 正常返回 `202` 和 `JobInfo`；返回时通常为 `starting`。仍需检查响应中的 `status` 和后续任务状态：worker 发送失败等异常也可能使此次返回的任务已经为 `failed`。
 
-从 1.2.0 开始，此接口也派发体素连通复核。请求体保持不变；分割读取 `config/voxel_connectivity.yaml`，可由 `BOXER_VC_CONFIG` 指定。提交前检查模型、地图、`global_map.pcd`、解释器、配置和两个任务槽。模型未就绪返回 `503`，地图/全局点云不存在返回 `404`，占槽返回 `409`。受理后的阶段失败通过 `workflow` 报告，另一项继续运行。
+API 2.0.0 统一由此接口派发物体检测、体素连通分割和几何归属。请求体保持不变；分割读取 `config/voxel_connectivity.yaml`，可由 `BOXER_VC_CONFIG` 指定。提交前检查模型、地图、`global_map.pcd`、解释器、配置和两个任务槽。模型未就绪返回 `503`，地图/全局点云不存在返回 `404`，占槽返回 `409`。受理后的阶段失败通过 `workflow` 报告，另一项继续运行。
 
 ### 7.2 `GET /api/jobs`
 
@@ -605,7 +591,7 @@ python scripts/upload_xnav_map.py /path/to/园区A.zip \
 | `tracking` | 是否包含跟踪结果；优先取保存结果中的跟踪设置 |
 | `device` | 执行设备或保存结果中的设备信息 |
 | `error` | 错误详情，无错误通常为 `null` |
-| `workflow` | 联合流程状态、关联分割与绑定阶段；历史/只读任务为 `null` |
+| `workflow` | 联合流程状态与阶段；新任务 `schema_version=2`，无联合流程时为 `null` |
 
 | 状态 | 含义 | 客户端处理 |
 | --- | --- | --- |
@@ -634,15 +620,12 @@ curl --fail-with-body -sS -X POST "$API_BASE/api/jobs/$JOB_ID/stop"
 
 ### 7.5 `GET /api/jobs/{job_id}/log`
 
-返回 `LogInfo`：
+统一通过父任务 ID 读取各阶段日志，响应为 `{"text":"…"}`。`stage` 可取 `boxer`（默认）、`room_segmentation`、`binding`；Boxer 返回日志末尾最多约 12,000 字节，房间分割和归属返回末尾最多 64 KiB。尚无阶段日志时返回空字符串；无效阶段返回 `422`。模型加载与配置日志另见服务输出根目录的 `worker.log`。
 
-```json
-{"text": "任务日志文本……"}
+```bash
+curl --fail-with-body -sS "$API_BASE/api/jobs/$JOB_ID/log?stage=room_segmentation"
+curl --fail-with-body -sS "$API_BASE/api/jobs/$JOB_ID/log?stage=binding"
 ```
-
-读取该任务 `inference.log` 最后最多约 12,000 字节，以 UTF-8 解码；不是完整日志下载。日志尚未创建或导入任务没有对应日志时，`text` 为空字符串。未知任务返回 `404`。
-
-模型启动与配置日志主要位于服务输出根目录的 `worker.log`；配置失败时也应查看 `/api/inference.error`。
 
 ### 7.6 `POST /api/jobs/import`
 
@@ -1218,6 +1201,10 @@ output/server/
 │   └── <Boxer任务ID>/
 │       ├── job.json
 │       ├── inference.log
+│       ├── workflow.json
+│       ├── binding-input.json
+│       ├── binding.log
+│       ├── room-bindings.json
 │       ├── 3dbbox.zip
 │       └── output/<地图清单map_id>/<snapshot_id>/<相机模式>/
 │           ├── results.json
@@ -1228,16 +1215,13 @@ output/server/
 │           ├── boxer_3dbbs_tracks.csv
 │           ├── boxer_3dbbs_tracked.csv
 │           └── performance.json
-└── potential_field/jobs/<势场任务ID>/
+└── voxel_connectivity/jobs/<内部子任务ID>/
     ├── job.json
     ├── inference.log
-    └── output/
-        ├── result_colored.ply
-        ├── rooms.json
-        └── summary.json
+    └── output/room_polygons.json
 ```
 
-Boxer 任务的实际结果路径以 `JobInfo.results_path` 为准。`map_id` 在路径树中指源地图清单的业务 ID。势场任务使用独立的目录与下载接口，见[第 13 节](#13-势场法房间分割)。
+Boxer 任务的实际结果路径以 `JobInfo.results_path` 为准。`map_id` 在路径树中指源地图清单的业务 ID。体素子任务目录由服务内部管理；调用方使用父任务 ID 查询、停止、读取日志及下载房间结果。
 
 | Boxer 文件 | 内容与生成条件 |
 | --- | --- |
@@ -1382,235 +1366,132 @@ OpenAPI 为各业务路由统一声明了上述错误模型，不表示每个路
 | 任务完成后 SSE 仍保持连接 | 收到结束状态后调用 `EventSource.close()` 或关闭流式请求 |
 | 重启后任务未继续或参数变回默认 | 这是当前恢复行为；重新应用配置并创建新任务 |
 
-## 13. 势场法房间分割
+## 13. 房间分割配置与运行
 
-势场法使用已注册地图目录里的完整 `global_map.pcd`，坐标为米制、Z 轴向上。
-算法源码、启动入口和默认 YAML 随本仓库部署。每个任务在独立 CPU 进程运行。
-源码位于 [`utils/potential_field_runtime/`](../utils/potential_field_runtime/)，
-启动入口为 [`potential_field.py`](../potential_field.py)。
+`POST /api/jobs` 是唯一计算任务入口。服务并行启动 Boxer 和内置 `voxel-connectivity-v10`，两者成功后按房间几何计算最终物品归属，再保存地图结果和 ZIP。请求体沿用第 7.1 节，房间分割配置由服务读取，不新增独立提交步骤。
 
-### Ubuntu 配置
+分割输入为当前注册地图的完整 `global_map.pcd`，坐标单位为米、`+Z` 向上。每次任务重新读取 `config/voxel_connectivity.yaml`，可由 `BOXER_VC_CONFIG` 指定其他配置文件：
 
-在 Boxer 仓库根目录，用已有 Boxer Python 环境安装势场法依赖。以下以 `.venv` 为例。
-
-```bash
-.venv/bin/python -m pip install -r requirements-potential-field.txt
-```
-
-先用一份实际点云验证算法入口，将 `--input` 换成服务器上的点云文件。
-
-```bash
-.venv/bin/python -m potential_field \
-  --input /path/to/map/global_map.pcd \
-  --output-dir "$(mktemp -d)"
-```
-
-服务默认用自身的 Python 启动势场工作进程。已有专用 Python 环境时，可将
-`BOXER_PF_PYTHON` 设为对应的解释器绝对路径。Docker 镜像构建时安装运行依赖。
-
-Docker 服务已运行时，也可直接在容器内试跑已挂载的点云。
-
-```bash
-docker compose -f docker-compose.x86.yaml exec -T server python -m potential_field \
-  --input /nav_map/demo/global_map.pcd \
-  --output-dir "/app/output/server/pf-smoke-$(date +%s)"
-```
-
-默认配置是 Boxer 仓库中的 [`config/potential_field.yaml`](../config/potential_field.yaml)。
-修改 `max_grid_voxels`、`max_stacks` 或其他默认值后，新任务会读取最新内容。
-Compose 将仓库的 `config/` 挂载到容器内，保存 YAML 后即可提交新任务。需要部署在其他位置时，
-可将 `BOXER_PF_CONFIG` 指向自定义 YAML。
-
-### 提交任务和获取结果
-
-先用 [地图注册接口](#62-post-apimaps) 注册完整的 x-nav 地图包，将返回的 `id` 作为 `map_id`。Docker 下地图路径使用 `/nav_map/…`。地图包需要包含 `global_map.pcd`。手头只有 PCD 或 PLY 时，可用本节的命令行入口直接读取点云文件。
-
-```bash
-API_BASE=http://127.0.0.1:18765
-MAP_ID=替换成地图注册返回的id
-
-curl --fail-with-body -sS -X POST "$API_BASE/api/potential-field/jobs" \
-  -H 'Content-Type: application/json' \
-  -d "{\"map_id\":\"$MAP_ID\",\"options\":{\"voxel\":0.2}}"
-```
-
-`options` 可省略。请求中显式提供的字段覆盖 YAML 默认值。表中的默认值对应仓库自带配置。
-
-| `options` 字段 | 单位与范围 | 默认值 | 含义 |
+| 配置字段 | 单位与范围 | 默认值 | 含义 |
 | --- | --- | --- | --- |
-| `voxel` | 米，`0.02–5` | `0.2` | 体素边长 |
-| `min_room_points` | 整数点数，`0–100000000` | `0` | 回投后少于此点数的房间，其点标签记为 `-1`。`0` 关闭筛选 |
-| `min_room_area` | 平方米，`0–1000000` | `2.0` | 最小平面面积。`0` 关闭面积筛选 |
-| `merge_opening` | 米，`0–10` | `1.6` | 宽开口合并所需的最小有效宽度。`0` 关闭宽开口合并 |
-| `max_projection_distance` | 米，`0–10` | `0.8` | 补点标签的最大三维体素距离。`0` 取消距离上限 |
+| `resolution` | 米，`0.03–0.50` | `0.10` | 二维分割栅格分辨率 |
+| `min_room_points` | 整数，`0–100000000` | `0` | 过滤支持点少于阈值的候选房间；`0` 关闭过滤 |
 
-`vis_targets`、`ceiling_aware`、`max_grid_voxels` 和 `max_stacks` 通过 YAML 设置。任务执行时的有效参数写入 `summary.json` 的 `parameters`。
+分割内部仍使用地图点云，发布结果统一为 `room_polygons.json`。归属、房间展示和房间导出直接使用轮廓与高度范围，不读取房间点云文件。
 
-| 方法 | 路径 | 成功码 | 返回内容 |
-| --- | --- | --- | --- |
-| `POST` | `/api/potential-field/jobs` | `202` | 已受理任务的详情和 `id` |
-| `GET` | `/api/potential-field/jobs` | `200` | 任务数组，按创建时间倒序，暂无任务时为 `[]` |
-| `GET` | `/api/potential-field/jobs/{job_id}` | `200` | 单个任务的最新状态 |
-| `POST` | `/api/potential-field/jobs/{job_id}/stop` | `202` | 请求停止后的任务状态。任务停止后为 `interrupted` |
-| `GET` | `/api/potential-field/jobs/{job_id}/log` | `200` | `{"text":"…"}`，包含最近最多 64 KiB 的日志 |
-| `GET` | `/api/potential-field/jobs/{job_id}/artifacts/{filename}` | `200` | 已完成任务的文件下载。PLY 为 `application/octet-stream`，两个 JSON 文件为 `application/json` |
+CPU 解释器选择顺序为 `BOXER_VC_PYTHON`、`BOXER_PF_PYTHON`、服务自身 Python；覆盖解释器也须安装 `requirements-potential-field.txt`。环境检查、配置检查在任务受理前进行。日志通过 `/api/jobs/{job_id}/log?stage=room_segmentation` 读取。
 
-任务详情包含 `id`、`map_id`、`status`、`options`、`created_at`、`finished_at`、`error` 和 `artifacts`。`options` 只记录该次请求覆盖的字段。时间使用 UTC ISO 8601 字符串。`finished_at`、`error` 可为 `null`。
-
-`running` 和 `stopping` 是中间状态。`complete`、`failed` 和 `interrupted` 是终态。服务重启后，之前的活动任务会标记为 `interrupted`。任务 `complete` 后，`artifacts` 给出按文件名索引的服务相对 URL。房间数和标签覆盖率通过 `summary.json` 读取，任务完成时房间数可以为 `0`。
-
-地图或任务不存在、注册地图缺少 `global_map.pcd`、产物尚未发布或文件名不支持时返回 `404`。已有活动房间分割任务时提交返回 `409`。参数校验失败返回 `422`，指定的 `BOXER_PF_PYTHON` 路径无效时返回 `503`。进程启动后的推理失败记录在任务的 `error` 和日志里。
+需要脱离 HTTP 服务处理文件时，仍可运行 CLI：
 
 ```bash
-PF_JOB_ID=替换成势场提交返回的id
-PF_JOB_URL="$API_BASE/api/potential-field/jobs/$PF_JOB_ID"
-
-curl --fail-with-body -sS "$PF_JOB_URL" | python3 -m json.tool
-# status 为 complete 后下载
-curl --fail-with-body -sS "$PF_JOB_URL/artifacts/result_colored.ply" -o result_colored.ply
-curl --fail-with-body -sS "$PF_JOB_URL/artifacts/rooms.json" -o rooms.json
-curl --fail-with-body -sS "$PF_JOB_URL/artifacts/summary.json" -o summary.json
-# 任务失败时查看日志
-curl --fail-with-body -sS "$PF_JOB_URL/log" | python3 -m json.tool
-```
-
-### 势场输出文件与字段
-
-| 文件 | 格式和用途 |
-| --- | --- |
-| `result_colored.ply` | 二进制 PLY。每个 `vertex` 包含 float32 `x,y,z,nx,ny,nz`、uint8 `red,green,blue` 和 int32 `label`。坐标为米制、`+Z` 向上，颜色按房间 ID 生成。`label=-1` 表示未分配 |
-| `rooms.json` | 房间对象数组。`id` 对应 PLY 的 `label`，`name` 为显示名称，`point_count` 为房间内点数，`color` 为三通道 RGB。`bounds` 是 `[[xmin,ymin,zmin],[xmax,ymax,zmax]]`，`center` 是房间点质心，坐标均为米。`confidence` 和 `area_m2` 当前为 `null` |
-| `summary.json` | 任务统计对象。`room_count` 是保留房间数，`raw_room_count` 是按点数筛选前的房间数，`point_count` 是有效输入点数。`unassigned_count` 是未分配点数，`assigned_ratio` 为 `0–1` 的比例。`filtered_room_count`、`point_count_filtered_count` 记录点数筛选影响，`parameters` 保存实际参数。另含分阶段耗时、峰值内存及势场诊断 |
-| `job.json`、`inference.log` | 服务端的任务详情和运行日志，通过任务详情和日志接口读取 |
-
-前端可直接解析 PLY 的 `label` 属性并按 `rooms.json` 的 `id` 查找房间信息。房间 ID 在单次任务内使用，筛选后可能不连续。PLY 保留有效输入点的顺序，跳过 XYZ 非有限值。`/api/maps/{map_id}/cloud` 使用独立抽样的地图预览，点序应从各自文件读取。
-
-服务将三个结果文件发布到 `<output_dir>/potential_field/jobs/<job_id>/output/`。`job.json` 和 `inference.log` 位于该任务目录。命令行直接运行时，三个结果文件写入 `--output-dir`。
-
-`summary.json` 的 `inference_seconds`、`total_seconds` 和 `stages[].seconds` 以秒计，`peak_memory_mb` 和 `stages[].peak_memory_mb` 是进程峰值内存，单位 MiB。`inference_seconds` 统计分割核心，`total_seconds` 另含法向量准备和房间汇总。`refinement`、`vertical_sampling` 和 `distance_computation` 提供空间清理、高度采样和聚类距离计算的诊断。
-
-## 14. 体素连通复核
-
-体素连通复核读取注册地图中的全量 `global_map.pcd`，坐标为米制、`+Z` 向上。它先做二维初分割，再复核门洞与边界，最后将房间标签回投到原始点云。Boxer 内置 Room Atlas 的 `voxel-connectivity-v10`。 [运行时来源](../utils/voxel_connectivity_runtime/README.md)
-
-| `options` 字段 | 单位与范围 | 默认值 | 含义 |
-| --- | --- | --- | --- |
-| `resolution` | 米/像素，`0.03–0.50` | `0.10` | 俯视二维地图的栅格边长。数值越小，网格越细，可能保留更多局部碎片 |
-| `min_room_points` | 整数点数，`0–100000000` | `0` | 回投后少于此点数的房间，其点标签设为 `-1`。`0` 关闭筛选 |
-
-请求中的参数覆盖 YAML 默认值。可以省略 `options`。保存 YAML 后，新任务会读取更新值。Compose 已挂载 `config/`，调整默认值时直接编辑宿主机文件。自定义配置路径可通过 `BOXER_VC_CONFIG` 指定，相对路径按 Boxer 仓库根目录解析。 [默认配置](../config/voxel_connectivity.yaml)
-
-```bash
-API_BASE=http://127.0.0.1:18765
-MAP_ID=替换成地图注册返回的id
-
-curl --fail-with-body -sS -X POST "$API_BASE/api/voxel-connectivity/jobs" \
-  -H 'Content-Type: application/json' \
-  -d "{\"map_id\":\"$MAP_ID\",\"options\":{\"resolution\":0.10,\"min_room_points\":20000}}"
-```
-
-查询、停止、读取日志和下载沿用第 13 节的任务状态与响应字段，入口前缀为 `/api/voxel-connectivity/jobs`。两种算法的历史和下载地址各自独立。体素连通复核的产物存放在 `<output_dir>/voxel_connectivity/jobs/<job_id>/output/`。
-
-新建独立任务的 `artifacts` 只发布 `room_polygons.json`。文件记录保留房间的 `id`、`area_m2`、XY 轮廓 `geometry` 和米制 `z_bounds_m`。轮廓支持 `Polygon` 和 `MultiPolygon`，环闭合并保留孔洞。判断物体归属时，使用与地图同坐标系的 XYZ 检查二维轮廓和 Z 范围。Z 上下界取各房间已标注点的最低和最高 Z。历史任务保留其记录中的下载地址。
-
-通过 `POST /api/jobs` 启动的联合工作流还保留 `result_colored.ply`、`rooms.json` 和 `summary.json`，供原始点云投票绑定、房间点云预览和结果下载使用；地图包中的房间结果同时保存 `room_polygons.json`。
-
-在 Boxer 网页加载地图后，点击「分割房间」。任务完成后，视口自动切换为三维房间线框。已有结果可以通过「房间框视图」打开。
-
-直接运行 PCD 或 PLY 文件时，使用 Boxer Python 环境安装 CPU 分割依赖。容器镜像包含这些依赖。服务选用解释器的顺序为 `BOXER_VC_PYTHON`、`BOXER_PF_PYTHON`、服务自身的 Python。
-
-```bash
-.venv/bin/python -m pip install -r requirements-potential-field.txt
 .venv/bin/python -m voxel_connectivity \
-  --input /path/to/map/global_map.pcd \
-  --output-dir "$(mktemp -d)" \
-  --resolution 0.10 --min-room-points 20000
+  --input /path/to/global_map.pcd --output-dir /path/to/rooms
+# 势场 CLI 继续保留；HTTP 联合任务固定使用体素连通算法。
+.venv/bin/python -m potential_field --help
 ```
 
-## 15. 联合工作流与物体房间绑定
+## 14. 房间几何格式
 
-### 15.1 状态与结果来源
-
-新建 `JobInfo` 增加以下字段；列表、详情和 SSE 的字段一致：
+`GET /api/jobs/{job_id}/room-polygons.json` 下载关联分割任务的原始文件，结构如下。原始算法文件的 `schema_version` 保持为 `1`；父任务结果和绑定采用版本 `2`。
 
 ```json
 {
-  "workflow": {
-    "status": "running",
-    "room_segmentation": {
-      "status": "complete", "job_id": "关联体素任务ID", "error": null,
-      "reason": null, "artifacts": {"rooms.json": "/api/voxel-connectivity/jobs/关联体素任务ID/artifacts/rooms.json"}
+  "schema_version": 1,
+  "coordinate_frame": "scene_xy",
+  "units": "m",
+  "resolution_m": 0.1,
+  "volume_type": "vertical_prism",
+  "z_bounds_source": "labeled_point_extents",
+  "rooms": [{
+    "id": 0,
+    "area_m2": 16.0,
+    "geometry": {
+      "type": "Polygon",
+      "coordinates": [[[0,0],[4,0],[4,4],[0,4],[0,0]]]
     },
-    "binding": {"status": "pending", "job_id": null, "error": null, "reason": null, "artifacts": {}},
-    "map_export": {"status": "pending", "relative_path": "3dbbox/room_segmentation", "error": null},
-    "error": null, "finished_at": null
-  }
+    "z_bounds_m": [0.0, 2.8]
+  }]
 }
 ```
 
-整体状态沿用 `starting/running/stopping/complete/failed/interrupted`。分割、绑定和地图保存阶段另有 `pending`（等待）和 `skipped`（上游未成功）。一项失败时，整体保持运行直到另一项及可执行的地图保存结束，再标为 `failed`；成功计算结果可单独读取。两项均完成、绑定 JSON 发布、房间保存与要求的 ZIP 完成后，整体才为 `complete`。引入地图导出前的历史工作流，其 `map_export` 为 `null`，不自动补写地图。
+- `scene_xy` 是当前注册地图 `map` 坐标系的 XY 平面，结合 `z_bounds_m` 构成三维竖直区域，不是地理经纬度。
+- `geometry` 支持 GeoJSON 形状的 `Polygon` 和 `MultiPolygon`，坐标仅有 XY。每个 Polygon 首环为外环，后续环为孔洞，所有环闭合；孔洞不属于房间。
+- `z_bounds_m` 是该房间已标注点的最小和最大 Z。上下界相等的区域没有体积，不会产生正体积归属。
+- 房间 ID 在关联分割任务内唯一且非负，过滤后可以不连续；只可与同一父任务的物品结果组合。
+- 房间可以为空数组。损坏的几何、重复 ID、非有限坐标、未闭合环或倒置高度范围会使绑定阶段失败，不自动修复拓扑。
 
-关联记录位于 `<output_dir>/jobs/<job_id>/workflow.json`。绑定输入、日志和结果分别为同目录下的 `binding-input.json`、`binding.log`、`room-bindings.json`。记录保存地图源签名与 `global_map.pcd` 文件指纹，绑定开始及发布前检查版本。房间 ID 仅在关联分割任务内有效，物体 `instance` 仅在 Boxer 任务内有效；查询使用明确的任务关联，不复用“最近一次”的分割或地图目录 CSV。已完成结果不会被后续重跑覆盖。
+## 15. 联合工作流与物品房间归属
 
-服务重启将未结束流程标为 `interrupted`，不补跑分割、绑定或地图导出。已完成的绑定继续可读；恢复未完成的目录替换，清理未发布 ZIP 和暂存文件，保留成功发布的地图目录。旧任务及 `POST /api/jobs/import` 的只读任务返回 `workflow: null`，不自动建立关联。
+### 15.1 单一任务与生命周期
 
-### 15.2 房间结果与预览
+所有计算通过 `POST /api/jobs` 提交，以返回的父任务 `id` 查询、停止和下载。`JobInfo.status` 表示 Boxer 阶段，`workflow.status` 表示完整流程；`workflow.room_segmentation`、`workflow.binding` 和 `workflow.map_export` 分别表示分割、归属和地图保存阶段。阶段 `job_id` 仅用于来源审计，调用方无需访问内部子任务。
 
-`GET /api/jobs/{job_id}/rooms` 返回 `job_id`、`map_id`、`segmentation_job_id`、`algorithm: "voxel_connectivity"`、`rooms`、`summary`、`artifacts`。房间与统计采用第 14 节原始产物字段。分割成功后即可读取，不要求 Boxer 或绑定成功。
+新任务的 `workflow.schema_version=2`。整体沿用 `starting/running/stopping/complete/failed/interrupted`，阶段另有 `pending/skipped`。两项并行计算成功后才启动归属；一项失败时另一项继续，成功的分割结果仍可读取和保存。分割、归属、地图保存与要求的 ZIP 均发布后，整体才为 `complete`。
 
-`GET /api/jobs/{job_id}/rooms/cloud` 返回第 8.5 节的二进制 `xyzrgb`，颜色归一化到 0–1，最多 50 万点。可传 `room_id>=0` 只显示该房间；`room_id=-1` 显示标签为 -1 的点；省略显示全部。不存在的非负房间 ID 返回 `404`。抽样同时读取同一 PLY 的坐标和颜色，不能与地图预览按点序拼接。支持 ETag/304。
+`POST /api/jobs/{job_id}/stop` 停止仍活动的阶段并取消未发布导出；成功结果保留。服务重启将未完成流程标为 `interrupted`，恢复未完成目录替换并清理临时文件，不自动续跑。地图源签名与 `global_map.pcd` 文件指纹在绑定和发布前复核。
 
-### 15.3 绑定规则与分页查询
+原先两组独立分割任务路由以及 `/api/jobs/{job_id}/rooms/cloud` 已撤下，返回 `404`。已知历史任务缺少版本 `2` 时，新的房间、几何下载和归属接口返回 `409`，提示重新运行；历史任务文件及已有 ZIP 不改写。地图注册、上传和只读结果导入不启动计算。
 
-绑定使用最终 `results.json.objects`，与 `3dbbox_tracked` 一致，排除 `TENTATIVE`。在米制、+Z 向上的 map 坐标系中，按 bbox 四元数、中心及尺寸判断完整分割点云是否落在朝向框内。边界容差为 `1e-5` 米。每个物体最多属于一个房间。
+### 15.2 房间结果与下载
 
-获胜房间至少包含 **10 个支持点**，且占框内全部有效点 **≥60%**。标签 -1 的点参与分母，不投给任何房间。无有效证据时保留物体并返回 `room_id: null`；不按最近房间补配。预览抽样不参与投票。
-
-`GET /api/jobs/{job_id}/room-bindings` 支持 `offset=0`、`limit=200`（1–1000）。`room_id>=0` 筛选房间，`room_id=-1` 筛选未绑定物体，省略返回全部。`total` 是筛选后物体数，顺序与最终 tracked 物体一致。
-
-返回包含 `job_id/map_id/segmentation_job_id/status/summary/total/offset/limit/items`。每个 `items` 保留第 8.7 节的 3D bbox 字段，另含：
+`GET /api/jobs/{job_id}/rooms` 在分割成功后即可读取，不要求 Boxer 或归属成功。响应包括：
 
 | 字段 | 含义 |
 | --- | --- |
-| `room_id`、`room_name` | 归属房间；未绑定时均为 `null` |
-| `point_count` | 框内全部有效点数，包含标签 -1 |
-| `labeled_point_count` | 框内标签非负的点数 |
-| `support_points`、`vote_ratio` | 得票最多房间的点数、占框内全部有效点的比例 |
-| `votes` | 按票数降序排列的 `{room_id,point_count}`；并列按房间 ID 排序 |
-| `reason` | 已绑定为 `null`；其余为 `invalid_bbox/no_rooms/no_points/no_labeled_points/insufficient_support/ambiguous_room` |
+| `schema_version` | `2` |
+| `job_id/map_id/segmentation_job_id` | 父任务、注册地图及内部来源子任务 |
+| `algorithm` | `voxel_connectivity` |
+| `coordinate_frame/units/volume_type/resolution_m` | 第 14 节的几何坐标和分辨率约定 |
+| `rooms` | 房间数组，每项含 `id/name/geometry/z_bounds_m/area_m2`；名称缺省时按 ID 生成为“房间 01”等 |
+| `summary` | `room_count`、总平面面积 `area_m2` 和总区域体积 `volume_m3` |
+| `artifacts` | `room_polygons.json` 对应的父任务下载 URL |
 
-`GET /api/jobs/{job_id}/room-bindings.json` 下载完整 JSON，包含 `schema_version=1`、地图版本、坐标约定、实际门槛 `parameters`、`summary` 及所有 `items`。`summary` 包含 `object_count/assigned_count/unassigned_count/reason`。关闭跟踪时成功返回空绑定，原因为 `tracking_disabled`；开启跟踪但没有最终物体时为 `no_tracked_objects`。
+文件下载使用 `GET /api/jobs/{job_id}/room-polygons.json`，媒体类型为 `application/json`。不再发布 `result_colored.ply`、`rooms.json`、`summary.json` 或房间预览点云。
 
-上述结果接口对未知任务或没有联合流程的历史/只读任务返回 `404`；关联阶段未成功完成返回 `409`。分页或筛选参数无效返回 `422`。分割为 0 个房间时仍可成功，最终物体全部未绑定。
+### 15.3 精确体积归属与分页
+
+输入为最终 `results.json.objects`，与最终 tracked 物品一致，排除 `TENTATIVE`；保留现有物品 ID、位姿、尺寸及检测来源。按完整四元数使用朝向框，不将倾斜框近似为轴对齐框。
+
+对物品框 B 和房间竖直区域 R，覆盖比例为 `Volume(B ∩ R) / Volume(B)`。分母固定为物品完整框体积，不按房间体积或已覆盖部分归一化。候选房间先经 XY 空间索引和高度筛选，再使用裁剪面片的有向面积积分精确计算三维体积，支持凹轮廓、孔洞和 MultiPolygon。
+
+唯一最大覆盖比例达到 **60%** 才归属。并列、比例不足、仅边界接触或没有相交时保持未归属，不按中心点或距离补配。计算采用 float64、物品中心局部坐标和 `1e-9` 相对容差，容差只处理浮点误差，不扩大房间或物品框。
+
+`GET /api/jobs/{job_id}/room-bindings` 支持 `offset=0`、`limit=200`（1–1000）、`room_id>=0` 筛选房间、`room_id=-1` 筛选未归属物品；省略返回全部。响应为版本 `2`，`binding_method=obb_room_volume_v1`，包含任务关联、`summary/total/offset/limit/items`。物品顺序与最终 tracked 结果一致，`total` 为筛选后的数量。
+
+| 每项字段 | 含义 |
+| --- | --- |
+| 现有物品字段 | ID、类别、位姿、尺寸、概率及检测关联 |
+| `room_id/room_name` | 确认归属；未归属均为 `null` |
+| `object_volume_m3` | 完整 OBB 体积；无效框为 `null` |
+| `intersection_volume_m3/overlap_ratio` | 最佳候选的相交体积与完整框覆盖比例；无候选为 `0`，未归属时仍保留最佳证据 |
+| `overlaps` | 正相交候选 `{room_id,intersection_volume_m3,overlap_ratio}`，按体积降序、并列按房间 ID 排序 |
+| `reason` | 成功为 `null`；否则为 `invalid_bbox/no_rooms/no_overlap/insufficient_overlap/ambiguous_overlap` |
+
+不再返回 `point_count/labeled_point_count/support_points/vote_ratio/votes`。关闭跟踪时成功生成空归属结果，`summary.reason=tracking_disabled`；没有最终物品时为 `no_tracked_objects`。零房间时仍成功，物品均以 `no_rooms` 保留为未归属。
+
+`GET /api/jobs/{job_id}/room-bindings.json` 下载完整 JSON，包含 `schema_version=2`、`binding_method`、来源签名、地图指纹、坐标约定、`parameters`、`summary` 和 `items`。参数记录 `min_overlap_ratio=0.6`、`relative_tolerance=1e-9`。归属尚未成功或版本不支持返回 `409`，未知父任务返回 `404`，分页参数无效返回 `422`。
 
 ```bash
-# 等待 workflow.status == "complete"，也可先在分割成功后读取 rooms。
 curl --fail-with-body -sS "$API_BASE/api/jobs/$JOB_ID/rooms" | jq
-curl --fail-with-body -sS "$API_BASE/api/jobs/$JOB_ID/rooms/cloud" -o rooms.xyzrgb
+curl --fail-with-body -sS "$API_BASE/api/jobs/$JOB_ID/room-polygons.json" -o room_polygons.json
 curl --fail-with-body -sS "$API_BASE/api/jobs/$JOB_ID/room-bindings?room_id=-1&limit=1000" | jq
 curl --fail-with-body -sS "$API_BASE/api/jobs/$JOB_ID/room-bindings.json" -o room-bindings.json
 ```
 
-### 15.4 保存到地图包并统一归档
+### 15.4 地图保存与完整 ZIP
 
-仅 `POST /api/jobs` 的新联合流程，在收尾阶段将房间产物保存到输入 x-nav 地图包：
+新任务收尾时整体替换输入地图的专用房间目录：
 
 ```text
-<地图>/3dbbox/room_segmentation/
-├── result_colored.ply
-├── rooms.json
-├── summary.json
+3dbbox/room_segmentation/
+├── room_polygons.json
 ├── room-bindings.json
 └── source.json
 ```
 
-前三个文件逐字节复制关联分割任务的产物。绑定成功时保存 `room-bindings.json`；Boxer 或绑定失败但分割成功时，仍保存三个分割文件和 `source.json`，不保留旧绑定，也不生成该失败流程的 ZIP。分割失败时不替换地图中的房间目录。显式停止不启动新的导出。
+房间几何逐字节复制关联分割产物；归属成功时保存完整绑定 JSON。`source.json` 的版本为 `2`，记录任务、来源地图、导出时间及实际文件列表。分割成功但 Boxer 或归属失败时，仅保存几何与来源文件，清除目录中的旧归属，整体失败且不生成 ZIP。分割失败时不替换地图目录；显式停止不启动新的导出。
 
-`source.json` 包含 `schema_version=1`、`job_id`、`map_id`、`segmentation_job_id`、`algorithm`、`source_signature`、`global_map_fingerprint`、`exported_at` 和实际 `files` 列表。它描述本次保存的计算来源；所有原件继续位于任务目录，结果 API 不依赖地图目录。
-
-每次先完整暂存，再整体替换专用房间目录，失败时还原旧目录。替换日志位于 `<output_dir>/jobs/<job_id>/map-export.json`；以 `.boxer-rooms-` 开头的暂存和备份不进入 ZIP。复制前、发布前及归档前后检查地图版本。仅成功联合流程生成完整 ZIP，后续重跑不会修改旧任务归档。
-
-`no_csv=true` 仍写入上述房间结果，继续跳过检测 CSV 和 ZIP。独立的势场及体素分割接口、历史任务、只读导入不增加地图写入。Web 显示“地图保存”阶段和保存位置，完整成功后提供“完整结果 ZIP”链接。
+继续使用完整暂存、目录原子替换和替换日志，失败还原旧目录。成功任务的 ZIP 包含检测 CSV、累计地图特征以及上述房间目录；后续重跑不修改历史 ZIP。`no_csv=true` 仍保存几何和归属，跳过检测 CSV 与 ZIP。Web 提供房间几何、物品归属 JSON 和整体成功后的完整 ZIP 下载。
 
 ## 16. 实现位置与维护
 
@@ -1621,7 +1502,8 @@ curl --fail-with-body -sS "$API_BASE/api/jobs/$JOB_ID/room-bindings.json" -o roo
 | [server.py](../server.py) | HTTP 路由、状态码、SSE、JPEG 与二进制响应、Swagger UI |
 | [utils/xnav_service.py](../utils/xnav_service.py) | 请求/响应模型、配置与任务状态、目录发现、持久化和恢复 |
 | [utils/xnav_workflow.py](../utils/xnav_workflow.py) | 联合调度、父子关联、生命周期与房间结果读取 |
-| [utils/xnav_room_binding.py](../utils/xnav_room_binding.py) | 独立 CPU 绑定进程、完整点云投票和房间预览 |
+| [utils/xnav_room_binding.py](../utils/xnav_room_binding.py) | 独立 CPU 归属进程、精确 OBB 与房间体积覆盖 |
+| [utils/xnav_room_geometry.py](../utils/xnav_room_geometry.py) | 房间几何校验、完整朝向框裁剪与体积积分 |
 | [utils/xnav_room_export.py](../utils/xnav_room_export.py) | 房间地图目录发布、恢复及工作流 ZIP 归档 |
 | [utils/xnav_upload.py](../utils/xnav_upload.py) | 上传会话、分块提交、ZIP 安全解压、后台校验和发布恢复 |
 | [utils/xnav_runtime.py](../utils/xnav_runtime.py) | 模型加载复用、设备和精度选择 |

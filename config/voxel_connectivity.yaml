@@ -4,4 +4,4 @@
 resolution: 0.10
 
 # 房间回投到原始点云后要求的最少点数，范围 0–100000000。0 关闭点数筛选。
-min_room_points: 0
+min_room_points: 10000

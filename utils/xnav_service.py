@@ -193,6 +193,7 @@ class MapExportInfo(BaseModel):
 
 
 class WorkflowInfo(BaseModel):
+    schema_version: Literal[2] | None = None
     status: Status = "starting"
     room_segmentation: WorkflowStage = Field(default_factory=WorkflowStage)
     binding: WorkflowStage = Field(default_factory=WorkflowStage)
@@ -343,45 +344,82 @@ class Box3DPage(BoxPage):
     items: list[Box3DRow]
 
 
-class RoomInfo(BaseModel):
+class PolygonGeometry(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+    type: Literal["Polygon"]
+    coordinates: list[list[tuple[float, float]]]
+
+
+class MultiPolygonGeometry(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+    type: Literal["MultiPolygon"]
+    coordinates: list[list[list[tuple[float, float]]]]
+
+
+class RoomPolygon(BaseModel):
     id: int = Field(ge=0)
+    geometry: PolygonGeometry | MultiPolygonGeometry = Field(discriminator="type")
+    z_bounds_m: tuple[float, float]
+    area_m2: float = Field(gt=0, allow_inf_nan=False)
+
+
+class RoomInfo(RoomPolygon):
     name: str
-    point_count: int = Field(ge=0)
-    color: list[int]
-    bounds: list[list[float]]
-    center: list[float]
-    confidence: float | None = None
-    area_m2: float | None = None
-    cell_count: int | None = None
+
+
+class RoomPolygonDocument(BaseModel):
+    schema_version: Literal[1] = 1
+    coordinate_frame: Literal["scene_xy"] = "scene_xy"
+    units: Literal["m"] = "m"
+    volume_type: Literal["vertical_prism"] = "vertical_prism"
+    resolution_m: float = Field(gt=0, allow_inf_nan=False)
+    z_bounds_source: Literal["labeled_point_extents"] = "labeled_point_extents"
+    rooms: list[RoomPolygon]
 
 
 class RoomResult(BaseModel):
+    schema_version: Literal[2] = 2
     job_id: str
     map_id: str
     segmentation_job_id: str
     algorithm: Literal["voxel_connectivity"] = "voxel_connectivity"
+    coordinate_frame: Literal["scene_xy"] = "scene_xy"
+    units: Literal["m"] = "m"
+    volume_type: Literal["vertical_prism"] = "vertical_prism"
+    resolution_m: float = Field(gt=0, allow_inf_nan=False)
     rooms: list[RoomInfo]
     summary: dict
     artifacts: dict[str, str]
 
 
-class RoomVote(BaseModel):
-    room_id: int
-    point_count: int = Field(ge=0)
+class RoomOverlap(BaseModel):
+    room_id: int = Field(ge=0)
+    intersection_volume_m3: float = Field(ge=0, allow_inf_nan=False)
+    overlap_ratio: float = Field(ge=0, le=1, allow_inf_nan=False)
 
 
 class RoomBindingRow(Box3DRow):
     room_id: int | None
     room_name: str | None
-    point_count: int = Field(ge=0)
-    labeled_point_count: int = Field(ge=0)
-    support_points: int = Field(ge=0)
-    vote_ratio: float = Field(ge=0, le=1)
-    votes: list[RoomVote]
-    reason: str | None
+    object_volume_m3: float | None = Field(ge=0, allow_inf_nan=False)
+    intersection_volume_m3: float = Field(ge=0, allow_inf_nan=False)
+    overlap_ratio: float = Field(ge=0, le=1, allow_inf_nan=False)
+    overlaps: list[RoomOverlap]
+    reason: (
+        Literal[
+            "invalid_bbox",
+            "no_rooms",
+            "no_overlap",
+            "insufficient_overlap",
+            "ambiguous_overlap",
+        ]
+        | None
+    )
 
 
 class RoomBindingPage(BaseModel):
+    schema_version: Literal[2] = 2
+    binding_method: Literal["obb_room_volume_v1"] = "obb_room_volume_v1"
     job_id: str
     map_id: str
     segmentation_job_id: str
@@ -390,6 +428,23 @@ class RoomBindingPage(BaseModel):
     total: int = Field(ge=0)
     offset: int = Field(ge=0)
     limit: int = Field(ge=1, le=1000)
+    items: list[RoomBindingRow]
+
+
+class RoomBindingResult(BaseModel):
+    schema_version: Literal[2] = 2
+    binding_method: Literal["obb_room_volume_v1"] = "obb_room_volume_v1"
+    job_id: str
+    map_id: str
+    segmentation_job_id: str
+    algorithm: Literal["voxel_connectivity"] = "voxel_connectivity"
+    source_signature: str
+    global_map_fingerprint: list[int]
+    coordinate_frame: Literal["map"] = "map"
+    unit: Literal["metre"] = "metre"
+    up_axis: Literal["+Z"] = "+Z"
+    parameters: dict[str, float]
+    summary: dict
     items: list[RoomBindingRow]
 
 
@@ -821,8 +876,9 @@ class JobManager:
                     self._export_results,
                     Path(job["results_path"]).parent,
                     self.map_records[job["map_id"]]["path"],
-                    None if job.get("defer_archive") else
-                    self.root / "jobs" / identity / "3dbbox.zip",
+                    None
+                    if job.get("defer_archive")
+                    else self.root / "jobs" / identity / "3dbbox.zip",
                     cancel,
                 )
                 self._finalizations[identity] = (future, cancel)

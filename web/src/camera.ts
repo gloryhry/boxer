@@ -52,8 +52,6 @@ export class SceneView {
   private readonly labels: { point: THREE.Vector3; element: HTMLSpanElement }[] = [];
   private readonly cameraMarker = new THREE.Group();
   private map?: THREE.Points;
-  private roomCloud?: THREE.Points;
-  private roomsMode = false;
   private mapVisible = true;
   private observed?: THREE.Points;
   private trajectory?: THREE.Line;
@@ -61,6 +59,7 @@ export class SceneView {
   private radius = 5;
   private roomView = false;
   private roomBounds?: THREE.Sphere;
+  private boxBounds?: THREE.Box3;
   private savedMapView?: { target: THREE.Vector3; position: THREE.Vector3; maxDistance: number };
   private lastTarget = new THREE.Vector3();
   private internalChange = false;
@@ -97,9 +96,9 @@ export class SceneView {
     );
     axes.material.toneMapped = false;
     sourceAxes.dispose();
-    this.mapGroup.add(grid, axes, this.boxGroup, this.cameraMarker);
+    this.mapGroup.add(grid, axes, this.cameraMarker);
     this.roomGroup.visible = false;
-    this.scene.add(this.mapGroup, this.roomGroup);
+    this.scene.add(this.mapGroup, this.roomGroup, this.boxGroup);
     this.fit();
     new ResizeObserver(() => {
       const { width, height } = host.getBoundingClientRect();
@@ -147,12 +146,13 @@ export class SceneView {
   }
 
   setMap(info: SceneInfo, data: ArrayBuffer) {
-    this.setRoomCloud();
-    this.setRoomsMode(false);
+    this.setRoomView(false);
+    this.clearRoomOutlines();
     if (this.map) release(this.map);
     this.clearFrame();
     this.setTrajectory([]);
     this.map = this.cloud(data, 1.8);
+    this.map.visible = this.mapVisible;
     this.mapGroup.add(this.map);
     this.center.fromArray(info.center);
     this.radius = info.radius;
@@ -163,31 +163,18 @@ export class SceneView {
   setObserved(data?: ArrayBuffer) {
     if (this.observed) release(this.observed);
     this.observed = data ? this.cloud(data, 2.5) : undefined;
-    if (this.observed) { this.mapGroup.add(this.observed); this.observed.visible = !this.roomsMode; }
+    if (this.observed) this.mapGroup.add(this.observed);
   }
 
-  setRoomCloud(data?: ArrayBuffer) {
-    if (this.roomCloud) release(this.roomCloud);
-    this.roomCloud = data ? this.cloud(data, 1.8) : undefined;
-    if (this.roomCloud) { this.mapGroup.add(this.roomCloud); this.roomCloud.visible = this.roomsMode && this.mapVisible; }
+  showMap(show: boolean) {
+    this.mapVisible = show;
+    if (this.map) this.map.visible = show;
   }
-
-  setRoomsMode(enabled: boolean) {
-    this.roomsMode = enabled;
-    if (this.map) this.map.visible = !enabled && this.mapVisible;
-    if (this.roomCloud) this.roomCloud.visible = enabled && this.mapVisible;
-    if (this.observed) this.observed.visible = !enabled;
-    if (this.trajectory) this.trajectory.visible = !enabled;
-    this.cameraMarker.visible = !enabled;
-  }
-
-  showMap(show: boolean) { this.mapVisible = show; this.setRoomsMode(this.roomsMode); }
 
   setTrajectory(positions: number[][]) {
     if (this.trajectory) release(this.trajectory);
     const geometry = new THREE.BufferGeometry().setFromPoints(positions.map(p => new THREE.Vector3().fromArray(p)));
     this.trajectory = new THREE.Line(geometry, new THREE.LineBasicMaterial({ color: '#2c8ba5' }));
-    this.trajectory.visible = !this.roomsMode;
     this.mapGroup.add(this.trajectory);
   }
 
@@ -216,6 +203,7 @@ export class SceneView {
       this.host.append(element);
       this.labels.push({ point: center, element });
     }
+    this.boxBounds = positions.length ? new THREE.Box3().setFromArray(positions) : undefined;
     this.boxGroup.add(this.lineSegments(positions, 0xffffff, colors));
   }
 
@@ -295,7 +283,12 @@ export class SceneView {
       this.follow.enabled = false;
       this.follow.offset.set(0, 0, 0);
     }
-    const bounds = this.roomView ? this.roomBounds : undefined;
+    let bounds = this.roomView ? this.roomBounds?.clone() : undefined;
+    if (this.roomView && this.boxBounds) {
+      const objects = this.boxBounds.getBoundingSphere(new THREE.Sphere());
+      if (bounds) bounds.union(objects);
+      else bounds = objects;
+    }
     const center = bounds?.center ?? this.center;
     const radius = Math.max(0.1, bounds?.radius ?? this.radius);
     const distance = radius * 2.8 / Math.min(1, Math.max(this.camera.aspect, 0.1));
@@ -329,7 +322,6 @@ export class SceneView {
     this.camera.far = Math.max(1000, distance + (this.roomView ? this.roomBounds?.radius ?? this.radius : this.radius) * 4);
     this.camera.updateProjectionMatrix();
     this.renderer.render(this.scene, this.camera);
-    if (this.roomView) return;
     const occupied: [number, number][] = [];
     for (const label of this.labels) {
       const p = label.point.clone().project(this.camera);

@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import HTTPException
-from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from utils.voxel_connectivity_runtime import (
@@ -118,8 +117,6 @@ class PotentialFieldJobs:
         self.lock = threading.RLock()
         self.jobs = {}
         self.command = tuple(command) if command else None
-        self.active_artifact_types = self.artifact_types
-        self.active_json_artifact_types = self.json_artifact_types
         self.active_id = None
         self.process = None
         self.source = None
@@ -166,9 +163,7 @@ class PotentialFieldJobs:
             or not python.is_file()
             or not os.access(python, os.X_OK)
         ):
-            raise HTTPException(
-                503, f"{env} must be an absolute executable path"
-            )
+            raise HTTPException(503, f"{env} must be an absolute executable path")
         return (str(python), "-u", "-m", self.worker_module)
 
     def _save(self, job):
@@ -200,7 +195,7 @@ class PotentialFieldJobs:
             fingerprint = _fingerprint(source)
             return map_cloud, source, command, fingerprint
 
-    def start(self, request, map_root, *, workflow_artifacts=False):
+    def start(self, request, map_root):
         with self.lock:
             map_cloud, source, command, fingerprint = self.prepare_start(map_root)
             identity = uuid.uuid4().hex
@@ -215,14 +210,6 @@ class PotentialFieldJobs:
             ]
             for name, value in options.items():
                 args.extend([f"--{name.replace('_', '-')}", str(value)])
-            self.active_artifact_types = self.artifact_types
-            self.active_json_artifact_types = self.json_artifact_types
-            if workflow_artifacts:
-                args.append("--workflow-artifacts")
-                self.active_artifact_types = self.artifact_types | ARTIFACTS
-                self.active_json_artifact_types = (
-                    self.json_artifact_types | PotentialFieldJobs.json_artifact_types
-                )
             job = PotentialFieldJobInfo(
                 id=identity,
                 map_id=request.map_id,
@@ -263,7 +250,7 @@ class PotentialFieldJobs:
             try:
                 if staging.is_symlink():
                     raise ValueError("Invalid artifact directory")
-                for name in self.active_artifact_types:
+                for name in self.artifact_types:
                     path = staging / name
                     if (
                         path.is_symlink()
@@ -271,7 +258,7 @@ class PotentialFieldJobs:
                         or not path.stat().st_size
                     ):
                         raise ValueError(f"Missing or empty artifact: {name}")
-                for name, kind in self.active_json_artifact_types.items():
+                for name, kind in self.json_artifact_types.items():
                     if not isinstance(json.loads((staging / name).read_bytes()), kind):
                         raise ValueError(f"Invalid artifact: {name}")
                 source, fingerprint = self.source
@@ -279,9 +266,7 @@ class PotentialFieldJobs:
                     raise ValueError("global_map.pcd changed during segmentation")
                 staging.rename(output)
                 url = f"{self.api_path}/{job['id']}/artifacts"
-                artifacts = {
-                    name: f"{url}/{name}" for name in self.active_artifact_types
-                }
+                artifacts = {name: f"{url}/{name}" for name in self.artifact_types}
             except (OSError, ValueError) as exc:
                 status, error = "failed", f"Could not publish worker output: {exc}"
         if status != "complete":
@@ -423,11 +408,11 @@ class VoxelConnectivityJobs(PotentialFieldJobs):
 
 
 class RoomSegmentationDispatcher:
-    """One shared CPU admission lock for standalone and paired submissions."""
+    """Admission lock for internal CPU segmentation workers."""
 
-    def __init__(self, manager, potential_field_jobs, voxel_connectivity_jobs):
+    def __init__(self, manager, *jobs):
         self.manager = manager
-        self.jobs = (potential_field_jobs, voxel_connectivity_jobs)
+        self.jobs = jobs
         self.lock = threading.RLock()
 
     def prepare_start(self, jobs, request):
@@ -446,68 +431,3 @@ class RoomSegmentationDispatcher:
         with self.lock:
             scene = self.prepare_start(jobs, request)
             return jobs.start(request, scene.loader.root)
-
-
-def install_room_segmentation_routes(
-    app, manager, potential_field_jobs, voxel_connectivity_jobs, *,
-    errors=None, artifact_response=None, dispatcher=None,
-):
-    """Expose separate job histories while dispatching one CPU job at a time."""
-    dispatcher = dispatcher or RoomSegmentationDispatcher(
-        manager, potential_field_jobs, voxel_connectivity_jobs
-    )
-    errors = errors or {}
-    artifact_responses = {**errors, **(artifact_response or {})}
-
-    def register(jobs, other, request_model):
-        path, method = jobs.api_path, jobs.worker_module
-
-        @app.get(
-            path, name=f"list_{method}_jobs",
-            response_model=list[PotentialFieldJobInfo], responses=errors,
-        )
-        def list_jobs():
-            return jobs.list()
-
-        @app.post(
-            path, name=f"start_{method}_job", response_model=PotentialFieldJobInfo,
-            status_code=202, responses=errors,
-        )
-        def start_job(body: request_model):
-            if getattr(app.state, "stopping", False):
-                raise HTTPException(503, f"{jobs.name} service is shutting down")
-            return dispatcher.start(jobs, body)
-
-        @app.get(
-            path + "/{job_id}", name=f"{method}_job_info",
-            response_model=PotentialFieldJobInfo, responses=errors,
-        )
-        def job_info(job_id: str):
-            return jobs.info(job_id)
-
-        @app.post(
-            path + "/{job_id}/stop", name=f"stop_{method}_job",
-            response_model=PotentialFieldJobInfo, status_code=202, responses=errors,
-        )
-        def stop_job(job_id: str):
-            return jobs.stop(job_id)
-
-        @app.get(
-            path + "/{job_id}/log", name=f"{method}_job_log",
-            response_model=LogInfo, responses=errors,
-        )
-        def job_log(job_id: str):
-            return {"text": jobs.log(job_id)}
-
-        @app.get(
-            path + "/{job_id}/artifacts/{filename}", name=f"{method}_job_artifact",
-            response_class=FileResponse, responses=artifact_responses,
-        )
-        def job_artifact(job_id: str, filename: str):
-            artifact = jobs.artifact(job_id, filename)
-            return FileResponse(
-                artifact, filename=filename, media_type=ARTIFACT_MEDIA_TYPES[filename]
-            )
-
-    register(potential_field_jobs, voxel_connectivity_jobs, PotentialFieldJobRequest)
-    register(voxel_connectivity_jobs, potential_field_jobs, VoxelConnectivityJobRequest)

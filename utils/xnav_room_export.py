@@ -110,9 +110,6 @@ def export_room_results(
         staging.mkdir()
         for name, source in sources.items():
             if name not in {
-                "result_colored.ply",
-                "rooms.json",
-                "summary.json",
                 "room_polygons.json",
                 "room-bindings.json",
             }:
@@ -123,7 +120,7 @@ def export_room_results(
             dict(
                 provenance,
                 files=sorted([*sources, "source.json"]),
-                schema_version=1,
+                schema_version=2,
             ),
         )
         _sync_directory(staging)

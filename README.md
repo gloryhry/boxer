@@ -177,6 +177,13 @@ python view_prompt.py --input /path/to/xnav/map
 
 The responsive x-nav Web viewer and OpenAPI service run on port **18765**.
 
+`POST /api/jobs` starts detection and voxel room segmentation together, then
+assigns final oriented objects by exact overlap with room polygon prisms. A
+unique room must cover at least 60% of the complete object box volume. The Web
+room view shows outlines and final objects; geometry and binding downloads use
+the parent job ID. Room results use schema version 2.
+
+
 The Web UI and API also accept ZIP map uploads with durable chunks, restart-safe
 resume, SHA-256 verification and automatic map registration. Defaults: 8 MiB
 chunks, 20 GiB per ZIP and 24-hour idle retention. See the
